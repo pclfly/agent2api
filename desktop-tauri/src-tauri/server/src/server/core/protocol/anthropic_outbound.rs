@@ -501,6 +501,145 @@ fn thinking_budget(effort: &str) -> Option<i64> {
     })
 }
 
+// ─── 请求：提示缓存断点 ──────────────────────────────────────
+
+/// Anthropic 提示缓存的断点上限。超限上游**报错**（不是忽略），所以宁少勿多。
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// 给 Anthropic 请求体补提示缓存断点（`cache_control:{type:"ephemeral"}`）。
+///
+/// ── 为什么必须有这一步 ───────────────────────────────────────
+/// Anthropic 协议的提示缓存是**显式断点制**：请求里没有 `cache_control`
+/// 就等于关闭缓存，上游既不命中也不回报 `cache_read_input_tokens`。
+/// 而 [`anthropic_request_from_chat`] 是**保真**语义 —— 只把入口暂存的客户端
+/// 断点恢复回去，客户端没带就一个都不加。走 chat 协议的客户端（如 DeepSeek
+/// Harness）本来就不发断点，于是整条链路出站请求零断点、缓存读取恒为 0。
+/// 本函数就是补上这一环。
+///
+/// ── 断点打在哪儿（对齐官方 MiniMax 客户端）────────────────────
+/// 官方客户端的 Anthropic provider 在三处打断点，这里照做：
+///   1. system 末块（提示词主体，最稳定，复用率最高）；
+///   2. 工具清单末项（工具声明大而稳定，收益最高的一段）；
+///   3. 最后一条 user 消息的末块（对话历史到此为止）。
+/// 三处合计 3 个断点，在上限之内 —— 客户端自带断点时按剩余预算补齐。
+///
+/// ── 与已有断点的关系 ─────────────────────────────────────────
+/// **保留**客户端自带的断点（入口已恢复进 `_wb_cache_control` → 出站落回块上），
+/// 只在标准位置补缺失的那些；预算按 [`MAX_CACHE_BREAKPOINTS`] 扣除已有数量。
+/// 字符串内容会升格成块数组 —— 只有块形态能挂断点（Anthropic 两种都认）。
+pub fn apply_prompt_cache_breakpoints(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    let ephemeral = json!({ "type": "ephemeral" });
+    let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(count_cache_breakpoints(object));
+
+    // ① system 末块
+    if budget > 0 {
+        if let Some(system) = object.get_mut("system") {
+            if mark_last_cacheable_block(system, &ephemeral) {
+                budget -= 1;
+            }
+        }
+    }
+    // ② 工具清单末项
+    if budget > 0 {
+        if let Some(last) = object
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .and_then(|tools| tools.last_mut())
+            .and_then(Value::as_object_mut)
+        {
+            // insert 返回 Some = 原本就有（已在预算里扣过），None = 本次新增
+            if last.insert("cache_control".to_string(), ephemeral.clone()).is_none() {
+                budget -= 1;
+            }
+        }
+    }
+    // ③ 最后一条 user 消息的末块
+    if budget > 0 {
+        if let Some(message) = object
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+            .and_then(|messages| {
+                messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            })
+        {
+            if let Some(content) = message.get_mut("content") {
+                let _ = mark_last_cacheable_block(content, &ephemeral);
+            }
+        }
+    }
+}
+
+/// 数请求体里现有的断点数（system 块 + 工具 + 各消息的内容块）。
+///
+/// 字符串形态的 system / content 不可能带断点，不参与计数。
+fn count_cache_breakpoints(object: &Map<String, Value>) -> usize {
+    let count_blocks = |value: Option<&Value>| -> usize {
+        value
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter(|item| item.get("cache_control").is_some()).count())
+            .unwrap_or(0)
+    };
+    let mut count = count_blocks(object.get("system")) + count_blocks(object.get("tools"));
+    if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            count += count_blocks(message.get("content"));
+        }
+    }
+    count
+}
+
+/// 给「块数组」里**最后一个可挂断点的块**打上断点；字符串内容升格成块数组。
+///
+/// 返回是否**新增**了断点（没有可挂的块 / 末块已有断点 → false）。
+/// 从后往前找而不是只认最后一块：末块可能是 thinking（Anthropic 明确不许挂
+/// 断点），此时退到它前面那个 text 块才是有效断点。
+fn mark_last_cacheable_block(value: &mut Value, ephemeral: &Value) -> bool {
+    match value {
+        // 字符串 → 升格成块数组（只有块形态能带 cache_control）
+        Value::String(text) => {
+            let text = text.clone();
+            *value = json!([{ "type": "text", "text": text, "cache_control": ephemeral }]);
+            true
+        }
+        Value::Array(blocks) => {
+            for block in blocks.iter_mut().rev() {
+                if !block_accepts_cache_control(block) {
+                    continue;
+                }
+                let Some(object) = block.as_object_mut() else {
+                    continue;
+                };
+                if object.contains_key("cache_control") {
+                    return false;
+                }
+                object.insert("cache_control".to_string(), ephemeral.clone());
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// 该内容块能不能挂缓存断点。
+///
+/// Anthropic **不**接受在 `thinking` / `redacted_thinking` 上打断点，挂错类型
+/// 上游直接 400。放行清单与出站恢复断点时的 `mountable` 口径一致
+/// （见 [`anthropic_blocks_of`]）—— 两处不一致会让「客户端断点能落回、
+/// 网关断点却落不下」这种怪事发生。
+fn block_accepts_cache_control(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str).unwrap_or(""),
+        "text" | "image" | "tool_use" | "tool_result" | "document" | "search_result"
+    )
+}
+
 // ─── 响应：Anthropic SSE → Chat SSE（流式）────────────────────
 
 /// 上游 Anthropic SSE 字节流 → 标准 chat SSE 字节流（状态机）。
@@ -884,13 +1023,186 @@ impl ChatFromAnthropicStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatFromAnthropicStream, Value};
+    use super::{anthropic_request_from_chat, apply_prompt_cache_breakpoints, ChatFromAnthropicStream, Value};
+    use serde_json::json;
 
     fn output_text(frames: &[bytes::Bytes]) -> String {
         frames
             .iter()
             .map(|frame| String::from_utf8_lossy(frame).into_owned())
             .collect()
+    }
+
+    /// 数一份 Anthropic 请求体里的断点总数（system 块 + 工具 + 各消息块）。
+    fn breakpoints(body: &Value) -> usize {
+        let blocks = |value: Option<&Value>| -> usize {
+            value
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter(|item| item.get("cache_control").is_some()).count())
+                .unwrap_or(0)
+        };
+        let mut count = blocks(body.get("system")) + blocks(body.get("tools"));
+        if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                count += blocks(message.get("content"));
+            }
+        }
+        count
+    }
+
+    /// chat 协议客户端（不带任何 cache_control）经转换 + 补断点后，
+    /// system / 工具末项 / 最后一条 user 消息三处都要有断点。
+    #[test]
+    fn breakpoints_added_at_standard_positions() {
+        let chat = json!({
+            "messages": [
+                { "role": "system", "content": "you are helpful" },
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": "hi" },
+                { "role": "user", "content": "second question" },
+            ],
+            "tools": [
+                { "type": "function", "function": { "name": "a", "parameters": { "type": "object" } } },
+                { "type": "function", "function": { "name": "b", "parameters": { "type": "object" } } },
+            ],
+        });
+        let mut body = anthropic_request_from_chat(&chat, "MiniMax-M3").expect("转换必须成功");
+        assert_eq!(breakpoints(&body), 0, "转换器是保真语义：客户端没带就一个都不加");
+        apply_prompt_cache_breakpoints(&mut body);
+        // 三处标准位置
+        assert_eq!(body["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(body["tools"][1]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(breakpoints(&body), 3);
+    }
+
+    /// 字符串 content 要升格成块数组才挂得上断点。
+    #[test]
+    fn string_content_is_upgraded_to_blocks() {
+        let chat = json!({
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "user", "content": "plain string" },
+            ],
+        });
+        let mut body = anthropic_request_from_chat(&chat, "MiniMax-M3").expect("转换必须成功");
+        apply_prompt_cache_breakpoints(&mut body);
+        assert_eq!(body["system"], json!([{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }]));
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{ "type": "text", "text": "plain string", "cache_control": { "type": "ephemeral" } }])
+        );
+    }
+
+    /// 客户端已带满 4 个断点时，**不**再补 —— 超限上游是报错而不是忽略。
+    ///
+    /// 直接对 Anthropic 形态的请求体调用：走 `anthropic_request_from_chat` 的话，
+    /// chat 侧的裸 `cache_control` 在转换阶段就被丢了（转换器只认内部暂存字段
+    /// `_wb_cache_control`），测不到「已有断点」这个前提。
+    #[test]
+    fn existing_breakpoints_are_respected_and_capped() {
+        let ephemeral = json!({ "type": "ephemeral" });
+        let mut body = json!({
+            "model": "MiniMax-M3",
+            "system": [
+                { "type": "text", "text": "sys", "cache_control": ephemeral },
+            ],
+            "tools": [
+                { "name": "a", "input_schema": { "type": "object" }, "cache_control": ephemeral },
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "a", "cache_control": ephemeral },
+                        { "type": "text", "text": "b", "cache_control": ephemeral },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "tail" },
+                    ],
+                },
+            ],
+        });
+        assert_eq!(breakpoints(&body), 4, "前置条件：已有 4 个断点");
+        apply_prompt_cache_breakpoints(&mut body);
+        assert_eq!(breakpoints(&body), 4, "已有 4 个断点时必须停手（上限 4）");
+        // 且没有多打：末尾那个原本没断点的块保持没断点
+        assert!(body["messages"][1]["content"][0].get("cache_control").is_none());
+    }
+
+    /// 已有断点但未满 4 个时，只补到上限为止。
+    #[test]
+    fn budget_fills_up_to_the_cap() {
+        let mut body = json!({
+            "model": "MiniMax-M3",
+            "system": [
+                { "type": "text", "text": "sys" },
+            ],
+            "tools": [
+                { "name": "a", "input_schema": { "type": "object" }, "cache_control": { "type": "ephemeral" } },
+            ],
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "q", "cache_control": { "type": "ephemeral" } },
+                    { "type": "text", "text": "r", "cache_control": { "type": "ephemeral" } },
+                    { "type": "text", "text": "s" },
+                ] },
+            ],
+        });
+        assert_eq!(breakpoints(&body), 3, "前置条件：已有 3 个断点");
+        apply_prompt_cache_breakpoints(&mut body);
+        // 只剩 1 个预算 → 补给 system，总数到 4 就停，末尾块不再补
+        assert_eq!(breakpoints(&body), 4);
+        assert_eq!(body["system"][0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert!(body["messages"][0]["content"][2].get("cache_control").is_none());
+    }
+
+    /// thinking 块不可挂断点（Anthropic 会 400），要退到它前面那个 text 块。
+    #[test]
+    fn thinking_block_is_skipped_for_breakpoint() {
+        let chat = json!({
+            "messages": [
+                { "role": "user", "content": "q" },
+                { "role": "assistant", "content": "a", "reasoning_content": "thought" },
+            ],
+        });
+        let mut body = anthropic_request_from_chat(&chat, "MiniMax-M3").expect("转换必须成功");
+        apply_prompt_cache_breakpoints(&mut body);
+        // 最后一条 user 消息的末块是 text（不是 thinking）→ 断点落在它上面
+        let user_blocks = body["messages"][0]["content"].as_array().expect("块数组");
+        assert_eq!(user_blocks.last().and_then(|b| b.get("type")).and_then(Value::as_str), Some("text"));
+        assert_eq!(
+            user_blocks.last().and_then(|b| b.get("cache_control")),
+            Some(&json!({"type": "ephemeral"}))
+        );
+        // assistant 的 thinking 块绝不能带断点
+        for message in body["messages"].as_array().expect("messages") {
+            if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                        assert!(block.get("cache_control").is_none(), "thinking 块不许挂断点");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 空请求体（没有 system / tools / user 消息）不能 panic。
+    #[test]
+    fn empty_payload_is_safe() {
+        let chat = json!({ "messages": [] });
+        let mut body = anthropic_request_from_chat(&chat, "MiniMax-M3").expect("转换必须成功");
+        apply_prompt_cache_breakpoints(&mut body);
+        assert_eq!(breakpoints(&body), 0);
+        let mut not_object = json!("nonsense");
+        apply_prompt_cache_breakpoints(&mut not_object);
+        assert_eq!(not_object, json!("nonsense"));
     }
 
     #[test]

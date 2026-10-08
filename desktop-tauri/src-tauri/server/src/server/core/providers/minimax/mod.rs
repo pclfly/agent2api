@@ -229,6 +229,12 @@ impl ProviderAdapter for MinimaxAdapter {
         let mut payload = anthropic_outbound::anthropic_request_from_chat(body, &model)
             .map_err(|message| GatewayError::with_status(400, format!("请求体转换失败：{message}")))?;
         apply_thinking_from_client(&mut payload, &model, body);
+        // 提示缓存断点：Anthropic 协议是**显式断点制**，请求里没有
+        // `cache_control` 就等于关闭缓存（上游不命中、也不回报
+        // `cache_read_input_tokens`）—— 这正是「MiniMax 缓存读取恒为 0」的根因。
+        // 转换器是保真语义，客户端（chat 协议）不带断点就一个都不加，所以这里补。
+        // 见 `anthropic_outbound::apply_prompt_cache_breakpoints` 的说明。
+        anthropic_outbound::apply_prompt_cache_breakpoints(&mut payload);
         let headers = client::infer_headers(&credential);
         Ok(ChatRequestPlan {
             url: format!("{}{}", product::API_HOST, product::INFER_PATH),
@@ -582,6 +588,44 @@ mod tests {
         // 会话形态的请求体是 Anthropic Messages（不是 chat 体）
         assert_eq!(plan.response, UpstreamResponse::Anthropic);
         assert!(plan.body.get("system").is_none() || plan.body.get("system").is_some());
+    }
+
+    /// 转发请求**必须**带提示缓存断点。
+    ///
+    /// 这条钉的是「MiniMax 缓存读取恒为 0」那个缺陷：Anthropic 协议是显式断点制，
+    /// 出站请求没有 `cache_control` 上游就不命中、也不回报
+    /// `cache_read_input_tokens`。转换器是保真语义（客户端不带就不加），
+    /// 所以 `build_chat_request` 必须自己补上。
+    #[test]
+    fn build_request_carries_prompt_cache_breakpoints() {
+        let session = json!({
+            "endpoint": "https://agent.minimax.cn",
+            "edition": "cn",
+            "auth": { "accessToken": "mmoat_sess", "tokenType": "Bearer" },
+        });
+        let body = json!({
+            "model": "MiniMax-M3",
+            "messages": [
+                { "role": "system", "content": "you are helpful" },
+                { "role": "user", "content": "hi" },
+            ],
+            "stream": true,
+        });
+        let plan = MINIMAX_ADAPTER
+            .build_chat_request(&session, &body, &HeaderMap::new())
+            .expect("会话形态必须能构造请求");
+        // system 断点
+        assert_eq!(
+            plan.body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "system 上必须有缓存断点，否则上游不缓存"
+        );
+        // 最后一条 user 消息断点（字符串已升格成块数组）
+        assert_eq!(
+            plan.body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "最后一条 user 消息上必须有缓存断点"
+        );
     }
 
     /// 会话形态缺 token（例如记录里只有 refreshToken）时仍要如实报错。
