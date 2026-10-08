@@ -86,13 +86,13 @@ pub(super) async fn session_for(
 
 /// 本次请求使用的账号（对照 Node 的 selectTargetAccount，三级顺序）。
 ///
-///   1. 按**全局**优先级选（跳过禁用、限额冷却中与已达并发上限的账号），
-///      逐个向前找——跳过没有可用凭证的记录（避免选到空账号）；
+///   1. 按**全局**优先级选（跳过禁用、余额不足、限额冷却中与已达并发上限的
+///      账号），逐个向前找——跳过没有可用凭证的记录（避免选到空账号）；
 ///   2. 剩下的启用账号都在限额冷却期 / 已达并发上限 → 先在「未达并发上限」
 ///      的账号里挑恢复最早的一个试一次；一个都没有（全部达到并发上限）→
 ///      按**余量**挤占账号强塞（取舍见下方代码处的说明），
 ///      把上游真实的 429（含恢复时间）返回给客户端；
-///   3. 全部禁用 → 明确报 503，绝不回退到已禁用账号。
+///   3. 全部禁用（或全部余额不足）→ 明确报 503，绝不回退到已禁用 / 欠费账号。
 ///
 /// 候选集合 = `providers` 里各家的全部账号（见模块头）。`providers` 非空。
 ///
@@ -103,15 +103,25 @@ pub(super) async fn session_for(
 /// `session_key` 是会话粘性键（`upstream::session_affinity::derive_affinity_key`
 /// 从请求体派生；没有 messages 时为 None）：同一对话固定同一账号（prompt cache
 /// 命中），不同对话之间**轮询**分摊（见 `routing::pick_account_for_session`）。
+///
+/// `pinned` 是「这一轮只准用这个账号」（模型测试专用，见
+/// [`super::ForwardRequest::pinned_account`]）：候选池先被它收窄成一个账号，
+/// 上面那三级顺序对**那一个账号**照常生效 —— 它在限额冷却期时仍会被选中发一次，
+/// 这正是测试要的（把上游真实的 429 与恢复时间带回来，而不是换别人跑一遍）。
+///
+/// `model` 用于**按版本收窄候选池**（WorkBuddy 的版本独有模型，见
+/// [`accounts_for_model`]）：拆家后两个地区是两家 provider，收窄退化为
+/// 「按显式版本后缀点名一家」，两版都有的模型不收窄。
 pub(super) async fn select_target_account(
     service: &UpstreamService,
     providers: &[&str],
     keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
     session_key: Option<&str>,
+    pinned: Option<&str>,
     model: &str,
 ) -> Result<RouteTarget, GatewayError> {
-    let accounts = accounts_for_model(service, providers, model);
+    let accounts = accounts_for_model(service, providers, pinned, model);
     // 这些家都没有账号记录 → 用第一家的默认登录态（环境变量旁路等）
     if accounts.is_empty() {
         return Ok(RouteTarget {
@@ -124,6 +134,9 @@ pub(super) async fn select_target_account(
         });
     }
 
+    // 余额不足软跳过的候选先剔除（见 `filter_balance_blocked`），三级选择共用
+    let (candidates, balance_blocked_ids) = filter_balance_blocked(&accounts, pinned);
+
     // 在途计数快照取一次（锁是纳秒级的内存操作，见 connections.rs）：
     // 第一级与第二级共用同一份，两级看到的「谁在忙」是同一时刻的事实。
     let counts = connection_counts(service);
@@ -131,7 +144,7 @@ pub(super) async fn select_target_account(
     let now = logging::now_ms();
     loop {
         let picked = routing::pick_account_for_session(
-            &accounts,
+            &candidates,
             keys,
             &counts,
             &excluded,
@@ -150,12 +163,27 @@ pub(super) async fn select_target_account(
         excluded.push(id);
     }
 
-    let enabled: Vec<Value> = accounts
+    let enabled: Vec<Value> = candidates
         .iter()
         .filter(|account| !matches!(account.get("enabled"), Some(Value::Bool(false))))
         .cloned()
         .collect();
     if enabled.is_empty() {
+        // 剔除后一个可试的都没有：先分辨是不是余额不足造成的 —— 那与「全禁用」
+        // 是两件不同的事，用户要做的事也不一样（等余额回升 / 去启用账号）。
+        let enabled_total = accounts
+            .iter()
+            .filter(|account| !matches!(account.get("enabled"), Some(Value::Bool(false))))
+            .count();
+        if !balance_blocked_ids.is_empty() && enabled_total > 0 {
+            return Err(GatewayError::with_status(
+                503,
+                format!(
+                    "所有启用中的账号余额都低于阈值（已跳过 {} 个账号），无账号可转发：请等余额回升，或到账号设置里调整「余额不足处理」",
+                    balance_blocked_ids.len()
+                ),
+            ));
+        }
         return Err(GatewayError::with_status(
             503,
             "所有账号均已禁用，无账号可转发：请在账号页启用至少一个账号",
@@ -238,64 +266,87 @@ pub(super) use crate::server::core::routing::provider_of;
 /// 只会让签名更长；而它是**冷却键口径**的单一事实来源，不该在别处再写一遍。
 pub(super) use crate::server::core::routing::CooldownKeys;
 
-/// 候选账号池：`providers` 里各家的全部账号（公开形态，文件顺序）。
+/// 候选账号池：`providers` 里各家的全部账号（公开形态，文件顺序）；
+/// `pinned` 非空时再收窄成**那一个账号**（模型测试，见
+/// [`select_target_account`] 对该参数的说明）。
 ///
 /// 为什么在公开快照上过滤而不是用 `store.accounts_for_provider`：后者按
 /// 「启用且有凭证」过滤掉了禁用账号，而本模块的第三级选路（全禁用 → 503）
 /// 必须**看见**禁用账号才能给出准确文案。两者口径不同、各有用途。
-pub(super) fn accounts_in_providers(service: &UpstreamService, providers: &[&str]) -> Vec<Value> {
+///
+/// 收窄只做「过滤」，不报错也不回退：钉住的账号不在这几家（账号被删了、
+/// 或认错了家）时得到的是空池 —— 上游那条路径会照常给出「这些家都没有账号」
+/// 的既有语义，不会静默换一个账号去跑。
+pub(super) fn accounts_in_providers(
+    service: &UpstreamService,
+    providers: &[&str],
+    pinned: Option<&str>,
+) -> Vec<Value> {
     let snapshot = service.store.list_accounts();
     routing::accounts_of(&snapshot)
         .into_iter()
         .filter(|account| providers.contains(&provider_of(account)))
+        .filter(|account| match pinned {
+            Some(id) => routing::account_id(account) == Some(id),
+            None => true,
+        })
         .collect()
 }
 
 /// 候选账号池 + **按模型所属版本收窄**（WorkBuddy 的版本亲和）。
 ///
-/// ── 为什么需要它（模型 id 不带版本）──────────────────────────
-/// 对外 `/v1/models` 里同名模型只有一条（`fast-model` 国际版 x0.34 / 国内版
-/// x0.21 合并成一条），实际打哪个站点由**选中的账号**决定。对两版都有的模型
-/// 这没问题（同一个上游名字，谁都能跑），但**版本独有**的模型会被选错：
-/// `hy3-b` 只有国内版有、`gpt-5.6-sol` 只有国际版有，而选账号按优先级取队首
-/// （本机队首是国际版账号）→ 请求 `hy3-b` 打到 `www.workbuddy.ai`，上游回
-/// 「模型不存在」。
+/// ── 为什么还需要它（拆家后仍有用）───────────────────────────
+/// 拆家后两个地区是两家独立 provider，`providers` 已由 `forwarding_providers`
+/// 按清单分别命中 —— 因此「版本独有模型打错站」在结构上不再可能。
+/// 本函数保留的语义收窄为**显式版本后缀**：下游写了 `deepseek-v4.1-flash-intl`
+/// / `-cn` 时，点名只要那一家（不带后缀的请求名两家都在候选里，交给既有选路）。
 ///
-/// 收窄只在 [`ModelCatalog::edition_exclusive_of`] 给出唯一版本时发生；
-/// 两版都有的模型保持原集合，交给既有的优先级 / 并发 / 会话粘性选路。
+/// 收窄后一个都不剩时**退回原集合**：正确表现是上游如实报错，而不是
+/// 503「没有可用账号」（那会把排查方向引到账号页）。
 pub(super) fn accounts_for_model(
     service: &UpstreamService,
     providers: &[&str],
+    pinned: Option<&str>,
     model: &str,
 ) -> Vec<Value> {
-    let accounts = accounts_in_providers(service, providers);
+    let accounts = accounts_in_providers(service, providers, pinned);
     restrict_workbuddy_edition(accounts, model)
 }
 
 /// WorkBuddy 账号的版本收窄（其余家原样保留）。
+///
+/// 判据只有一条：请求名带显式版本后缀（`xxx-intl` / `xxx-cn`）。
+/// 「模型只属于某一个版本」那条判据随拆家退场 —— 那是「一个 provider 两份
+/// 清单」时代的补丁，现在两家 provider 各持一份清单，选路天然分流。
 ///
 /// ── 收窄后一个都不剩时**退回原集合**（有意）──────────────────
 /// 「那个版本一个可用账号都没有」的正确表现是上游如实报错（模型不存在 / 未授权），
 /// 而不是 503「没有可用账号」—— 后者会把排查方向引到账号页，而问题其实在
 /// 「这个模型属于另一个版本」。
 fn restrict_workbuddy_edition(accounts: Vec<Value>, model: &str) -> Vec<Value> {
-    use crate::server::core::models::{global_catalog, normalize_edition, split_edition_suffix};
-    // 两级判据，**显式后缀优先**：
-    //   1. 下游在模型名上写了版本（`deepseek-v4.1-flash-intl`）—— 用户明确要的版本；
-    //   2. 否则看模型是否**只属于**某一个版本（`hy3-b` 只在国内版）。
-    // 都没有（两版都有的模型、不认识的名字）→ 不收窄，交给既有选路。
-    let (_name, explicit) = split_edition_suffix(model);
-    let Some(edition) = explicit.or_else(|| global_catalog().edition_exclusive_of(model)) else {
+    use crate::server::core::models::{split_edition_suffix, EDITION_INTL};
+    let (_name, Some(edition)) = split_edition_suffix(model) else {
         return accounts;
     };
-    let workbuddy = crate::server::core::providers::DEFAULT_PROVIDER_ID;
+    let kind = if edition == EDITION_INTL {
+        crate::server::core::providers::ProviderKind::WorkBuddyIntl
+    } else {
+        crate::server::core::providers::ProviderKind::WorkBuddy
+    };
+    let wanted = crate::server::core::providers::kind_id(kind);
     let narrowed: Vec<Value> = accounts
         .iter()
         .filter(|account| {
-            if provider_of(account) != workbuddy {
+            // 只有 WorkBuddy 系受这条判据影响（后缀本来就是它家的路由手段）；
+            // 其余家原样保留 —— 别家的模型名可能恰好以 `-cn` 结尾。
+            if crate::server::core::providers::workbuddy::Region::from_provider_id(
+                provider_of(account),
+            )
+            .is_none()
+            {
                 return true;
             }
-            normalize_edition(account.get("edition").and_then(Value::as_str)) == edition
+            provider_of(account) == wanted
         })
         .cloned()
         .collect();
@@ -480,16 +531,66 @@ pub(super) fn connection_counts(service: &UpstreamService) -> HashMap<String, us
 /// `keys` 见 [`select_target_account`]：冷却按各家真名判定。
 /// 走与第一级选路同一个 `pick_account_by_priority`，并发上限的过滤
 /// （与软上限口径）由此自动获得 —— 换号顺延不会把请求塞回一个已达上限的账号。
+///
+/// `pinned` 见 [`select_target_account`]：钉住账号时，候选池里只有那一个账号、
+/// 它已经在 `tried_ids` 里 —— 本函数因此必然返回 None，也就是「不顺延」。
+/// 这条是刻意的：模型测试问的是「这个账号行不行」，换个人跑通只会把结论搅浑。
 pub(super) fn pick_next_account(
     service: &UpstreamService,
     providers: &[&str],
     keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
     model: &str,
+    pinned: Option<&str>,
 ) -> Option<Value> {
-    let accounts = accounts_for_model(service, providers, model);
+    let accounts = accounts_for_model(service, providers, pinned, model);
+    // 换号顺延与第一级选路同一份候选剔除：余额不足的账号不会在 429 之后
+    // 被当作「下一个」重新塞进来
+    let (candidates, _balance_blocked) = filter_balance_blocked(&accounts, pinned);
     let counts = connection_counts(service);
-    routing::pick_account_by_priority(&accounts, keys, &counts, tried_ids, logging::now_ms())
+    routing::pick_account_by_priority(&candidates, keys, &counts, tried_ids, logging::now_ms())
+}
+
+/// 余额不足软跳过的候选剔除：`lowBalance.mode == "skip"` 且最近读数低于阈值的
+/// 账号在进选路**之前**整体拿掉 —— 三级选择（正常选路 / 兜底等恢复 / 并发挤占）
+/// 共用这一份候选。余额不足与限流不同，是「等不起」的：限流有明确的恢复时间、
+/// 到点自然回来，硬塞一次还能把真实 429 带回来；余额不足硬塞只会吃上游的
+/// 402 / 403，拿不到任何有用的信息。
+///
+/// 判定读 `usage_records::balance_facts` 的内存事实表（零 IO，纳秒级查表），
+/// 数字是心跳 / 手动查询落库的最新读数 —— 余额回升后下一轮查询会刷新事实，
+/// 账号自动恢复参与，无需任何人手动清理。
+///
+/// `pinned`（模型测试）不剔除：测试要的是**那个账号**的真实反应 —— 余额不足时
+/// 把上游的拒绝原样带回来，与「限流中的账号仍会被钉住测试」同一取舍。
+/// 返回 `(剔除后的候选, 被剔除的账号 id 集合)`：调用方在「一个可试的都没有」时
+/// 用后者分辨 503 的原因（余额不足 vs 全禁用）。
+fn filter_balance_blocked(
+    accounts: &[Value],
+    pinned: Option<&str>,
+) -> (Vec<Value>, std::collections::HashSet<String>) {
+    if pinned.is_some() {
+        return (accounts.to_vec(), Default::default());
+    }
+    let facts = crate::server::core::usage_records::balance_facts();
+    let blocked_ids: std::collections::HashSet<String> = accounts
+        .iter()
+        .filter(|account| crate::server::core::usage_records::balance_blocked(account, &facts))
+        .filter_map(|account| routing::account_id(account).map(str::to_string))
+        .collect();
+    if blocked_ids.is_empty() {
+        return (accounts.to_vec(), blocked_ids);
+    }
+    let candidates = accounts
+        .iter()
+        .filter(|account| {
+            routing::account_id(account)
+                .map(|id| !blocked_ids.contains(id))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    (candidates, blocked_ids)
 }
 
 /// 该账号对该模型此前是否处于限额状态（用于「已恢复可用」日志的去噪）。
@@ -568,47 +669,19 @@ mod tests {
             .collect()
     }
 
-    /// 版本独有模型收窄 WorkBuddy 候选账号，其余家不受影响。
+    /// 版本后缀收窄 WorkBuddy 候选账号，其余家不受影响。
+    ///
+    /// 拆家后「版本独有模型打错站」在结构上不再可能（两个地区是两家 provider，
+    /// 请求按 `forwarding_providers` 的清单分流），因此收窄只剩**显式后缀**
+    /// 这一条判据：下游写 `xxx-intl` / `xxx-cn` 时点名只要那一家。
     #[test]
-    fn version_only_models_narrow_workbuddy_candidates() {
+    fn version_suffix_narrows_workbuddy_candidates() {
         let accounts = vec![
-            account("intl-1", "workbuddy", "intl"),
+            account("intl-1", "workbuddy-intl", "intl"),
             account("cn-1", "workbuddy", "cn"),
             account("raccoon-1", "raccoon", "cn"),
         ];
-        // 国内版独有 → 国际版账号被排除（否则请求会打到 www.workbuddy.ai 报模型不存在）
-        assert_eq!(
-            ids(&restrict_workbuddy_edition(accounts.clone(), "hy3-b")),
-            vec!["cn-1", "raccoon-1"]
-        );
-        // 国际版独有 → 国内版账号被排除
-        assert_eq!(
-            ids(&restrict_workbuddy_edition(accounts.clone(), "gpt-5.6-sol")),
-            vec!["intl-1", "raccoon-1"]
-        );
-        // 两版都有 → 原样（同一个上游名字，交给优先级 / 并发选路）
-        assert_eq!(restrict_workbuddy_edition(accounts.clone(), "fast-model").len(), 3);
-        // 不认识 → 原样
-        assert_eq!(restrict_workbuddy_edition(accounts, "no-such-model").len(), 3);
-    }
-
-    /// 收窄后一个账号都不剩时退回原集合：让上游如实报「模型不存在」，
-    /// 而不是 503「没有可用账号」（那会把排查方向引到账号页）。
-    #[test]
-    fn an_empty_narrowing_falls_back_to_the_full_set() {
-        let only_intl = vec![account("intl-1", "workbuddy", "intl")];
-        assert_eq!(ids(&restrict_workbuddy_edition(only_intl, "hy3-b")), vec!["intl-1"]);
-    }
-
-    /// 下游用版本后缀指定版本时，**后缀优先于「队首账号所属版本」** ——
-    /// 这是「两版都有的模型（`deepseek-v4.1-flash`）想固定走某一版」的唯一手段。
-    #[test]
-    fn an_explicit_edition_suffix_wins() {
-        let accounts = vec![
-            account("intl-1", "workbuddy", "intl"),
-            account("cn-1", "workbuddy", "cn"),
-            account("raccoon-1", "raccoon", "cn"),
-        ];
+        // `-intl` → 只留国际版那家（其余家不受影响）
         assert_eq!(
             ids(&restrict_workbuddy_edition(
                 accounts.clone(),
@@ -616,6 +689,7 @@ mod tests {
             )),
             vec!["intl-1", "raccoon-1"]
         );
+        // `-cn` → 只留国内版那家
         assert_eq!(
             ids(&restrict_workbuddy_edition(
                 accounts.clone(),
@@ -623,10 +697,42 @@ mod tests {
             )),
             vec!["cn-1", "raccoon-1"]
         );
-        // 不带后缀 → 两版都有 → 不收窄（走队首账号所属版本）
+        // 不带后缀 → 不收窄（两家的清单各自由 forwarding_providers 命中）
         assert_eq!(
-            restrict_workbuddy_edition(accounts, "deepseek-v4.1-flash").len(),
+            restrict_workbuddy_edition(accounts.clone(), "deepseek-v4.1-flash").len(),
             3
+        );
+        // 不认识的名字 → 原样
+        assert_eq!(restrict_workbuddy_edition(accounts, "no-such-model").len(), 3);
+    }
+
+    /// 收窄后一个账号都不剩时退回原集合：让上游如实报「模型不存在」，
+    /// 而不是 503「没有可用账号」（那会把排查方向引到账号页）。
+    #[test]
+    fn an_empty_narrowing_falls_back_to_the_full_set() {
+        // 只有国内版账号，却点名 `-intl` → 退回原集合（上游会如实报错）
+        let only_cn = vec![account("cn-1", "workbuddy", "cn")];
+        assert_eq!(
+            ids(&restrict_workbuddy_edition(
+                only_cn,
+                "deepseek-v4.1-flash-intl"
+            )),
+            vec!["cn-1"]
+        );
+    }
+
+    /// 别家的模型名恰好以 `-cn` / `-intl` 结尾时**不该被误伤** ——
+    /// 收窄只作用于 WorkBuddy 系的两家。
+    #[test]
+    fn suffix_narrowing_leaves_other_providers_alone() {
+        let accounts = vec![
+            account("intl-1", "workbuddy-intl", "intl"),
+            account("cn-1", "workbuddy", "cn"),
+            account("raccoon-1", "raccoon", "cn"),
+        ];
+        assert_eq!(
+            ids(&restrict_workbuddy_edition(accounts, "some-raccoon-model-intl")),
+            vec!["intl-1", "raccoon-1"]
         );
     }
 }

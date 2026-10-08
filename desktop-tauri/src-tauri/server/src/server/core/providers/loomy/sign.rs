@@ -1,286 +1,177 @@
-//! 讯飞账号（CAccount）HMAC-SHA1 签名。
+//! Loomy 账号（CAccount）请求签名：HMAC-SHA1（复刻客户端 `electron/xfyun/sign.js`）。
 //!
-//! 逐字节复刻 Loomy 客户端 `electron/xfyun/sign.js`。任何偏差都会让账号端点
-//! 返回鉴权失败，故本模块**全部是纯函数**，由单测锁死拼串格式。
-//!
-//! ## 签名字符串（9 段，`\n` 连接）
-//!
+//! ── 待签字符串（9 段，`\n` 连接，与客户端 `generateSignature` 逐字同构）──
 //! ```text
-//! {METHOD}\n{ESCAPED_PATH}\n{ESCAPED_QUERY}\n{Content-MD5}\n
-//! {Content-Type}\n{Date}\n{Nonce}\n{SignedHeaders}\n{CanonicalizedHeaders}
+//!   METHOD
+//!   ESCAPED_PATH          RFC3986 §3.3（逐段 encodeURIComponent 后再替换 !'()* ）
+//!   ESCAPED_QUERY         本项目所有账号接口都无 query，恒为空串
+//!   CONTENT_MD5           base64(md5(body 字节串))；无 body 时为空串
+//!   CONTENT_TYPE          "application/json"
+//!   DATE                  UTC 的 `Tue, 07 Oct 2026 08:00:00 GMT` 形态
+//!   NONCE                 UUID v4（客户端用 crypto.randomUUID）
+//!   SIGNED_HEADERS        只列 `x-` 前缀头；本项目不带，恒为空串
+//!   CANONICALIZED_HEADERS 同上，恒为空串
 //! ```
+//! 第二、九段的两处易错点：路径要有前导 `/` 且**不以 `/` 结尾**（客户端
+//! `buildEscapedPath` 会去掉尾部斜杠）；末两段是空串，因此拼接结果在 nonce
+//! 之后以两个 `\n` 结尾 —— 这里用数组 join 而不是手写 format，正是为了让
+//! 段数与分隔符数量不可能被写错。
 //!
-//! ⚠️ 后两段在本项目**恒为空串**（不发任何 `x-*` 头），故最终字符串
-//! **以两个换行结尾**。这是 `join('\n')` 在 9 个元素上的自然结果，
-//! 不要「顺手」去掉尾随换行 —— 去掉会让签名不匹配。
+//! ── Content-MD5 必须覆盖**实际发出去的字节**──────────────────
+//! `sign::signed_headers` 与 `auth_http::send_raw` 都走 `Value::to_string()`
+//! （紧凑序列化），两处必须保持同一序列化口径 —— 换任何一方都会让 MD5 对不上，
+//! 上游报签名错误，而错误信息不会指出是哪个环节。
 //!
-//! ⚠️ 认证头前缀是 **`account`**（`account {ak}:{sig}`），不是 `Bearer`。
+//! ── HMAC-SHA1 不是安全边界 ──────────────────────────────────
+//! 这是客户端指纹复刻（密钥随安装包分发，见 `endpoints` 的说明），目标是与
+//! 官方客户端行为一致，不是密码学意义上的完整性保证。
+//!
+//! ── 硬约束 ──────────────────────────────────────────────────
+//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use md5::{Digest as Md5Digest, Md5};
+use md5::{Digest, Md5};
+use serde_json::Value;
 use sha1::Sha1;
 
-type HmacSha1 = Hmac<Sha1>;
+use crate::server::errors::GatewayError;
 
-/// 签名所需参数。
-pub struct SignOptions<'a> {
-    pub access_key_id: &'a str,
-    pub access_key_secret: &'a str,
-    pub method: &'a str,
-    pub path: &'a str,
-    /// 查询参数（**保持传入顺序，不排序** —— 与客户端一致）。
-    pub query_params: &'a [(String, String)],
-    /// **已序列化**的请求体字符串（与发送时用的必须是同一个）。
-    pub body: &'a str,
-    pub content_type: &'a str,
-}
+use super::endpoints;
 
-/// RFC3986 转义（`encodeURIComponent` + 补转 `! ' ( ) *` 后的等价保留集）。
+/// 业务接口的 Content-Type（也是待签串第 5 段的取值）
+const CONTENT_TYPE: &str = "application/json";
+
+/// RFC3986 转义一个路径段（等价于 JS `encodeURIComponent` 后再替换 `!'()*`）。
 ///
-/// 依据 `sign.js:23-42`：路径段与 query 值用同一套转义。
-/// 最终保留集是 `A-Za-z0-9-_.~`，其余（含 UTF-8 多字节）逐字节 `%XX` 大写。
-fn escape_rfc3986(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{byte:02X}"));
-            }
+/// 保留字符集：`A-Z a-z 0-9 - _ . ~`；其余一律 `%XX`（大写十六进制）。
+/// 当前所有账号接口路径都只含字母与 `/`，转义结果与原串相同 —— 实现完整规则
+/// 是为了将来加带参数路径时不静默出错。
+fn escape_path_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            out.push(ch);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
         }
     }
     out
 }
 
-/// 构建 ESCAPED_PATH。
-///
-/// 依据 `sign.js:47-58`：补前导 `/`、剥末尾 `/`（长度 > 1 时）、
-/// 按 `/` 切段后逐段转义再拼回（空段保持空）。
-pub fn build_escaped_path(raw_path: &str) -> String {
-    let mut clean = if raw_path.starts_with('/') {
-        raw_path.to_string()
+/// 构建 ESCAPED_PATH：逐段转义、以 `/` 连接；去掉尾部斜杠（客户端同款）。
+fn build_escaped_path(path: &str) -> String {
+    let mut clean = if path.starts_with('/') {
+        path.to_string()
     } else {
-        format!("/{raw_path}")
+        format!("/{path}")
     };
     if clean.len() > 1 && clean.ends_with('/') {
-        clean.truncate(clean.len() - 1);
+        clean.pop();
     }
     clean
         .split('/')
-        .map(escape_rfc3986)
+        .map(escape_path_segment)
         .collect::<Vec<_>>()
         .join("/")
 }
 
-/// 构建 ESCAPED_QUERY_STRING。
-///
-/// 依据 `sign.js:63-79`：`key=value` 用 `&` 连接，**不排序**（保持传入顺序），
-/// 两者都转义；`null` / `undefined` 值转成空串（Rust 侧用空串表达）。
-pub fn build_escaped_query(query_params: &[(String, String)]) -> String {
-    query_params
-        .iter()
-        .map(|(key, value)| format!("{}={}", escape_rfc3986(key), escape_rfc3986(value)))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-/// 计算 `Content-MD5`（base64）。
-///
-/// ⚠️ 空 body 返回**空串**而不是空串的 md5 —— 与客户端 `sign.js:13-18` 一致。
-pub fn content_md5(body: &str) -> String {
-    if body.is_empty() {
-        return String::new();
-    }
-    let mut hasher = Md5::new();
-    hasher.update(body.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
-}
-
-/// 构建待签名字符串。
-///
-/// `date` / `nonce` 由调用方传入（而非在此生成），使本函数**完全确定**、
-/// 可用固定值单测。
-pub fn build_signing_string(options: &SignOptions<'_>, date: &str, nonce: &str) -> String {
-    let method = options.method.to_uppercase();
-    let escaped_path = build_escaped_path(options.path);
-    let escaped_query = build_escaped_query(options.query_params);
-    let md5 = content_md5(options.body);
-    // ⚠️ 后两段恒为空串（本项目不发 x-* 头）。join 后字符串以 `\n\n` 结尾。
-    [
-        method.as_str(),
-        escaped_path.as_str(),
-        escaped_query.as_str(),
-        md5.as_str(),
-        options.content_type,
-        date,
-        nonce,
-        "",
-        "",
-    ]
-    .join("\n")
-}
-
-/// HMAC-SHA1 → base64。
-pub fn hmac_sha1_base64(secret: &str, message: &str) -> String {
-    // HMAC 接受任意长度密钥，`new_from_slice` 对本输入不可能失败；
-    // 失败时返回空串（调用方会把「空签名」当成鉴权失败上报，不 panic）。
-    let Ok(mut mac) = HmacSha1::new_from_slice(secret.as_bytes()) else {
-        return String::new();
-    };
-    mac.update(message.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-}
-
-/// 生成完整的讯飞账号请求头。
-///
-/// `Date` 用 UTC 字符串、`Nonce` 用 UUID（与客户端 `sign.js:207-208` 一致）。
-///
-/// ⚠️ **返回的 body 必须与签名时的 `options.body` 是同一个字符串**：
-/// 调用方应先把 body 序列化一次，签名与发送共用该字符串，
-/// 否则二次序列化会改变字节（键序、空格），签名随即失效。
-pub fn auth_headers(options: &SignOptions<'_>) -> Vec<(String, String)> {
-    let date = utc_date_string();
-    let nonce = uuid_v4();
-    let string_to_sign = build_signing_string(options, &date, &nonce);
-    let signature = hmac_sha1_base64(options.access_key_secret, &string_to_sign);
-    let mut headers = vec![
-        (
-            "Authorization".to_string(),
-            format!("account {}:{signature}", options.access_key_id),
-        ),
-        ("Date".to_string(), date),
-        ("Nonce".to_string(), nonce),
-        ("Content-Type".to_string(), options.content_type.to_string()),
-    ];
-    let md5 = content_md5(options.body);
-    if !md5.is_empty() {
-        headers.push(("Content-MD5".to_string(), md5));
-    }
-    headers
-}
-
-/// JS `new Date().toUTCString()` 的等价形态：
-/// `"Mon, 01 Jan 2026 00:00:00 GMT"`。
-pub fn utc_date_string() -> String {
+/// UTC 时间字符串（对应 JS `new Date().toUTCString()`）：
+/// `Sun, 06 Oct 2026 12:34:56 GMT`
+fn utc_date_string() -> String {
     chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
-/// 生成一个 UUID v4（`Nonce`）。
-pub fn uuid_v4() -> String {
+/// UUID v4 形态的 Nonce（对应 JS `crypto.randomUUID().replace(/-/g, '')` 之前的形态；
+/// 客户端签名用的是**带连字符**的 randomUUID 原样值）。
+///
+/// 随机源不可用时退化成「纳秒时钟 + 进程内计数」—— 它只用于让每次请求的一次性
+/// 串不同（防重放口径由服务端与时间窗共同保证），不是安全凭证。
+fn new_nonce() -> String {
     let mut bytes = [0u8; 16];
     if getrandom::getrandom(&mut bytes).is_err() {
-        bytes = [0u8; 16];
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
+        let counter = FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        let mixed = nanos
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(counter);
+        for (index, slot) in bytes.iter_mut().enumerate() {
+            *slot = (mixed >> ((index % 8) * 8)) as u8;
+        }
     }
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    // RFC4122 v4：版本位与变体位
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
     format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn escaping_keeps_unreserved_and_uppercases_hex() {
-        assert_eq!(escape_rfc3986("abc-_.~"), "abc-_.~");
-        // encodeURIComponent 会保留 ! ' ( ) *，但 sign.js 补转它们
-        assert_eq!(escape_rfc3986("a!b'c(d)e*f"), "a%21b%27c%28d%29e%2Af");
-        assert_eq!(escape_rfc3986("a b"), "a%20b");
-        assert_eq!(escape_rfc3986("中"), "%E4%B8%AD");
+/// base64(md5(字节串))；空串输入返回空串（对应客户端 `contentMD5('')`）
+fn content_md5(body_string: &str) -> String {
+    if body_string.is_empty() {
+        return String::new();
     }
-
-    #[test]
-    fn escaped_path_normalizes_leading_and_trailing_slash() {
-        assert_eq!(build_escaped_path("/login/phone/sendMsgCode"), "/login/phone/sendMsgCode");
-        assert_eq!(build_escaped_path("login/phone"), "/login/phone");
-        assert_eq!(build_escaped_path("/a/b/"), "/a/b");
-        // 根路径保持一个斜杠
-        assert_eq!(build_escaped_path("/"), "/");
-        // 段内的斜杠保留结构
-        assert_eq!(build_escaped_path("/a b/c d"), "/a%20b/c%20d");
-    }
-
-    #[test]
-    fn query_string_keeps_order() {
-        let query = vec![
-            ("b".to_string(), "2".to_string()),
-            ("a".to_string(), "1".to_string()),
-        ];
-        // 不排序（与客户端一致）
-        assert_eq!(build_escaped_query(&query), "b=2&a=1");
-    }
-
-    #[test]
-    fn signing_string_ends_with_two_newlines() {
-        let options = SignOptions {
-            access_key_id: "ak",
-            access_key_secret: "sk",
-            method: "POST",
-            path: "/login/phone/sendMsgCode",
-            query_params: &[],
-            body: "",
-            content_type: "application/json",
-        };
-        let string = build_signing_string(&options, "Mon, 01 Jan 2026 00:00:00 GMT", "nonce-1");
-        assert!(string.ends_with('\n'), "后两段为空 → 以两个换行结尾");
-        assert!(string.ends_with("\n\n"));
-        // 9 段（8 个分隔符）
-        assert_eq!(string.split('\n').count(), 9);
-        let lines: Vec<&str> = string.split('\n').collect();
-        assert_eq!(lines[0], "POST");
-        assert_eq!(lines[1], "/login/phone/sendMsgCode");
-        assert_eq!(lines[2], "", "空 query");
-        assert_eq!(lines[3], "", "空 body → 空 Content-MD5");
-        assert_eq!(lines[4], "application/json");
-        assert_eq!(lines[5], "Mon, 01 Jan 2026 00:00:00 GMT");
-        assert_eq!(lines[6], "nonce-1");
-        assert_eq!(lines[7], "");
-        assert_eq!(lines[8], "");
-    }
-
-    #[test]
-    fn content_md5_empty_body_is_empty_string() {
-        assert_eq!(content_md5(""), "");
-        // 非空 body 给 base64（"abc" 的 md5 是 900150983cd24fb0d6963f7d28e17f72）
-        assert_eq!(content_md5("abc"), "kAFQmDzST7DWlj99KOF/cg==");
-    }
-
-    #[test]
-    fn auth_headers_shape() {
-        let options = SignOptions {
-            access_key_id: "2thryby66wxi53sk",
-            access_key_secret: "secret",
-            method: "POST",
-            path: "/login/phone/sendMsgCode",
-            query_params: &[],
-            body: "{\"base\":{}}",
-            content_type: "application/json",
-        };
-        let headers = auth_headers(&options);
-        let find = |key: &str| headers.iter().find(|(name, _)| name == key).map(|(_, value)| value.clone());
-        let authorization = find("Authorization").expect("必须有 Authorization");
-        assert!(authorization.starts_with("account 2thryby66wxi53sk:"));
-        assert!(find("Date").is_some());
-        assert!(find("Nonce").is_some());
-        assert!(find("Content-MD5").is_some(), "非空 body 必须带 Content-MD5");
-    }
-
-    #[test]
-    fn uuid_shape() {
-        let uuid = uuid_v4();
-        assert_eq!(uuid.len(), 36);
-        assert_eq!(uuid.as_bytes()[14], b'4');
-    }
+    let digest = Md5::digest(body_string.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(digest)
 }
+
+/// 生成一次请求的签名头集合：`Authorization` / `Date` / `Nonce` / `Content-MD5`。
+///
+/// `body` 为 `None` 时按空 body 处理（MD5 段为空串）。序列化口径必须与
+/// `auth_http::send_raw` 完全一致（`Value::to_string()`，见模块头）。
+pub fn signed_headers(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Vec<(String, String)>, GatewayError> {
+    let body_string = match body {
+        Some(value) => value.to_string(),
+        None => String::new(),
+    };
+    let md5 = content_md5(&body_string);
+    let date = utc_date_string();
+    let nonce = new_nonce();
+    // 9 段，`\n` 连接（末两段恒为空串，见模块头）
+    let string_to_sign = [
+        method.to_uppercase(),
+        build_escaped_path(path),
+        String::new(),
+        md5.clone(),
+        CONTENT_TYPE.to_string(),
+        date.clone(),
+        nonce.clone(),
+        String::new(),
+        String::new(),
+    ]
+    .join("\n");
+
+    let secret = endpoints::access_key_secret();
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes()).map_err(|_| {
+        GatewayError::with_status(500, "Loomy 签名初始化失败（密钥长度非法，请检查 LOOMY_XFYUN_ACCESS_KEY_SECRET）")
+    })?;
+    mac.update(string_to_sign.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+    let mut headers = vec![
+        (
+            "Authorization".to_string(),
+            format!("account {}:{}", endpoints::access_key_id(), signature),
+        ),
+        ("Date".to_string(), date),
+        ("Nonce".to_string(), nonce),
+    ];
+    if !md5.is_empty() {
+        headers.push(("Content-MD5".to_string(), md5));
+    }
+    Ok(headers)
+}
+

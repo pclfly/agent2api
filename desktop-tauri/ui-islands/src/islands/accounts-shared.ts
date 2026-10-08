@@ -51,11 +51,26 @@ export type AccountRecord = {
   provider?: string
   name?: string
   nickname?: string
+  /** 用户显式设置过备注名（后端在 update_account 真正改到 name 时打的标，见 apply_patch） */
+  nameCustom?: boolean
   email?: string
   priority?: number
   enabled?: boolean
+  /** 凭证完整性（后端逐家给出；缺省视为可用）：false = 登录态缺失 / 凭证不全。
+   *  余额的批量目标集合按它排除（与后端 `resolve_batch_targets` 同一口径），
+   *  与 `enabled` 是两回事 —— 禁用只表示不参与转发，余额仍可查。 */
+  available?: boolean
   /** 桌面端实时登录态（凭证每次从客户端登录态文件读取） */
   desktop?: boolean
+  /**
+   * 后端注入的**跨家事实**：这条账号有没有可用凭证（`has_token || desktop ||
+   * apiKey || jwt || noAuth`，见后端 `state::has_credentials`）。
+   *
+   * 界面现在只用它做一件事：给「自定义账号且没有凭证」标一枚「未配置凭证」——
+   * 那种账号在选路里会被静默跳过，不标出来用户看不出为什么请求发不出去。
+   * 缺失（旧版后端）按「有凭证」处理，宁可少标一枚徽章也不要误报。
+   */
+  hasCredentials?: boolean
   edition?: string
   editionLabel?: string
   chatSupported?: boolean
@@ -64,11 +79,30 @@ export type AccountRecord = {
   zcodePlan?: string
   hasRefreshToken?: boolean
   hasBalanceToken?: boolean
+  /**
+   * 自定义账号：记录里有没有非空 `apiKey`（设置弹窗据此决定输入框的提示文案与
+   * 有无「清除」按钮）。**值本身绝不透出**，后端只给这个布尔。
+   */
+  hasApiKey?: boolean
+  /** 自定义账号：是否声明了「该上游无需鉴权」（与 `hasApiKey` 互斥，见后端 `state::no_auth`） */
+  noAuth?: boolean
   maxConcurrent?: number
   /** 出站身份（workbuddy 专属，缺省 `wb`）：`wb` / `vsc` / `cli` —— 见 identity-dialog.tsx */
   product?: string
   productLabel?: string
   checkinAt?: number
+  /**
+   * 每账号自动余额查询设置（后端公开形态恒为对象；**缺省 = 开启、1 分钟**，
+   * 显式 `{enabled:false}` 才是关；见 accounts-domain 的 `usageQueryOf`）。
+   * `interval` 单位是秒（30 ~ 86400）。
+   */
+  usageQuery?: { enabled?: boolean; interval?: number }
+  /**
+   * 余额不足时的处理（后端公开形态恒为对象；**缺省 = 跳过、阈值 1**，显式
+   * `off` 才是关；见 `lowBalanceOf`）。`threshold` 与余额列同一数字口径
+   * （`available` / workbuddy 家的 `totalLeft`）。
+   */
+  lowBalance?: { mode?: 'off' | 'skip' | 'disable'; threshold?: number }
   addedAt?: number
   updatedAt?: number
   tokenTail?: string
@@ -93,11 +127,38 @@ export type UsageEntry = null | string | Record<string, unknown> | undefined
 export type Align = 'left' | 'center' | 'right'
 
 /**
- * 行内明细面板的 kind。**只剩「限流明细」一种**：签到曾经也有一个明细面板，
- * 已按要求删除 —— 签到的结果现在只落在行上那颗按钮（状态 + title 里的失败原因）
- * 与一条 toast 上，见 accounts-data.ts 的 `checkinErrors`。
+ * 行内明细面板的 kind。**只剩「限流明细」一种**：签到曾也有一个明细面板，
+ * 已随表格化删除；账号页的签到按钮又整体迁去了「签到中心」，行内面板
+ * 与签到从此互不相干。
  */
 export type PanelKind = 'limits'
+
+/* ─── Loomy 新手任务 ─────────────────────────
+ *
+ * 类型在这里、消费在签到中心（checkin-page.tsx / checkin-state.ts）：任务状态
+ * 是上游查询，签到中心的快照刻意不带，按账号惰性查询后缓存。账号页曾有一个
+ * 「签到后自动弹窗领取」的链路（accounts-dialog-onboarding），随账号页签到
+ * 按钮一起移除 —— 签到后的自动处理由 checkin-state.ts 承接。 */
+
+/** 后端任务行的原始形状（`GET /api/accounts/{id}/onboarding` 的 tasks 数组元素） */
+export type OnboardingTaskRaw = {
+  key?: unknown
+  title?: unknown
+  group?: unknown
+  points?: unknown
+  done?: unknown
+}
+
+/** 渲染用的归一形状（claiming / error 是前端运行态，后端没有） */
+export type OnboardingTask = {
+  key: string
+  title: string
+  group: string
+  points: number
+  done: boolean
+  claiming?: boolean
+  error?: string
+}
 
 /* ─── 全局桥 ─────────────────────────────────── */
 
@@ -123,12 +184,6 @@ export type AccountsBridge = {
   } | null | undefined>
   getAllBalances(id?: string): Promise<{ results?: Array<Record<string, unknown>> } | null | undefined>
   getBalancesSnapshot(): Promise<{ at?: number; results?: Array<Record<string, unknown>> } | null | undefined>
-  checkinAllAccounts(id?: string | null): Promise<{
-    results?: Array<Record<string, unknown>>
-    succeeded?: number
-    total?: number
-    skipped?: number
-  } | null | undefined>
   getProxies(): Promise<{ clash?: ClashSnapshot } | null | undefined>
   /** 代理池列表（「网络代理」页维护的命名代理）：账号代理表单的
    *  「已保存的代理」下拉读它；写侧（增删改）只有那一页用，不在这份桥里 */
@@ -287,8 +342,14 @@ export type SharedWindow = {
   }
   /** 自定义提供商目录（查一家 / 改一家 / 删一家），账号设置弹窗里的「提供商」一段用它 */
   wbCustomProvidersUi?: {
-    find?: (id: string) => Promise<{ id: string; name?: string; protocol?: string; baseUrl?: string } | null | undefined>
-    update?: (patch: { id: string; name: string; protocol: string; baseUrl: string }) => Promise<unknown>
+    find?: (id: string) => Promise<{
+      id: string; name?: string; protocol?: string; baseUrl?: string
+      /** 客户端形态伪装（'' / 'opencode'）：账号设置弹窗的「提供商」段读它做初值 */
+      clientEmulation?: string
+    } | null | undefined>
+    update?: (patch: {
+      id: string; name: string; protocol: string; baseUrl: string; clientEmulation?: string
+    }) => Promise<unknown>
     remove?: (id: string) => Promise<boolean>
   }
   /** 并发上限小对话框（已迁的岛，见 conc-dialog.tsx） */

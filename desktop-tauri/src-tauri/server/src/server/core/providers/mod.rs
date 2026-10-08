@@ -116,6 +116,7 @@ pub mod content_block;
 /// 形态调用它 —— 挂在这里与其它子模块并列，便于对照「内置家走适配器、
 /// 自定义家走独立通道」的两条路径。
 pub mod custom;
+pub mod kuku;
 /// LobsterAI（有道龙虾）。适配器 / 凭据 / 登录 / 目录 / 签到 / 积分
 /// 全部在 `lobsterai/` 下（模块头有协议速览与出站指纹说明）。
 /// 参照实现为参考仓库的 `src/lobsterai*.ts`。
@@ -150,8 +151,33 @@ use serde_json::{json, Value};
 /// 加新家请加在**末尾**并同步 `PROVIDERS`。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ProviderKind {
-    /// WorkBuddy（原唯一上游）
+    /// WorkBuddy **国内版**（原唯一上游；`copilot.tencent.com`）
     WorkBuddy,
+    /// WorkBuddy **国际版**（`www.workbuddy.ai`，`workbuddy-intl`）。
+    ///
+    /// ── 为什么两个地区是两家 provider（2026-10 拆分的由来）──────
+    /// 与 AutoClaw / Accio / ZCode 的两个地区、Cline 的两个额度池同一思路 ——
+    /// 本家是最后一个补齐的：早先「地区是账号上的 `edition` 字段」，
+    /// 后果是三处具体故障（完整论证见 `workbuddy::region` 的模块头）：
+    ///   1. 模型目录只有一份（单槽缓存 + 单条刷新排期），两个地区的清单
+    ///      互相覆盖，不可能同时存在（issue #74）；
+    ///   2. 模型规则只有一套 `(provider, id)` 命名空间，同名模型在两个地区
+    ///      无法区分、无法分别点名（issue #89）；
+    ///   3. 转发候选账号不含地区，请求可能落到另一个地区的账号上，而
+    ///      「模型不存在」的 400 是 `Fatal`、不会换账号，直接失败。
+    ///
+    /// ── provider id 为什么只有国际版是新 id ──────────────────────
+    /// 国内版保持 `"workbuddy"` 不动：它是存量账号的落盘契约（改名会让账号
+    /// 升级后变成「未知 provider」而静默消失）。国际版取 `"workbuddy-intl"`，
+    /// 存量国际版账号由 `account_store::migrate_startup` 原地归位。
+    ///
+    /// ── 实现是**一套**（与 AutoClaw 等各家同款）──────────────────
+    /// `workbuddy::adapter::WorkBuddyAdapter` 持有一个 `workbuddy::region::Region`，
+    /// 两个静态实例（`WORKBUDDY_ADAPTER` / `WORKBUDDY_INTL_ADAPTER`）由
+    /// `adapter_for` 按 kind 给出。地区 → provider 的互查在 `Region`
+    /// （`kind` / `provider_id` / `from_provider_id`），别处不要再写
+    /// `"workbuddy-intl"` 这类字面量。
+    WorkBuddyIntl,
     /// 小浣熊（适配实现在 `raccoon/`：JWT 凭证 + `/model_catalog` + SSE 回写）
     Raccoon,
     /// CatPaw（美团；架构文档 §9）。适配实现在 `catpaw/adapter.rs`
@@ -314,26 +340,43 @@ pub enum ProviderKind {
     /// 积分读 `/api/user/profile-summary` 的 `creditItems[]`。
     /// 因此本家**在** `core::auto_checkin` 的提供商清单里。
     LobsterAi,
-    /// Loomy（讯飞办公助手）。适配实现在 `providers::loomy/`。
+    /// Loomy（讯飞系桌面客户端）。适配实现在 `loomy/`：账号管理（手机号验证码
+    /// 登录 / 粘贴 session）**加推理转发**（OpenAI 兼容、无状态、`token` +
+    /// `Bearer` 双头鉴权）。
     ///
-    /// ── 上游长什么样（参照参考实现的 `loomy*.ts`）───────────
-    /// 对话是**标准 OpenAI 兼容 + 标准 SSE**（`loomyad.xunfei.cn/api/v1`），
-    /// 因此走**无状态**转发路径。登录是**短信验证码**（讯飞 CAccount，
-    /// HMAC-SHA1 签名 —— 本项目唯一一家短信登录的反代，与 AutoClaw 的
-    /// 短信登录共用 `api/session` 那条链路、按 provider 分派）。
+    /// ── 上游长什么样（从安装包 app.asar 逆向，见 `loomy/mod.rs` 的模块头）──
+    /// 三套平面：账号 CAccount（`account.xfinfr.com`，HMAC-SHA1 签名头、密钥是
+    /// 客户端内置的 AccessKey 对）、集成网关（`loomyad.xunfei.cn`，积分与每日
+    /// 登录刷新）、模型网关（集成网关 + `/api/v1`，OpenAI 协议）。
     ///
-    /// ── 两个必须记住的坑（写死在协议层）────────────────────
-    /// 1. **两套认证头**：`/chat/completions` 只认 `Authorization: Bearer`，
-    ///    而 `/models`、`/points/*` 只认小写 `token` 头 —— 转发时两个都发；
-    /// 2. **没有 refresh 端点**：session 是登录时声明 14 天得来的，
-    ///    过期只能重新短信登录。故 `supports_refresh()` 恒 false ——
-    ///    诚实标记，不是遗漏（与 CatPaw 同一处境、同一处置）。
+    /// ── 两处与别家不同、值得先知道的事实 ───────────────────────
+    ///   1. **没有续期**（`supports_refresh = false`）：session 14 天，上游没有
+    ///      refresh 接口，过期只能重新短信登录；
+    ///   2. **没有桌面端导入**：登录态不在可读文件里（与 Accio / ZCode 同一
+    ///      处境），入口是「短信登录」与「粘贴 session」。
     ///
-    /// ── 签到与积分都在 ──────────────────────────────────────
-    /// 签到是 `POST /points/first-login`（幂等判据 `alreadyProcessed`），
-    /// 积分读 `/points/records`（只读，两个池分开显示）。
-    /// 因此本家**在** `core::auto_checkin` 的提供商清单里。
+    /// ── 签到形态与别家不同 ──────────────────────────────────
+    /// 本家没有独立的签到接口，「每日赠送积分」由**每日首次登录**触发刷新
+    /// （`POST /api/v1/points/first-login`）。它已接进 `core::auto_checkin`
+    /// （清单里列 `loomy`），claim 见 `loomy::checkin`。
     Loomy,
+    /// KukuAI（百度文库「库库 AI / GenFlowPro」，`kuku.baidu.com`）。适配实现
+    /// 在 `kuku/`：账号管理（粘贴 Cookie / 导入本机客户端登录态）**加推理转发**
+    /// （建会话 → 分配算力 → SSE 的自有三步时序，`is_stateful()` 为 true，
+    /// 会话是**请求内**的、不跨请求保持状态）。
+    ///
+    /// ── 上游长什么样（从客户端 app.asar 逆向 + 参考实现实测，见模块头）──
+    /// 认证是三个 Cookie（`BDUSS` / `STOKEN` / `gfprotpl=genflowpro`），
+    /// **没有刷新接口**（`supports_refresh = false`，过期只能重新登录/重新导入，
+    /// 与 CatPaw 同一处境）；模型是 `/wenchain/genflowpro/model_list` 的
+    /// `model_name`（静态兜底 + 远程刷新）；余额是
+    /// `/bizapi/gfpro/getgfvipremain`（`data.list[0].totalPoint`）。
+    ///
+    /// ── 签到形态 ────────────────────────────────────────────
+    /// 「免费领积分」活动的每日任务（每日登录 / 完成一次对话），已接进
+    /// `core::auto_checkin`（清单里列 `kuku`），claim 见 `kuku::checkin`。
+    /// 业务会话靠换发的 genflowpro STOKEN（`kuku::engine`）。
+    Kuku,
     /// MiniMax Code（**中国版**）。适配实现在 `providers::minimax/`。
     ///
     /// ── 上游长什么样（参照参考实现的 `minimax*.ts`）─────────
@@ -387,7 +430,22 @@ pub struct ProviderMeta {
 /// 注册表顺序只用于**展示**（providers 摘要、模型目录合并时同名模型的去重顺序）
 /// 与旧数据迁移（把按家分队的优先级合并成全局队列时，作为旧默认路由顺序的依据）。
 pub const PROVIDERS: &[ProviderMeta] = &[
-    ProviderMeta { id: "workbuddy", label: "WorkBuddy" },
+    // WorkBuddy 两个地区都带上版本后缀（与 AutoClaw / ZCode 同款）：拆家后它们
+    // 是**两家独立的提供商**，名字是用户区分它们的唯一线索 —— 只给国际版加后缀
+    // 会让「WorkBuddy」读起来像「两地通吃的那一家」，而那正是拆家前的误解
+    // （issue #74 / #89 的根子）。业务口径不受影响：归谁家一律看 provider id，
+    // 没有任何判定读展示名。
+    //
+    // 例外（有意，别顺手统一）：壳侧登录窗口标题的品牌名仍是中性「WorkBuddy」，
+    // 由它自己拼版本后缀（拼成「登录 WorkBuddy 国内版账号」）；`/health` 的
+    // `product` 字段也仍是 "WorkBuddy" —— 桌面端靠它认出自家网关的端口。
+    // 这两处都不是「这一家在界面上的名字」，各自有各自的契约。
+    ProviderMeta { id: "workbuddy", label: "WorkBuddy 国内版" },
+    // 两个地区**相邻**排列（与 AutoClaw / Accio / ZCode 同一理由：同一条产品线的
+    // 两个版本，中间隔着别家会让「找国际版」变成一次扫描）。
+    // 顺序也决定模型目录合并时同名模型先归谁家 —— 国内版在前，与存量账号的
+    // 归属一致。
+    ProviderMeta { id: "workbuddy-intl", label: "WorkBuddy 国际版" },
     ProviderMeta { id: "raccoon", label: "小浣熊" },
     ProviderMeta { id: "catpaw", label: "CatPaw" },
     // AutoClaw 两个地区**相邻**排列（本次改动的要求）：界面上它们是同一条产品线的
@@ -410,14 +468,17 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "zcode-intl", label: "ZCode 国际版" },
     ProviderMeta { id: "codearts", label: "CodeArts" },
     ProviderMeta { id: "trae", label: "Trae" },
-    // 三家新反代（Phase 0 骨架接入）：都是「登录态 + 模型转发 + 签到 + 积分」
-    // 的完整反代形态，排列按产品线的常见程度（LobsterAI 桌面用户最多）。
+    // 三家新反代：都是「登录态 + 模型转发 + 签到 + 积分」的完整反代形态。
     // 顺序也决定模型目录合并时同名模型先归谁家 —— 三家的模型名互不重叠
     // （LobsterAI 有 MiniMax-M3 这类第三方模型名，但那与 MiniMax 官方的
     // provider 是两回事：聚合清单先到先得，撞名时后一家整家消失，
-    // 故这里保持各自注册表位置的稳定性）。
+    // 故这里保持各自注册表位置的稳定性）。排列与 `ProviderKind` 变体顺序一致。
     ProviderMeta { id: "lobsterai", label: "LobsterAI" },
+    // Loomy（讯飞）：单一地区、单一入口（手机号验证码登录），没有国际版伴生。
     ProviderMeta { id: "loomy", label: "Loomy" },
+    // KukuAI（百度文库库库 AI）：单一地区、单一入口（粘贴 Cookie / 导入本机
+    // 客户端登录态），没有国际版伴生。
+    ProviderMeta { id: "kuku", label: "KukuAI" },
     ProviderMeta { id: "minimax", label: "MiniMax" },
 ];
 
@@ -480,6 +541,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
     }
     match id {
         "workbuddy" => Some(ProviderKind::WorkBuddy),
+        "workbuddy-intl" => Some(ProviderKind::WorkBuddyIntl),
         "raccoon" => Some(ProviderKind::Raccoon),
         "catpaw" => Some(ProviderKind::CatPaw),
         "autoclaw" => Some(ProviderKind::AutoClaw),
@@ -495,6 +557,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "trae" => Some(ProviderKind::Trae),
         "lobsterai" => Some(ProviderKind::LobsterAi),
         "loomy" => Some(ProviderKind::Loomy),
+        "kuku" => Some(ProviderKind::Kuku),
         "minimax" => Some(ProviderKind::Minimax),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
@@ -515,6 +578,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
 pub const fn kind_id(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::WorkBuddy => "workbuddy",
+        ProviderKind::WorkBuddyIntl => "workbuddy-intl",
         ProviderKind::Raccoon => "raccoon",
         ProviderKind::CatPaw => "catpaw",
         ProviderKind::AutoClaw => "autoclaw",
@@ -530,6 +594,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Trae => "trae",
         ProviderKind::LobsterAi => "lobsterai",
         ProviderKind::Loomy => "loomy",
+        ProviderKind::Kuku => "kuku",
         ProviderKind::Minimax => "minimax",
     }
 }

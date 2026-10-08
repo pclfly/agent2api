@@ -1,211 +1,134 @@
-//! Loomy 出站请求头、账号请求体与 JSON 请求小工具。
+//! Loomy 两种出站请求的薄封装：签名 POST（CAccount）与 token 请求（集成网关）。
 //!
-//! ── 两套认证头（本家最大的坑）────────────────────────────────
-//!   - **业务端点**（`/models`、`/points/*`）只认小写 `token` 头；
-//!     带 `Authorization: Bearer` 会被判「缺少 token」；
-//!   - **chat 端点**只认 `Authorization: Bearer`，但官方客户端在 session
-//!     模式下**两个都发** —— 保持一致可避免上游将来改判据。
+//! ── 为什么收在一处 ──────────────────────────────────────────
+//! 三处消费者（login / checkin / balance / models）共用同一套超时、错误翻译与
+//! 「业务码 → 人话」口径；各写一份会让「哪个码算登录失效」这类判据分叉。
 //!
-//! ── 账号端点 ────────────────────────────────────────────────
-//! 讯飞 CAccount 的 HMAC-SHA1 签名（`sign::auth_headers`），
-//! 请求体信封 `{base, param}`（`account_body`）。
+//! ── 业务码的口径（实测 + 客户端源码对照）────────────────────
+//! CAccount 与集成网关都用 HTTP 200 + `{code, desc, data}` 表达业务结果：
+//!   - `000000`：成功；
+//!   - `020002` / `100002`：登录态无效（客户端 `AUTH_ERROR_CODES`，两个码分别来自
+//!     CAccount 与业务网关）；
+//!   - 其余：业务失败，`desc` 是上游文案。
+//!
+//! ── 硬约束 ──────────────────────────────────────────────────
+//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
-use std::time::Duration;
+use serde_json::Value;
 
-use serde_json::{json, Value};
-
-use crate::server::core::egress;
-use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::auth_http::send_raw;
 use crate::server::errors::GatewayError;
 
-use super::product;
+use super::endpoints;
 use super::sign;
 
-/// 上游响应体的读取上限（1 MiB）。
-const MAX_BODY_BYTES: usize = 1 << 20;
+/// 登录 / 积分接口的超时（与客户端 30 秒口径对齐，略收紧到 20 秒）
+const REQUEST_TIMEOUT_MS: u64 = 20_000;
 
-/// 一次请求的结果（HTTP 状态 + 文本体）。
-pub struct Reply {
-    pub status: u16,
-    pub body: String,
+/// 登录态失效业务码（客户端 `AUTH_ERROR_CODES`）
+pub const AUTH_ERROR_CODES: [&str; 2] = ["020002", "100002"];
+
+/// 成功码
+pub const SUCCESS_CODE: &str = "000000";
+
+/// 读取响应体里的业务码（字符串；缺失时为空串）
+pub fn business_code(payload: &Value) -> String {
+    payload
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
-impl Reply {
-    pub fn json(&self) -> Option<Value> {
-        serde_json::from_str(&self.body).ok()
-    }
+/// 业务码是不是「登录态无效」
+pub fn is_auth_error_code(code: &str) -> bool {
+    AUTH_ERROR_CODES.contains(&code)
 }
 
-/// 业务端点请求头（`/models`、`/points/*`）。
+/// 上游业务文案（`desc` → `message` 兜底）
+pub fn upstream_message(payload: &Value) -> String {
+    payload
+        .get("desc")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 向 CAccount 发一次**带签名**的 POST（登录链路，没有账号上下文，不走代理）。
 ///
-/// ⚠️ **只认小写 `token` 头**，刻意不加 Authorization。
-pub fn business_headers(token: &str) -> Vec<(String, String)> {
-    vec![
-        ("Accept".to_string(), "application/json".to_string()),
-        ("token".to_string(), token.to_string()),
-    ]
-}
-
-/// chat 端点请求头。
-///
-/// ⚠️ **两个头都发**（官方客户端同款）；`Bearer ` 前缀必需
-/// （实测无前缀同样回 `100002 缺少 token`）。
-pub fn chat_headers(token: &str) -> Vec<(String, String)> {
-    vec![
-        ("Accept".to_string(), "text/event-stream".to_string()),
-        ("Content-Type".to_string(), "application/json".to_string()),
-        ("Authorization".to_string(), format!("Bearer {token}")),
-        ("token".to_string(), token.to_string()),
-    ]
-}
-
-/// 构造账号端点请求体信封 `{base, param}`。
-///
-/// 依据 `account-service.js:441-450`。`traceid` 每次调用重新生成
-/// （去掉连字符的 uuid，32 位 hex）。
-pub fn account_body(param: Value) -> Value {
-    let traceid = sign::uuid_v4().replace('-', "");
-    json!({
-        "base": {
-            "appid": product::APP_ID,
-            "modelid": product::ACCOUNT_MODEL_ID,
-            "version": product::ACCOUNT_VERSION,
-            "devid": product::ACCOUNT_DEV_ID,
-            "ua": product::ACCOUNT_UA,
-            "traceid": traceid,
-        },
-        "param": param,
-    })
-}
-
-/// `GET` 一个业务端点（自动拼 `product::API_BASE`）。
-pub async fn get_business(
-    path: &str,
-    headers: &[(String, String)],
-    proxy: Option<&ResolvedProxy>,
-) -> Result<Reply, GatewayError> {
-    let url = format!("{}{path}", product::API_BASE);
-    request("GET", &url, None, headers, proxy, Duration::from_millis(product::REQUEST_TIMEOUT_MS)).await
-}
-
-/// `POST` 一个 JSON 体到业务端点。
-pub async fn post_business(
+/// 返回上游响应体（`{code, desc, data}`）。HTTP 层失败翻译成网关错误；
+/// 业务码**不在这里判**（调用方各有各的翻译，见 `login.rs`）。
+pub async fn signed_post(
     path: &str,
     body: &Value,
-    headers: &[(String, String)],
-    proxy: Option<&ResolvedProxy>,
-) -> Result<Reply, GatewayError> {
-    let url = format!("{}{path}", product::API_BASE);
-    request("POST", &url, Some(body), headers, proxy, Duration::from_millis(product::REQUEST_TIMEOUT_MS)).await
+    what: &str,
+) -> Result<Value, GatewayError> {
+    let url = format!("{}{path}", endpoints::xfyun_base_url());
+    let headers = sign::signed_headers("POST", path, Some(body))?;
+    let response = send_raw("POST", &url, Some(body), &headers, None, Some(REQUEST_TIMEOUT_MS))
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                GatewayError::with_status(504, format!("{what}超时，请稍后重试"))
+            } else {
+                GatewayError::with_status(502, format!("{what}失败：{error}"))
+            }
+        })?;
+    if !response.ok {
+        return Err(GatewayError::with_status(
+            response.status as i32,
+            format!("{what}返回 HTTP {}（上游地址 {}）", response.status, endpoints::xfyun_base_url()),
+        ));
+    }
+    Ok(response.payload.unwrap_or(Value::Null))
 }
 
-/// `POST` 一个账号端点（自动拼 `product::ACCOUNT_BASE` + HMAC-SHA1 签名头）。
+/// 向集成网关发一次带 `token`（= 登录 session）的请求。
 ///
-/// ⚠️ body 序列化一次、签名与发送共用 —— 这是签名能通过的前提。
-pub async fn post_account(
-    path: &str,
-    param: Value,
-    proxy: Option<&ResolvedProxy>,
-) -> Result<Reply, GatewayError> {
-    let body = account_body(param);
-    let serialized = body.to_string();
-    let headers = sign::auth_headers(&sign::SignOptions {
-        access_key_id: product::ACCESS_KEY_ID,
-        access_key_secret: product::ACCESS_KEY_SECRET,
-        method: "POST",
-        path,
-        query_params: &[],
-        body: &serialized,
-        content_type: "application/json",
-    });
-    let url = format!("{}{path}", product::ACCOUNT_BASE);
-    // 手动发送（要发 `serialized` 而不是 `body.to_string()` 的二次序列化）
-    let mut builder = egress::client_for(proxy)
-        .post(&url)
-        .timeout(Duration::from_millis(product::REQUEST_TIMEOUT_MS));
-    for (name, value) in &headers {
-        builder = builder.header(name, value.clone());
-    }
-    let response = builder.body(serialized).send().await.map_err(|error| {
-        GatewayError::with_status(
-            502,
-            format!("Loomy 账号请求发不出去：{}", egress::describe_error_detail(&error)),
-        )
-    })?;
-    let status = response.status().as_u16();
-    let text = read_limited(response).await;
-    Ok(Reply { status, body: text })
-}
-
-/// 发一次请求（网络层错误归一成 502；HTTP 状态本身不在这里判成错误）。
-pub async fn request(
+/// `path` 形如 `/api/v1/points/first-login`；`query` 以 query string 形态直接
+/// 拼在 path 后（调用方自己拼好，见 `balance::query_usage`）。
+///
+/// 成功（HTTP 2xx）返回响应体；HTTP 失败 / 超时翻译成网关错误。
+/// **登录态失效（业务码）由调用方判定** —— 不同接口的成功码判定不同
+/// （模型列表接口根本不返回 `code`）。
+pub async fn token_request(
     method: &str,
-    url: &str,
+    path: &str,
+    session: &str,
     body: Option<&Value>,
-    headers: &[(String, String)],
-    proxy: Option<&ResolvedProxy>,
-    timeout: Duration,
-) -> Result<Reply, GatewayError> {
-    let mut builder = match method {
-        "POST" => egress::client_for(proxy).post(url),
-        _ => egress::client_for(proxy).get(url),
+    what: &str,
+) -> Result<Value, GatewayError> {
+    if session.trim().is_empty() {
+        return Err(GatewayError::with_status(401, "Loomy 账号缺少 session"));
     }
-    .timeout(timeout);
-    for (name, value) in headers {
-        builder = builder.header(name, value.clone());
+    let url = format!("{}{path}", endpoints::integration_base_url());
+    let headers = vec![
+        ("token".to_string(), session.to_string()),
+        ("Authorization".to_string(), format!("Bearer {session}")),
+    ];
+    let response = send_raw(method, &url, body, &headers, None, Some(REQUEST_TIMEOUT_MS))
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                GatewayError::with_status(504, format!("{what}超时，请稍后重试"))
+            } else {
+                GatewayError::with_status(502, format!("{what}失败：{error}"))
+            }
+        })?;
+    if !response.ok {
+        if response.status == 401 || response.status == 403 {
+            return Err(GatewayError::with_status(
+                401,
+                format!("{what}：Loomy 登录态已失效，请重新登录（HTTP {}）", response.status),
+            ));
+        }
+        return Err(GatewayError::with_status(
+            response.status as i32,
+            format!("{what}返回 HTTP {}", response.status),
+        ));
     }
-    if let Some(payload) = body {
-        builder = builder.json(payload);
-    }
-    let response = builder.send().await.map_err(|error| {
-        GatewayError::with_status(
-            502,
-            format!("Loomy 请求发不出去：{}", egress::describe_error_detail(&error)),
-        )
-    })?;
-    let status = response.status().as_u16();
-    let text = read_limited(response).await;
-    Ok(Reply { status, body: text })
-}
-
-/// 读响应体，最多 [`MAX_BODY_BYTES`]。
-async fn read_limited(response: reqwest::Response) -> String {
-    match response.bytes().await {
-        Ok(bytes) if bytes.len() <= MAX_BODY_BYTES => String::from_utf8_lossy(&bytes).into_owned(),
-        Ok(bytes) => String::from_utf8_lossy(&bytes[..MAX_BODY_BYTES]).into_owned(),
-        Err(_) => String::new(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn business_headers_use_lowercase_token_only() {
-        let headers = business_headers("sess-1");
-        assert!(headers.iter().any(|(name, value)| name == "token" && value == "sess-1"));
-        assert!(!headers.iter().any(|(name, _)| name == "Authorization"));
-    }
-
-    #[test]
-    fn chat_headers_send_both() {
-        let headers = chat_headers("sess-1");
-        assert!(headers
-            .iter()
-            .any(|(name, value)| name == "Authorization" && value == "Bearer sess-1"));
-        assert!(headers.iter().any(|(name, value)| name == "token" && value == "sess-1"));
-    }
-
-    #[test]
-    fn account_body_wraps_base_and_param() {
-        let body = account_body(json!({"ccode": "86", "phone": "13011111100"}));
-        assert_eq!(body["base"]["appid"], "GM3LOOMY");
-        assert_eq!(body["base"]["ua"], "Loomy|Desktop|Electron|macOS");
-        assert_eq!(body["param"]["phone"], "13011111100");
-        // traceid：32 位 hex（uuid 去掉连字符）
-        let traceid = body["base"]["traceid"].as_str().unwrap_or("");
-        assert_eq!(traceid.len(), 32);
-        assert!(traceid.chars().all(|ch| ch.is_ascii_hexdigit()));
-    }
+    Ok(response.payload.unwrap_or(Value::Null))
 }

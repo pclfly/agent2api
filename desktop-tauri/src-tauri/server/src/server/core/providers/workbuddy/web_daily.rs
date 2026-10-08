@@ -73,11 +73,21 @@ const ACP_PROTOCOL_VERSION: i64 = 1;
 ///
 /// 国内版走的是腾讯的每日签到接口（`billing::checkin`），与国际版这条
 /// 网页通道互不相通 —— 拿国内版账号去打网页通道（或反过来）只会白跑一轮。
+///
+/// 判据取 **provider id 落在国际版**（拆家后 `workbuddy-intl` 是独立 provider，
+/// 见 `region.rs`）；`edition` 字段仍作兼容判据，照顾拆家迁移途中残留的
+/// 旧记录（`account_store::migrate_startup` 会把它们原地归位，但迁移前后的
+/// 一次运行不该因此少打卡一天）。
 pub fn supports_daily_chat(account: &Value) -> bool {
     let provider = account
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    if crate::server::core::providers::workbuddy::Region::from_provider_id(provider)
+        == Some(crate::server::core::providers::workbuddy::Region::Intl)
+    {
+        return true;
+    }
     provider == crate::server::core::providers::DEFAULT_PROVIDER_ID
         && account.get("edition").and_then(Value::as_str) == Some("intl")
 }

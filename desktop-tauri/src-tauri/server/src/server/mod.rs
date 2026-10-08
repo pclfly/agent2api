@@ -183,9 +183,18 @@ pub struct ServerState {
     /// `/v1/*` 网关，静态界面与 `/api/*` 挂到 `p` —— 面板端口可以不暴露公网，
     /// 管理面整体留在内网。桌面壳不设置它。
     pub panel_port: Option<u16>,
-    /// 监听地址。桌面壳固定 127.0.0.1（单机安全边界）；headless 二进制按
-    /// `AGENT2API_HOST` 解析（默认 0.0.0.0，供容器端口映射）。
+    /// 监听地址。桌面壳默认 127.0.0.1（单机安全边界；用户开启局域网访问后为
+    /// 0.0.0.0）；headless 二进制按 `AGENT2API_HOST` 解析（默认 0.0.0.0，供容器
+    /// 端口映射）。
     pub host: IpAddr,
+    /// 管理界面跑在本机（桌面壳的 Tauri 窗口）。
+    ///
+    /// 桌面壳固定 true；headless 恒 false。它与 `host.is_loopback()` 是两个维度：
+    /// 桌面壳开了局域网访问后 host 是 0.0.0.0，但发起管理操作的浏览器（Tauri
+    /// 窗口）仍在本机 —— OAuth 回调该占本机登记端口（见
+    /// `api::session::login_oauth_start` 的 `local_browser`）。headless 不设它，
+    /// 回退按 `host.is_loopback()` 判（容器绑回环没有意义，判 false 是对的）。
+    pub local_panel: bool,
     /// 配置目录（`~/.agent2api`），与壳侧 gateway::config_dir() 同源
     pub config_dir: PathBuf,
     /// headless 下托管管理界面（`ui/` 静态目录）的根；`None` = 不托管
@@ -327,6 +336,9 @@ impl ServerState {
         // 下面日志裁剪天数与旧文件候选目录才不会用错值。
         let snapshot = config::init(db.clone());
         core::task_state::install(db.clone());
+        // 每账号的余额查询记录（余额不足跳过 / 自动禁用的底座）：装库句柄时
+        // 顺带做旧 kv 快照的一次性迁移与内存事实表的装载（见 usage_records 模块头）。
+        core::usage_records::install(db.clone());
         // 出网代理池（「网络代理」页维护的命名代理；账号按 id 引用它们）：
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
@@ -409,12 +421,13 @@ impl ServerState {
         let auth = AuthService::new(store.clone(), context);
         let login = LoginService::new(auth.clone(), store.clone());
         let billing = BillingService::new(auth.clone());
-        // 模型目录：**进程级单例**（Agent2API 改造 W2a-T2）。聚合模型目录
-        // （core::providers::catalog）只收 &AccountStore，不该让调用方层层传目录，
-        // 因此目录自身也做成进程级句柄（与 config / auto_checkin
-        // 同一模式）：`core::models::global_catalog()` 与这里的 `models` 是
-        // **同一实例**（共享同一把 RwLock），刷新对两边同时可见。
-        let models = core::models::global_catalog();
+        // 模型目录：**进程级单例，按地区各一份**（Agent2API 改造 W2a-T2；
+        // WorkBuddy 拆家后国内版与国际版各持一份，见 `core::models` 模块头）。
+        // 聚合模型目录（core::providers::catalog）只收 &AccountStore，不该让
+        // 调用方层层传目录，因此目录自身也做成进程级句柄（与 config /
+        // auto_checkin 同一模式）：`core::models::global_catalog(region)` 与
+        // 这里的 `models` 是**同一实例**（共享同一把 RwLock），刷新对两边同时可见。
+        let models = core::models::global_catalog(core::providers::workbuddy::Region::Cn);
         // 恢复各家的持久化清单缓存：各家的目录句柄在这一步**首次初始化**
         // （`OnceLock`），缓存也只在这一刻读得回来（见 `providers::catalog_cache`
         // 的模块头）。必须在上面那次 `install` 之后 —— 句柄先被别处碰到的话，
@@ -495,6 +508,7 @@ impl ServerState {
             port,
             panel_port: None,
             host,
+            local_panel: false,
             config_dir,
             ui_dir: None,
             store,
@@ -663,6 +677,11 @@ impl ServerState {
         // 服务器停机时进程会结束，任务随之消失。用 crate::spawn_task
         // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
         core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
+
+        // 每账号自动余额查询的心跳循环：与上面的间隔型任务同一形态（一个进程
+        // 一个循环，到点判定全在「记录 + 配置」上），只是排期按账号各自算，
+        // 不再是全局任务（见 `core::usage_query` 的模块头）。
+        core::usage_query::spawn_sweeper(state.store.clone());
 
         Ok(state)
     }

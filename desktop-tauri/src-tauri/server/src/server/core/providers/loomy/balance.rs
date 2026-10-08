@@ -1,20 +1,24 @@
-//! Loomy 积分余额（`GET /points/records`，**只读**）。
+//! Loomy 积分 / 余额查询：`GET {集成网关}/api/v2/points/records` 的摘要字段。
 //!
-//! ── 为什么用 `points/records` 而不是 `first-login` ─────────────
-//! 后者是**写**端点（触发每日额度初始化），在「打开面板」这种高频路径上调用
-//! 会意外触发签到。读与写严格分离。
+//! ── 为什么余额藏在流水接口里（客户端就是这么读的）──────────────
+//! Loomy **没有独立的余额接口**。客户端的积分详情页读的是 V2 流水接口——
+//! 它的响应 `data` 里同时带账户摘要：
 //!
-//! ── 两个积分池分开显示（用户明确要求的展示方式）──────────────
-//! 实测（2026-09-26）：
 //! ```text
-//! balance: 15000        ← 永久
-//! dailyBalance: 4992    ← 每日池余额 = dailyQuota(5000) - dailyConsumed(8)
-//! availableBalance: 19992  ← 两者之和
+//! GET /api/v2/points/records?pageNo=1&pageSize=1&direction=debit&granularity=chat
+//!   → {code:"000000", data:{ balance,           ← 永久积分（长期积分）
+//!                          dailyBalance,       ← 每日赠送积分（每日登录刷回 5000）
+//!                          dailyLimitPoints, dailyConsumedPoints, dailyRemainingPoints,
+//!                          list:[…], total }}
 //! ```
-//! 两个池各作一个 wallet，`available` 用 `availableBalance`。
 //!
-//! ── 失败与「余额为 0」严格区分 ──────────────────────────────
-//! `balance` 是核心字段：没有它就说明响应形状不对，**不编造数字**。
+//! 积分详情页的两张卡片（永久 5000 / 每日赠送 5000）读的就是 `balance` 与
+//! `dailyBalance`（渲染层字段名经 babel 产物核对）。这里按账号页的统一形状
+//! （`{available, unit, wallets, raw}`，见 `ProviderAdapter::query_usage` 的契约）
+//! 归一化：两个钱包各一行，`available` 取两者之和（实际可用的总量）。
+//!
+//! ── 硬约束 ──────────────────────────────────────────────────
+//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
 use serde_json::{json, Value};
 
@@ -22,106 +26,92 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
 use super::client;
-use super::credentials::{self, Credential};
-use super::product;
+use super::credentials;
 
-/// 查询某账号的积分余额（归一化形状见 `ProviderAdapter::query_usage` 的文档）。
+/// 流水查询路径（相对集成网关；pageSize 取 1 只为拿摘要，不看流水本身）
+const RECORDS_PATH: &str =
+    "/api/v2/points/records?pageNo=1&pageSize=1&direction=debit&granularity=chat";
+
+/// 从 `data.data` 里取一个非负数字（字段缺失 / 非法时给 None）
+fn pick_number(data: &Value, key: &str) -> Option<f64> {
+    let value = data.get(key)?;
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    // 上游有把数字序列化成字符串的形态（如 "5000"）
+    value
+        .as_str()
+        .and_then(|text| text.trim().parse::<f64>().ok())
+}
+
+/// 查询某 Loomy 账号的双账户余额。
 pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value, GatewayError> {
     let record = store.loomy_account_record(account_id);
     if !account_id.is_empty() && record.is_none() {
-        return Err(GatewayError::with_status(404, "账号不存在"));
+        return Err(GatewayError::with_status(
+            404,
+            format!("Loomy 账号 {account_id} 不存在（请重新添加）"),
+        ));
     }
-    let Some(record) = record else {
-        return Err(GatewayError::with_status(404, "没有可用的 Loomy 账号"));
-    };
-    let credential = Credential::from_value(&record);
-    if !credential.valid() {
-        return Err(GatewayError::with_status(401, "该账号没有可用凭证，无法查询积分"));
-    }
-    let path = format!("{}?pageNo=1&pageSize=1&recordType=all", product::POINTS_RECORDS_PATH);
-    let reply = client::get_business(&path, &client::business_headers(&credential.access_token), None).await?;
-    if reply.status == 401 || reply.status == 403 {
-        return Err(GatewayError::with_status(401, "登录态已过期，无法查询积分"));
-    }
-    if !(200..300).contains(&reply.status) {
-        return Err(GatewayError::with_status(502, format!("上游返回 HTTP {}", reply.status)));
-    }
-    let Some(body) = reply.json() else {
-        return Err(GatewayError::with_status(502, "余额响应不是 JSON"));
-    };
-    let envelope = match credentials::parse_envelope(&body) {
-        Ok(envelope) => envelope,
-        Err(failure) => {
-            if failure.code == credentials::AUTH_ERROR_CODE {
-                return Err(GatewayError::with_status(401, "登录态已失效：请重新短信登录"));
-            }
-            return Err(GatewayError::with_status(502, format!("余额查询失败：{}", failure.message)));
-        }
-    };
-    let data = &envelope.data;
-    let permanent = credentials::read_number(data, "balance");
-    let daily = credentials::read_number(data, "dailyBalance");
-    let available = credentials::read_number(data, "availableBalance");
-    // `balance` 是核心字段：没有它就说明响应形状不对，不编造数字。
-    let Some(permanent) = permanent else {
-        return Err(GatewayError::with_status(502, "上游没有返回积分读数"));
-    };
-    let daily = daily.unwrap_or(0.0);
-    let total = available.unwrap_or(permanent + daily);
-    let daily_quota = credentials::read_number(data, "dailyQuota");
-    let daily_consumed = credentials::read_number(data, "dailyConsumed");
+    let credentials = credentials::from_record(record.as_ref())?;
 
-    // 两个池各作一个 wallet（见模块头）；每日池带展示串说明「消耗后不回补」
-    let mut daily_view = format!("剩 {}", compact(daily));
-    if let Some(quota) = daily_quota {
-        daily_view = format!("剩 {} / {}", compact(daily), compact(quota));
+    let payload = client::token_request("GET", RECORDS_PATH, &credentials.session, None, "积分查询").await?;
+
+    let code = client::business_code(&payload);
+    if client::is_auth_error_code(&code) {
+        return Err(GatewayError::with_status(
+            401,
+            "Loomy 登录态已失效，无法查询积分（请重新登录）",
+        ));
     }
-    if let Some(consumed) = daily_consumed {
-        if consumed > 0.0 {
-            daily_view = format!("{daily_view}（今日已用 {}）", compact(consumed));
-        }
+    if code != client::SUCCESS_CODE {
+        let message = client::upstream_message(&payload);
+        return Err(GatewayError::with_status(
+            502,
+            if message.trim().is_empty() {
+                format!("积分查询失败（上游 code={code}）")
+            } else {
+                format!("积分查询失败：{message}")
+            },
+        ));
     }
-    let wallets = vec![
+
+    // 摘要可能在 data 或 data.data 两层（V2 接口的形态在不同版本里出现过两种）
+    let data = payload
+        .get("data")
+        .and_then(|value| value.get("data"))
+        .unwrap_or_else(|| payload.get("data").unwrap_or(&Value::Null));
+
+    let permanent = pick_number(data, "balance").unwrap_or(0.0);
+    let daily = pick_number(data, "dailyBalance").unwrap_or(0.0);
+    let daily_remaining = pick_number(data, "dailyRemainingPoints");
+    let daily_limit = pick_number(data, "dailyLimitPoints");
+
+    let mut wallets = vec![
         json!({
-            "type": "permanent",
+            "type": "permanent_points",
             "displayName": "永久积分",
             "balance": permanent,
-            "balanceView": format!("剩 {}", compact(permanent)),
         }),
         json!({
-            "type": "daily",
-            "displayName": "每日赠送（消耗后不回补）",
+            "type": "daily_points",
+            "displayName": "每日赠送积分",
             "balance": daily,
-            "balanceView": daily_view,
         }),
     ];
+    // 赠送额度的「剩余 / 上限」是独立的展示口径（客户端在团队卡片上用它），
+    // 有就带上，没有不编造
+    if let (Some(remaining), Some(limit)) = (daily_remaining, daily_limit) {
+        if let Some(object) = wallets.get_mut(1).and_then(Value::as_object_mut) {
+            object.insert("remaining".to_string(), Value::from(remaining));
+            object.insert("limit".to_string(), Value::from(limit));
+        }
+    }
 
     Ok(json!({
-        "available": total,
+        "available": permanent + daily,
         "unit": "积分",
         "wallets": wallets,
-        // Loomy 没有订阅概念，如实给 null
-        "subscription": Value::Null,
-        "raw": { "points": data },
+        "raw": payload,
     }))
-}
-
-/// 数值 → 去尾零展示串。
-fn compact(value: f64) -> String {
-    if value == value.trunc() && value.abs() < 1e15 {
-        return format!("{}", value as i64);
-    }
-    format!("{value:.2}").trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compact_formats() {
-        assert_eq!(compact(15000.0), "15000");
-        assert_eq!(compact(4992.0), "4992");
-        assert_eq!(compact(8.5), "8.5");
-    }
 }

@@ -123,12 +123,13 @@ function applyZoom(percent) {
 // ─── 页面导航 ────────────────────────────────
 
 const PAGE_KEY = 'workbuddy-desktop-page';
-const PAGES = ['overview', 'accounts', 'gateway', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'settings'];
+const PAGES = ['overview', 'accounts', 'checkin', 'gateway', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'settings'];
 /** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」、gateway 的是「模型管理」
  *  （内部标识保持不变：localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它） */
 const PAGE_LABELS = {
   overview: '报表',
   accounts: '账号',
+  checkin: '签到中心',
   gateway: '模型管理',
   proxies: '网络代理',
   keys: '网关 Key',
@@ -176,6 +177,10 @@ function showPage(name, { persist = true } = {}) {
   // 定时任务页自持清单与编辑态，切进去时拉一次最新
   if (page === 'tasks') {
     window.wbTasksPanel?.load?.();
+  }
+  // 签到中心自持数据（聚合快照 + 惰性查询缓存），切进去时拉一次最新
+  if (page === 'checkin') {
+    void window.wbCheckinPanel?.load?.();
   }
   // 切到设置页时拉一次启动设置与网关地址（面板内部自持状态，这里只做转发）
   if (page === 'settings') {
@@ -260,6 +265,8 @@ function renderTopbarStatus() {
     requests: () => mirror('req-badge'),
     // 定时任务页的徽标由 tasks-panel 自己渲染（「N / M 个已开启」），直接镜像
     tasks: () => mirror('tasks-badge'),
+    // 签到中心的徽标由 checkin-page 自己渲染（自动签到开启状态），直接镜像
+    checkin: () => mirror('checkin-badge'),
     settings: () => (gatewayUp ? chip('网关运行中', 'ok', true) : chip('未就绪', 'bad', true))
       + (enabled ? chip(`${enabled} 个账号启用`) : ''),
     overview: () => (gatewayUp ? chip('网关运行中', 'ok') : chip('未就绪', 'bad'))
@@ -688,7 +695,7 @@ async function refresh() {
   }
 }
 
-// ─── 账号操作（列表按钮统一入口；积分/签到由 accounts-view 自行消化） ───
+// ─── 账号操作（列表按钮统一入口；余额查询由账号视图自行消化） ───
 
 async function runAccountAction(action, id) {
   if (busy) return;
@@ -709,7 +716,8 @@ async function runAccountAction(action, id) {
       toast('✅ Token 已刷新');
     } else if (action === 'remove') {
       const account = state?.accounts?.accounts?.find(a => a.id === id);
-      const name = esc(account?.nickname || account?.name || id);
+      // 与岛内 displayNameOf 同一口径：nameCustom 恒赢，未打标维持旧口径（昵称优先）
+      const name = esc(account?.nameCustom && account?.name ? account.name : (account?.nickname || account?.name || id));
       // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认），
       // 危险确认一律走自绘弹窗（wbConfirm，见 confirm-dialog.js）—— 下同
       const note = window.wbAccountsModel?.isDesktopAccount?.(account) ? '（不会影响客户端登录态）' : '';
@@ -818,12 +826,32 @@ paintIcons();
 // 一整套弹窗交互，留在本文件会让这里继续膨胀。本文件只负责在 render()
 // 里委托它重画，并在首屏主动问一次后端状态。
 
-showPage(localStorage.getItem(PAGE_KEY) || 'overview', { persist: false });
+// ─── 初始页恢复：必须等 islands bundle 注册完 ───────────────
+// app.js 在 index.html 里排在 islands/ui.js **之前**，而各页面的数据加载由
+// showPage 里「切到某页时拉一次」完成。若在这里同步恢复上次页面，此刻 ui.js
+// 还没执行、wbSettingsPanel 等岛方法都不存在，`?.` 会把这次加载静默吞掉 ——
+// 恢复页是「设置」时，启动设置就永远停在「检测中…」（局域网开关随之显示
+// 默认值，看着像没保存）。DOMContentLoaded 在全部同步脚本执行完才触发，
+// 借它把初始切换对齐到「岛已就绪」之后，与用户手动切页完全同行为。
+const initialPage = localStorage.getItem(PAGE_KEY) || 'overview';
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    showPage(initialPage, { persist: false });
+    restorePortPanel();
+  }, { once: true });
+} else {
+  showPage(initialPage, { persist: false });
+  restorePortPanel();
+}
 
 refresh();
-// 首屏就问一次后端状态：此时 state 还没回来，侧栏两条状态各自显示
-// 「正在检查…」，拿到结果后立刻变成真值（端口冲突会直接给出失败原因）
-void window.wbPortPanel?.sync?.();
+
+/** 首屏问一次后端状态：此时 state 还没回来，侧栏两条状态各自显示
+ * 「正在检查…」，拿到结果后立刻变成真值（端口冲突会直接给出失败原因）。
+ * port-panel 也是岛，同样要等注册完，所以与初始页恢复放在一起。 */
+function restorePortPanel() {
+  void window.wbPortPanel?.sync?.();
+}
 
 /**
  * 启动即把更新状态铺一次：读**后端缓存**里的最近一次检查结果（定时任务按间隔
@@ -851,7 +879,22 @@ document.addEventListener('DOMContentLoaded', () => {
   // 它**不是**更新检查那种「有新版本就提示」的可选动作 —— 没升级时账号是空的，
   // 所以过程与结果都要 toast 报出来，不能让用户面对一个「账号怎么空了」的疑问。
   void window.wbUpgradePanel?.check?.();
+  // 启动即读一次后端的余额结果快照（每账号自动查询的最新结论，重启也在），
+  // 只靠下面那条 20 秒轮询的话，用户启动后第一眼看到的是账号页一片「未查询」，
+  // 要等最久一整轮才变出余额 —— 那正是「定时查询好像没生效、必须手动点」的来源。
+  // 放在 DOMContentLoaded：islands（wbAccountsView 的注册处，见 index.html 的
+  // 加载顺序）是同步脚本，此刻已经就位。
+  void window.wbAccountsView?.syncBalancesSnapshot?.();
 }, { once: true });
+
+// 窗口重新可见时立刻补读一次余额快照：20 秒轮询在页面隐藏期间整体跳过
+// （见下面 setInterval 的 document.hidden 判定），恢复可见的瞬间界面上还是
+// 隐藏前的旧读数 —— 这一下让用户切回来就看到定时任务的最近一轮结果。
+// 快照时间戳没变时 syncBalancesSnapshot 自己会早退，重复触发没有代价。
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  void window.wbAccountsView?.syncBalancesSnapshot?.();
+});
 
 // 定时轮询：限额标记（429 + 恢复时间）与账号状态变化自动刷新；窗口隐藏时暂停
 setInterval(() => {
@@ -865,7 +908,7 @@ setInterval(() => {
   void syncLogsBadge();
   // 请求日志的未读失败同理：人不在请求日志页时也要有人推进角标
   void syncRequestsBadge();
-  // 「定时查询积分」的结果快照也跟着这一轮读一次：后端的定时任务在跑，
+  // 余额快照也跟着这一轮读一次：后端的每账号自动查询在跑，
   // 界面得跟上它（否则用户不点按钮就永远停在启动那次的旧余额上）。
   // 快照时间戳没变时它自己会早退，不会造成无谓的重绘。
   void window.wbAccountsView?.syncBalancesSnapshot?.();

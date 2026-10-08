@@ -63,23 +63,21 @@ pub const KV_KEY: &str = "modelCatalogCache";
 // 粒度是**一个远程目录一条**：按地区分开的目录（Qoder / AutoClaw / Accio）
 // 各自一条，与各家内存状态的粒度一致。
 
-/// WorkBuddy **国内版**（`/v3/config`，`copilot.tencent.com`）
-pub const SCOPE_WORKBUDDY_CN: &str = "workbuddyCn";
-/// WorkBuddy **国际版**（`/v3/config`，`www.workbuddy.ai`）
+/// WorkBuddy 国内版（`/v3/config`，`copilot.tencent.com`）。
+///
+/// 键名就是改造前那条**不分版本**的单条清单的键（`"workbuddy"`）：老库升级
+/// 上来时那份清单是国内版账号拉的，留在国内版槽语义正确、无需迁移。
+pub const SCOPE_WORKBUDDY: &str = "workbuddy";
+/// WorkBuddy 国际版（`/v3/config`，`www.workbuddy.ai`）
 ///
 /// ── 为什么拆成两条（2026-10）────────────────────────────────
 /// 上游按站点下发**两套不同的清单**：国际版 29 个（含 `default-model` /
 /// `fast-model` / `gpt-5.x` / `grok-4.7`，其中 `deepseek-v4.1-flash` 是 x0.00
 /// 限时免费），国内版 55 个（含 `hy3-*` / `minimax-*` / `glm-4.6v` 等），
 /// **同名模型的倍率也不同**（`fast-model`：国际版 x0.34 / 国内版 x0.21）。
-/// 改造前只有一条 `workbuddy` 键，两个版本的账号谁最后刷新谁覆盖 ——
-/// 管理页于是显示「一个版本的名字 + 另一个版本的倍率」。
+/// 改造前两个版本共用一条键，谁最后刷新谁覆盖 ——
+/// 管理页于是显示「一个版本的名字 + 另一个版本的倍率」（issue #74）。
 pub const SCOPE_WORKBUDDY_INTL: &str = "workbuddyIntl";
-/// **旧键**（改造前不区分版本的单条清单）。
-///
-/// 只读不写：国内版槽在初始化时把它当兜底来源（老库升级上来时那份清单是
-/// 国内版账号拉的，装到国内版槽语义正确）；写入一律走上面两个新键。
-pub const SCOPE_WORKBUDDY_LEGACY: &str = "workbuddy";
 /// 小浣熊（`/model_catalog`）
 pub const SCOPE_RACCOON: &str = "raccoon";
 /// Qoder 国际版
@@ -104,16 +102,15 @@ pub const SCOPE_CODEARTS: &str = "codearts";
 pub const SCOPE_TRAE: &str = "trae";
 /// LobsterAI（`/api/models/available`）
 pub const SCOPE_LOBSTERAI: &str = "lobsterai";
-/// Loomy（`/api/v1/models`，仅 type=chat 的条目）
+/// Loomy（讯飞；`GET {集成网关}/api/v1/models`，OpenAI 格式目录）
 pub const SCOPE_LOOMY: &str = "loomy";
 /// MiniMax（`/mavis/api/v1/models?region=cn&buildEnv=prod`）
 pub const SCOPE_MINIMAX: &str = "minimax";
 
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
-    SCOPE_WORKBUDDY_CN,
+    SCOPE_WORKBUDDY,
     SCOPE_WORKBUDDY_INTL,
-    SCOPE_WORKBUDDY_LEGACY,
     SCOPE_RACCOON,
     SCOPE_QODER_GLOBAL,
     SCOPE_QODER_CN,

@@ -21,7 +21,7 @@
  * 所以筛选与计数都按这一条队列算，positionMap 的序号就是整张表的行序。
  */
 
-import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type RateLimitInfo } from './accounts-shared'
+import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type RateLimitInfo, type UsageEntry } from './accounts-shared'
 
 /** 缺省 provider id（后端注册表的默认项；旧账号记录没有该字段时的兜底） */
 export const DEFAULT_PROVIDER_ID = 'workbuddy'
@@ -31,15 +31,15 @@ export const RACCOON_PROVIDER_ID = 'raccoon'
 type ProviderFeatures = {
   /** 这一家有没有余额 / 积分查询概念 */
   usage: boolean
-  /** 这一家有没有签到活动 */
-  checkin: boolean
   /** 有没有国内 / 国际版概念（决定提供商徽章是否拼版本后缀、有效期读哪个字段） */
   edition: boolean
   /** 账号标识落在记录里的哪个键（uid / userId / account） */
   identifier: string
   /** 有效期落在记录里的哪个键（expiresAt / tokenExpiresAt） */
   expiry: string
-  /** 「这家的账号就该以邮箱报名字」（Qoder / AutoClaw 国际版），见 accountCell 的说明 */
+  /** 「这家的账号以邮箱报名字」（Qoder / AutoClaw 国际版 / Accio）。两处消费：
+   *  displayNameOf（**未设备注**账号的主名口径，设过备注的以备注名为主）与
+   *  models-fetch-modal 的 accountLabel（拉取模型的账号下拉） */
   emailAsName?: boolean
   /** 有没有「领体验套餐」这个动作（只有 ZCode 两家） */
   claim?: boolean
@@ -72,8 +72,12 @@ type ProviderFeatures = {
  * provider 能力表：决定行上出现哪些按钮、哪行明细显示什么。
  *
  * 为什么是「按 provider 查表」而不是在渲染处写 if：账号页的每个分支（余额按钮、
- * 签到按钮、版本后缀、标识字段名）都要问同一个问题 ——「这家有没有这个概念」。
+ * 版本后缀、标识字段名）都要问同一个问题 ——「这家有没有这个概念」。
  * 散在各处写 if 的话，加一家就要翻一遍全文件，漏掉一处不报错、只静默少一个按钮。
+ *
+ * （签到**不在**这张表里：账号页已无签到按钮，签到中心的分组与可签判定在
+ * 后端 —— `core::auto_checkin` 的 CHECKIN_PROVIDERS 与 `billing::checkin::
+ * supports_checkin` 是唯一口径，各家的签到链路事实也记在那边的模块头里。）
  *
  * usage 各家都是 true（余额查询已扩到全部提供商），各由自己的适配器实现；前端只回答
  * 「这一家有没有这个概念」。CatPaw 的余额接口要单独配一个网页会话凭证（token2），
@@ -81,26 +85,27 @@ type ProviderFeatures = {
  * 用户才有「去配置」的入口。
  */
 const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
-  workbuddy: { usage: true, checkin: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
-  raccoon: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
-  catpaw: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
+  workbuddy: { usage: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
+  // WorkBuddy 国际版（拆家后的第二家，见 providers::workbuddy::region）：
+  //   `edition: false` 是因为注册名「WorkBuddy 国际版」自带地区，再拼一次会
+  //   得到「WorkBuddy 国际版 国际版」（`editionSuffix` 虽有「名字已含就不拼」
+  //   的兜底，这里直接写 false 更清楚，与 `zcode-intl` 同款）。
+  'workbuddy-intl': { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  raccoon: { usage: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
+  catpaw: { usage: true, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
   // AutoClaw 两个地区能力完全一致，差别只在域名；两项都必须登记 —— 漏了哪一项，
   // 那一家就会掉进 GENERIC_FEATURES（症状：余额按钮消失、标识列显示成空）
-  autoclaw: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
-  'autoclaw-intl': { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt', emailAsName: true },
-  // Qoder 的签到**只有中国版有**（国际版这个地区没有签到计划，见 providers::qoder::checkin）。
-  // 能力位照样写 true —— 国际版账号由 supportsCheckin 的第二道判据（edition !== 'intl'，
-  // Qoder 的公开形态带该字段）单独排除，明细面板给出「国际版暂无签到活动」的说明；
-  // 中国版里没有被下发活动的账号（Free 套餐实测如此）会在点签到后得到一条中性提示。
-  qoder: { usage: true, checkin: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
+  autoclaw: { usage: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
+  'autoclaw-intl': { usage: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt', emailAsName: true },
+  qoder: { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
   // Cline 两条键：同一家上游按计费通道拆成两个 provider，账号形态完全一样（见
   // providers::cline::models）。查表按 id 精确匹配，只登记一个会让另一家掉进兜底
-  'cline-free': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
-  'cline-pass': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
-  // Accio 两个地区：额度可查（上游只给用量百分比）、没有签到、有地区概念
-  accio: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
-  'accio-cn': { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
-  // ZCode 两个地区：**没有签到**，替代它的是「限时套餐领取」（claim 位）。
+  'cline-free': { usage: true, edition: false, identifier: 'account', expiry: 'expiresAt' },
+  'cline-pass': { usage: true, edition: false, identifier: 'account', expiry: 'expiresAt' },
+  // Accio 两个地区：额度可查（上游只给用量百分比）、有地区概念
+  accio: { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
+  'accio-cn': { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
+  // ZCode 两个地区：本家的运营动作是「限时套餐领取」（claim 位）。
   // `usage: true` 对应 providers::zcode::balance —— 余额读的是 billing 网关的
   //   `/zcode-plan/billing/balance`，认**套餐 JWT**（与转发用的 accessToken 不是
   //   一套凭证）。账号只粘了 accessToken 时后端回可识别的「未配置」，余额列显示成
@@ -109,19 +114,19 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   **每天一份新套餐**（plan_id 带日期段），领过之后按钮当天显示「今日已领」、
   //   次日自动恢复 —— 见 `claimedToday`。
   // expiry 取 expiresAt 是给 add_zcode_account 的契约（落账号时要写访问令牌的过期时间）
-  zcode: { usage: true, checkin: false, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
-  'zcode-intl': { usage: true, checkin: false, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+  zcode: { usage: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+  'zcode-intl': { usage: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
   // CodeArts（华为云 AI 代码助手）。各位各有出处，别照着别家抄：
   // `usage: true` —— 余额是**两份账**（订阅统计 + 福利网关，见 providers::codearts::balance），
   //   界面上「读到 0」与「没读到」必须能分开，后端因此把失败的一侧写进 statisticsError /
   //   benefitError 而不是整次失败（半次失败的呈现见 accounts-panels 的 usageSummary）。
-  // `welfare: true` —— 本家没有「每日签到」，对应物是 ops 福利领取（探测 → 确认 →
-  //   领取 → 回读二次确认），是用户点一下才走的独立按钮。
+  // `welfare: true` —— 本家的运营动作是 ops 福利领取（探测 → 确认 → 领取 → 回读
+  //   二次确认），是用户点一下才走的独立按钮。
   // `edition: false` —— 没有版本/地区概念：region 固定在 cn-north-4 且必须与 token
   //   签发地一致，不是用户可选项；`login_type`（WEB/IDE）也不是版本，别塞进这一列。
   // `expiry: 'expiresAt'` —— 临时凭据约一小时到期，这一列对本家**是主要信息**。
   codearts: {
-    usage: true, checkin: false, welfare: true, edition: false,
+    usage: true, welfare: true, edition: false,
     identifier: 'userId', expiry: 'expiresAt',
     concurrencyDefault: 3,
   },
@@ -129,29 +134,38 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 而不是一个地区的两种拼法，国际版将来接入时另立 provider id，不把它做成账号字段。
   // `usage: true` 对应 providers::trae::usage（上游两份账：ide_user_ent_usage 的权益包/
   // 积分池 + ide_user_pay_status 的快请求与 SOLO 并发）。
-  // `checkin: false` 同样不是省事：签到那条链在参考实现里有把出口 IP 打进封禁的前科，
-  // 且它记的「签到钱包」与模型调用真正扣的积分池是两笔钱 —— 不给按钮，免得给一个
-  // 点了必然报错（或报出一个对不上官方数字的余额）的入口。
-  trae: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'expiresAt' },
-  // LobsterAI（有道龙虾）：积分可查（profile-summary 的 creditItems）、每日签到（三步链路，
-  // slot → context → check_in），标识取 uid（四级回退保证非空）。
-  // `expiry: 'expiresAt'` 对应凭据里的毫秒时间戳（界面显示到期列）。
-  lobsterai: { usage: true, checkin: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
-  // Loomy（讯飞）：积分可查（两个池分开显示：永久 + 每日赠送），签到是「每日额度初始化」
-  // （`points/first-login`，语义是触发额度重置而不是 +N 积分）。标识取 userId。
-  // 注意本家**没有续期端点**（session 14 天过期后重新短信登录），界面靠 hasRefreshToken=false 提示。
-  loomy: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
-  // MiniMax Code（中国版）：积分可查（credit/details）、每日签到（signin/status + signin/claim，
-  // 必须带 timezone_id）。标识取账号 id（token 非 JWT、没有稳定用户字段）。
-  minimax: { usage: true, checkin: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  trae: { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // Loomy（讯飞）。各位各有出处：
+  // `usage: true` 对应 providers::loomy::balance —— 余额是**双账户**（永久积分 +
+  //   每日赠送积分，读 `GET /api/v2/points/records` 的摘要字段），界面上两张卡都列。
+  // `edition: false` —— 单一入口（手机验证码登录），没有国际版/地区概念。
+  // `expiry: 'expiresAt'` —— 落账号时按登录时刻 + 14 天估算（上游没有续期接口，
+  //   过期只能重新登录；这一列对它是「什么时候该重登」的提示）。
+  loomy: { usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  // KukuAI（百度文库库库 AI）。各位各有出处：
+  // `usage: true` —— 余额/积分查询（GET /bizapi/gfpro/getgfvipremain 的
+  //   totalPoint，见后端 providers::kuku::balance）。
+  // `edition: false` —— 单一入口（粘贴 Cookie / 导入本机登录态 / 网页登录），
+  //   没有国际版。
+  // `identifier: 'uid'` —— 账号标识存 uid（userreport 的 uk）。
+  // `expiry: ''` —— BDUSS 没有过期时间字段（无刷新接口，过期只能重登，
+  //   这一列对它是空，界面不渲染「有效期」）。
+  kuku: { usage: true, edition: false, identifier: 'uid', expiry: '' },
+  // LobsterAI（有道龙虾）：积分可查（profile-summary 的 creditItems），标识取 uid
+  // （四级回退保证非空）。`expiry: 'expiresAt'` 对应凭据里的毫秒时间戳。
+  // （签到能力**不在本表**：签到统一在签到中心，口径见上面 ProviderFeatures 的说明。）
+  lobsterai: { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // MiniMax Code（中国版）：积分可查（credit/details），标识取账号 id
+  // （token 非 JWT、没有稳定用户字段）。
+  minimax: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
 }
 
 /**
- * 未登记 provider 的兜底能力：不显示余额 / 签到 / 版本 —— 这三个都是 provider 私有
+ * 未登记 provider 的兜底能力：不显示余额 / 版本 —— 这两个都是 provider 私有
  * 概念，未知的家不该被假定拥有。标识字段假定成 userId，取不到时明细行自动少一项。
  */
 const GENERIC_FEATURES: ProviderFeatures = {
-  usage: false, checkin: false, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt',
+  usage: false, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt',
   emailAsName: false,
 }
 
@@ -195,7 +209,15 @@ export function providerSummaries(snapshot: AccountsSnapshot | null | undefined)
     if (known.has(id)) return
     known.set(id, { id, label: shared().wbProviders?.labelOf?.(id) || id, count })
   })
-  if (!known.size) known.set(DEFAULT_PROVIDER_ID, { id: DEFAULT_PROVIDER_ID, label: 'WorkBuddy', count: 0 })
+  // 摘要还没到时的兜底项：名字优先问注册表，问不到才用字面量 —— 与
+  // add-provider-pick 那张卡的兜底同一口径（拆家后注册名带「国内版」）
+  if (!known.size) {
+    known.set(DEFAULT_PROVIDER_ID, {
+      id: DEFAULT_PROVIDER_ID,
+      label: shared().wbProviders?.labelOf?.(DEFAULT_PROVIDER_ID) || 'WorkBuddy 国内版',
+      count: 0,
+    })
+  }
   return [...known.values()]
 }
 
@@ -205,16 +227,122 @@ export function identifierOf(account: AccountRecord | null | undefined): string 
   return String(account?.[key] || '')
 }
 
+/**
+ * 到期时刻**归一到毫秒**：库里落盘的单位在秒与毫秒之间漂过 —— CPA 的 auth 文件与
+ * 手工粘贴进来的是 10 位秒，别家与上游刷新响应都是 13 位毫秒。不归一的后果不是
+ * "少三位精度"而是整条账号被判死：`1791009732`（秒）当毫秒读是 1970-01-21，
+ * 有效期那一列直接显示「已过期」，而它的令牌其实还有几天。
+ *
+ * 1e11 这个分界与后端 `providers::trae::Credential::expires_at_ms` **同一个口径**
+ * （1e11 秒 ≈ 公元 5138 年，真正的毫秒时间戳不可能小于它），两处注释互相指着对方，
+ * 改数值时要一起改。0 与负数原样返回：那代表"记录里没给到期时刻"，不能捏成
+ * 一个 1970 年的时间戳。
+ */
+export function expiryMillis(value: unknown): number {
+  const raw = Number(value) || 0
+  if (raw <= 0) return 0
+  return raw < 1e11 ? raw * 1000 : raw
+}
+
 /** token 过期时间戳（毫秒，0 表示记录里没有这个字段） */
 export function tokenExpiryOf(account: AccountRecord | null | undefined): number {
   const key = providerFeatures(providerOf(account)).expiry
-  const value = Number(account?.[key])
-  return Number.isFinite(value) ? value : 0
+  return expiryMillis(account?.[key])
 }
 
 /** 该账号所属 provider 是否有余额概念（没有就不渲染余额按钮，也不参与批量查询） */
 export function supportsUsage(account: AccountRecord | null | undefined): boolean {
   return providerFeatures(providerOf(account)).usage
+}
+
+/* ─── 每账号的余额查询设置（账号设置弹窗「查询设置」段 + 余额列徽章共用）─── */
+
+/** 自动查询间隔的边界（秒）—— 与后端 `usage_records` 的常量同一对数值 */
+export const USAGE_QUERY_MIN_SECONDS = 30
+export const USAGE_QUERY_MAX_SECONDS = 86_400
+
+/** 余额不足的处理档（与后端 `lowBalance.mode` 同一套取值） */
+export type LowBalanceMode = 'off' | 'skip' | 'disable'
+
+/**
+ * 缺省口径（记录上没有 usageQuery / lowBalance 字段时）—— 与后端
+ * `usage_records::DEFAULT_*` 同一对数值：自动查询**开启**、1 分钟；余额不足
+ * **跳过**、阈值 1。缺省必须对齐全局任务时代「默认就在查」的行为，否则升级
+ * 后所有人的余额列会静默停更；跳过@1 是最温和的兜底（没钱的让路、回升自愈）。
+ */
+export const DEFAULT_USAGE_INTERVAL_SECONDS = 60
+export const DEFAULT_LOW_BALANCE_THRESHOLD = 1
+
+/**
+ * 自动余额查询设置的规范化读取。缺省（字段缺失）= 开启、1 分钟；显式
+ * `{enabled:false}` 才是关；开着但间隔缺失 / 越界按缺省间隔跑（脏值不把
+ * 自动查询停掉）。调用方拿到的一定是完整形状，不必判「键缺失」。
+ */
+export function usageQueryOf(account: AccountRecord | null | undefined): {
+  enabled: boolean
+  interval: number
+} {
+  const config = account?.usageQuery
+  if (!config || typeof config !== 'object') {
+    return { enabled: true, interval: DEFAULT_USAGE_INTERVAL_SECONDS }
+  }
+  const enabled = config.enabled === undefined ? true : config.enabled === true
+  const interval = Number(config.interval) || 0
+  const valid = interval >= USAGE_QUERY_MIN_SECONDS && interval <= USAGE_QUERY_MAX_SECONDS
+  return { enabled, interval: enabled && !valid ? DEFAULT_USAGE_INTERVAL_SECONDS : interval }
+}
+
+/**
+ * 余额不足处理的规范化读取。缺省（字段缺失）= 跳过、阈值 1；显式 `off` 必须
+ * 保持 off（那是用户关掉的）；skip / disable 档下阈值缺失或非法回落缺省 1。
+ */
+export function lowBalanceOf(account: AccountRecord | null | undefined): {
+  mode: LowBalanceMode
+  threshold: number
+} {
+  const config = account?.lowBalance
+  if (!config || typeof config !== 'object') {
+    return { mode: 'skip', threshold: DEFAULT_LOW_BALANCE_THRESHOLD }
+  }
+  const mode: LowBalanceMode =
+    config.mode === 'skip' || config.mode === 'disable' || config.mode === 'off'
+      ? config.mode
+      : 'skip'
+  const threshold = Number(config.threshold) || 0
+  if (mode === 'off') return { mode, threshold: 0 }
+  return { mode, threshold: threshold > 0 ? threshold : DEFAULT_LOW_BALANCE_THRESHOLD }
+}
+
+/**
+ * 秒数 → 人能读的间隔文案（`每 90 分钟` 这类），与后端变更提示同一口径：
+ * 整小时 / 整分钟进位，其余按秒。
+ */
+export function formatIntervalSeconds(seconds: number): string {
+  if (seconds > 0 && seconds % 3600 === 0) return `${seconds / 3600} 小时`
+  if (seconds > 0 && seconds % 60 === 0) return `${seconds / 60} 分钟`
+  return `${seconds} 秒`
+}
+
+/**
+ * 这条账号此刻是否应因「余额不足」被跳过（余额列徽章的判据）。
+ *
+ * 与后端选路过滤（`usage_records::balance_blocked`）同一口径：mode == 'skip'
+ * 且最近一次读数判得出数字且严格小于阈值（等于仍可用）。`entry` 是余额缓存的
+ * 读数（`usageEntryOf` 的结果）—— 判不出（未查询 / 失败行 / unlimited / 数字
+ * 缺失）一律放行：跳过是对「这个账号没钱」的断言，拿不出证据就不亮徽章。
+ */
+export function lowBalanceBlockedOf(
+  account: AccountRecord | null | undefined,
+  entry: UsageEntry,
+): boolean {
+  const { mode, threshold } = lowBalanceOf(account)
+  if (mode !== 'skip' || !(threshold > 0)) return false
+  if (!entry || typeof entry !== 'object') return false
+  const data = entry as Record<string, unknown>
+  if (data.unlimited) return false
+  // 数字口径与余额列同源：workbuddy 既有形状 totalLeft，其余 available
+  const remaining = Number(data.totalLeft ?? data.available)
+  return Number.isFinite(remaining) && remaining < threshold
 }
 
 /** 是否为「桌面端实时登录态」账号（凭证实时读客户端文件；可禁用、也可删除） */
@@ -229,6 +357,18 @@ export function isDesktopAccount(account: AccountRecord | null | undefined): boo
  */
 export function supportsChat(account: AccountRecord | null | undefined): boolean {
   return account?.chatSupported !== false
+}
+
+/**
+ * 自定义提供商的 id 判据（`custom-` 前缀）。
+ *
+ * 与后端 `custom_providers::is_custom_provider_id` 的**第一半**一致：那边还要求
+ * 「能在配置里找到这家」（判「这个 id 是不是真家」），界面这里问的是另一件事 ——
+ * 「这条账号是不是自定义形态」，提供商被删后残留的账号同样要按自定义形态展示
+ * （与后端 `to_custom_public_account` 用前缀分派同一取向）。
+ */
+export function isCustomProviderId(provider: string | null | undefined): boolean {
+  return typeof provider === 'string' && provider.startsWith('custom-')
 }
 
 export function typeLabel(type: string | undefined): string {
@@ -269,27 +409,6 @@ export function isRateLimited(account: AccountRecord | null | undefined, model =
 /** 账号所属版本：cn=国内 / intl=国际（缺省视为国内，兼容旧账号记录） */
 export function accountEdition(account: AccountRecord | null | undefined): 'cn' | 'intl' {
   return account?.edition === 'intl' ? 'intl' : 'cn'
-}
-
-/**
- * 该账号是否参与「签到 / 每日活跃打卡」这个动作。
- *
- * ── 国际版：只有 WorkBuddy 在范围内（2026-10）─────────────────
- * 国际站没有国内站那种每日签到接口，但 WorkBuddy 国际版另有一条「每日活跃」
- * 奖励：官方认的是**跑完的网页端 agent 会话**（桌面身份发 chat/completions
- * 不计数、只建会话不接沙箱也不计数）。这条链路在后端是
- * `providers::workbuddy::web_daily`，按钮与国内版是同一颗。
- *
- * 其它家的国际版仍然排除：Qoder 国际版这个地区根本没有签到计划；Accio 系
- * 两个地区都没有活动（能力位 `checkin` 已是 false）。
- *
- * 与后端同源同口径：`billing::checkin::supports_checkin` 也是这条判据，
- * 两处任一改动都要同时改（批量签到的目标集合由后端算，前端这处只决定按钮）。
- */
-export function supportsCheckin(account: AccountRecord | null | undefined): boolean {
-  if (!providerFeatures(providerOf(account)).checkin) return false
-  if (accountEdition(account) === 'intl') return providerOf(account) === 'workbuddy'
-  return true
 }
 
 /**
@@ -456,44 +575,6 @@ export function welfareTodoTitle(state: WelfareState): string {
   return `${tried}探测并领取官方每日登录赠送的套餐积分（到账进套餐积分，不增加福利模型 token 池）`
 }
 
-/**
- * 某时刻所在**本地自然日**的零点。自然日的判定统一走这里，与限流恢复时间的
- * 「今天 / 明天」（formatResetText）同一口径。
- */
-const startOfLocalDay = (value: number): number => {
-  const date = new Date(value)
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
-}
-
-/**
- * 该账号**今天是否已签到**（后端落盘的 `checkinAt` 落在本地今天）。
- *
- * 签到按自然日幂等（上游按天重置额度），所以「签过没有」不能只看有没有这个时间戳，
- * 必须比自然日 —— 过了 0 点同一个字段自然失效，**不需要任何定时器去重置**：判定是
- * 每次渲染现算的，跨零点后下一次重绘按钮就自己变回可点。
- * 看的是后端字段而不是界面缓存：自动签到的执行者是后端（定时任务），界面缓存里
- * 根本没有那次签到的结果。
- */
-export function checkedInToday(account: AccountRecord | null | undefined): boolean {
-  const at = Number(account?.checkinAt) || 0
-  if (at <= 0) return false
-  // 时间戳比现在还晚（改过系统时钟、或手工编辑过账号文件）时仍按「今天」算：
-  // 它只可能来自一次真实的签到，宁可显示已签到也不要让按钮一直亮着
-  if (at > Date.now()) return true
-  return startOfLocalDay(at) === startOfLocalDay(Date.now())
-}
-
-/**
- * 可参与签到的账号（一键签到只用这批：所属家有签到活动 + 非国际版）。
- *
- * **不看 `enabled`**：禁用只表示「别用它转发」，签到是另一件事 —— 一个被禁用的账号
- * 依然可以每天签到攒积分。此处与后端 `core::billing::checkin` 的批量路径过滤链
- * 口径一致，否则界面上的「将签到 N 个账号」会与实际执行数对不上。
- */
-export function checkinableAccounts(list: AccountRecord[] | null | undefined): AccountRecord[] {
-  return (list || []).filter(account => supportsCheckin(account))
-}
-
 /* ─── 筛选维度（provider / enabled / limit 三维各自独立）───── */
 
 export type AccountFilter = { provider: string; enabled: string; limit: string }
@@ -588,9 +669,23 @@ export function positionMap(all: AccountRecord[] | null | undefined): Map<string
 
 /* ─── 展示派生 ─────────────────────────────── */
 
-/** 账号展示名（昵称优先，退化到备注名 / 标识 / id） */
+/**
+ * 账号展示名，纯 nameCustom 分流（两条线，不按家再分叉）：
+ *   · 用户显式设置过备注名（打标，见后端 apply_patch / mark_name_custom）—— 备注名恒为主名；
+ *   · 未打标 —— 维持历史口径：「以邮箱报名字」的三家（Qoder / AutoClaw 国际版 / Accio）
+ *     邮箱优先，其余昵称优先，再退备注名种子 / 标识 / id。
+ * 备注名种子与用户改的名在记录里无法区分，全靠 nameCustom 分流 —— 没有它，
+ * 「备注名优先」会让未设备注的账号顶掉邮箱 / 昵称，显示成建号时的种子值。
+ * （中间版本试过「非邮箱系家名字优先」的放宽，好处是更新前的旧备注免重存生效，
+ *  代价是取名规则按家分叉、解释成本高 —— 已按用户决定回归纯标记这一条线。）
+ */
 export function displayNameOf(account: AccountRecord | null | undefined): string {
-  return account?.nickname || account?.name || identifierOf(account) || account?.id || ''
+  if (!account) return ''
+  const name = String(account.name || '').trim()
+  if (account.nameCustom === true && name) return name
+  const email = String(account.email || '').trim()
+  if (providerFeatures(providerOf(account)).emailAsName && email) return email
+  return account?.nickname || name || identifierOf(account) || account?.id || ''
 }
 
 /** 无有效恢复时间时的退化文案：它本身就是完整一句，调用方据此不再拼「，恢复时间：」 */
@@ -657,6 +752,19 @@ export function accountTags(account: AccountRecord): AccountTag[] {
     // 留着是为了「将来某家处于只有账号管理的过渡期」时界面能自己说清楚
     supportsChat(account)
       ? null : { text: '仅账号管理', kind: 'plain' as const, title: '该提供商的推理转发尚未接入，账号不参与转发' },
+    // 自定义账号没有凭证：既没填 API Key、也没勾「无需鉴权」时，它在选路里会被
+    // **静默跳过**（后端 hasCredentials = false，目录也不广告它家的模型）——原样
+    // 展示成一条普通账号会让用户完全看不出「为什么加了账号却发不出去请求」。
+    // 判据用后端注入的 hasCredentials（所有家都有这个字段，但只有自定义家会为
+    // false —— 其它家的凭证各有各的链路），再限定 id 前缀避免误报。
+    isCustomProviderId(providerOf(account)) && account.hasCredentials === false
+      ? {
+        text: '未配置凭证',
+        kind: 'bad' as const,
+        title: '这条自定义账号既没有 API Key，也没有勾选「无需鉴权」：转发时会被跳过，'
+          + '该提供商下的模型也不会出现在模型列表里。去账号「设置」里补上 Key，或勾选「该上游无需鉴权」',
+      }
+      : null,
     // 代理配了解析不出来时明确标出：转发会回退直连，属于需要留意的情况
     account.proxy?.error
       ? { text: '代理异常', kind: 'bad' as const, title: `${account.proxy.error}（转发时会回退直连）` }
@@ -671,33 +779,6 @@ export function accountTags(account: AccountRecord): AccountTag[] {
       }
       : null,
   ].filter((tag): tag is AccountTag => tag !== null)
-}
-
-/**
- * 「下次什么时候能再签」的说明（已签到按钮的悬停说明与明细面板共用一句）。
- *
- * 两家口径不同：
- *   - WorkBuddy / 小浣熊 / AutoClaw：按**自然日**重置，明天 0 点后可再签；
- *   - Qoder：每日权益是一个**活动窗口**（当天 10:00 → 次日 10:00），
- *     所以 0 点后不一定能签 —— 说「0 点后可再签」会让人白点一次。
- */
-export function checkinResetHint(account: AccountRecord | null | undefined): string {
-  return providerOf(account) === 'qoder'
-    ? 'Qoder 的每日权益按 10:00 → 次日 10:00 的活动窗口发放，新窗口开放后可再领'
-    : '签到按自然日重置，明天 0 点后可再签'
-}
-
-/** 「已签到」按钮的悬停说明：给出签到时刻与重置时机，回答「为什么点不动、什么时候能再签」 */
-export function checkinDoneTitle(account: AccountRecord | null | undefined): string {
-  const at = Number(account?.checkinAt) || 0
-  const clock = at > 0 ? `今天 ${new Date(at).toTimeString().slice(0, 5)}` : '今天'
-  return `${clock} 已签到；${checkinResetHint(account)}`
-}
-
-/** 签到明细里「今天已签到」那一刻的时钟串（0 返回空串） */
-export function checkinClock(account: AccountRecord | null | undefined): string {
-  const at = Number(account?.checkinAt) || 0
-  return at > 0 ? new Date(at).toTimeString().slice(0, 5) : ''
 }
 
 /** 更新时刻文案（时间戳非法时返回空串，调用处据此省略那半句） */

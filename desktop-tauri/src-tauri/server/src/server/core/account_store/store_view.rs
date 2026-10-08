@@ -16,6 +16,8 @@
 //!
 //! 这些方法仍是 `impl AccountStore` 的分块（同一个类型，跨文件不改变可见性）。
 
+use std::collections::HashMap;
+
 use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::state::{AccountState, StoredAccount};
@@ -175,6 +177,31 @@ impl AccountStore {
         self.snapshot(&state)
     }
 
+    /// 账号 id → 该记录最近一次改动的时刻（`max(addedAt, updatedAt)`，毫秒）。
+    ///
+    /// 给「这条结论现在还算不算数」的时效判定用（见 `core::usage_query` 的快照
+    /// 出口过滤）。判据刻意只看记录自己的时间戳：重新登录、重新导入、token 被
+    /// 刷新、改设置都会把它往前推，而**凭证内容本身不必为了这个判定被读出来**
+    /// —— 比指纹更省事，也不给「把 token 拼进一个新结构」多开一条口子。
+    ///
+    /// 代价是改动类型区分不出来（换凭证与改备注名同样是「记录变了」）：判定方
+    /// 按「记录变了就作废旧结论」处理，多作废一条失败提示，比留着一条过期结论
+    /// 更轻 —— 用户手点一次查询就能得到新的（见 `usage_query` 的说明）。
+    pub fn account_change_times(&self) -> HashMap<String, i64> {
+        let _guard = self.guard();
+        let state = self.load(&_guard);
+        state
+            .accounts
+            .iter()
+            .map(|record| {
+                (
+                    record.id().to_string(),
+                    record.added_at().max(record.updated_at()),
+                )
+            })
+            .collect()
+    }
+
     /// 已持锁时的列表快照（CRUD 内部要在同一次锁里连做「写入 + 取快照」）
     pub(crate) fn snapshot(&self, state: &AccountState) -> Value {
         // 逐家派生队首：provider 取值的来源就是账号数据里出现过的家
@@ -265,8 +292,14 @@ impl AccountStore {
             // LobsterAI（有道龙虾）：公开形态见 `lobsterai_accounts.rs`
             self.to_lobsterai_public_account(record)
         } else if record.provider() == super::LOOMY_PROVIDER_ID {
-            // Loomy（讯飞）：公开形态见 `loomy_accounts.rs`
+            // Loomy（讯飞）：单一入口（手机验证码登录），公开形态带 userId /
+            // phone / session 尾四位的展示字段（见 `loomy_accounts.rs`）
             self.to_loomy_public_account(record)
+        } else if record.provider() == super::kuku_accounts::KUKU_PROVIDER_ID {
+            // KukuAI（百度文库库库 AI）：单一入口（粘贴 Cookie / 导入本机登录态），
+            // 公开形态带 uid(=uk) / loginName(=昵称) / tokenTail（见
+            // `kuku_accounts.rs`）
+            self.to_kuku_public_account(record)
         } else if record.provider() == super::MINIMAX_PROVIDER_ID {
             // MiniMax Code（中国版）：公开形态见 `minimax_accounts.rs`
             self.to_minimax_public_account(record)
@@ -310,6 +343,33 @@ impl AccountStore {
                 // 恒为数字（无记录时 0）而不是缺键：界面按 `Number(...) || 0` 读，
                 // 两种形态都能吃，但恒定的形状让「字段缺失」与「值为 0」不再需要分开判。
                 fields.insert("checkinAt".to_string(), Value::from(record.checkin_at()));
+                // 用户显式设置过备注名（update_account 真正改到 name 时打的标，
+                // 见 apply_patch）。恒为布尔而不是缺键：界面据此决定「备注名赢过
+                // 邮箱 / 昵称等默认口径」还是「维持原展示行为」，两种形态都不必
+                // 再判「字段缺失」。
+                fields.insert(
+                    "nameCustom".to_string(),
+                    Value::Bool(
+                        record
+                            .fields()
+                            .get("nameCustom")
+                            .map(js_truthy)
+                            .unwrap_or(false),
+                    ),
+                );
+                // 每账号的余额查询设置（自动查询 + 余额不足处理）：跨家统一注入
+                // 的理由与 hasCredentials 相同 —— 心跳调度、选路跳过 / 禁用与前端
+                // 弹窗、徽章读的是**同一份事实**，不能各家形状一个口径。
+                // 恒为对象（未配置 = 关闭 / off 的规范化形状，与写入侧
+                // `apply_patch` 的归一化一致），读侧不必判「键缺失」。
+                fields.insert(
+                    "usageQuery".to_string(),
+                    usage_query_public(record.fields().get("usageQuery")),
+                );
+                fields.insert(
+                    "lowBalance".to_string(),
+                    low_balance_public(record.fields().get("lowBalance")),
+                );
                 Value::Object(fields)
             }
             // 各家形状恒为对象；真出现异常形态时原样透出，不在这里改语义
@@ -388,7 +448,8 @@ impl AccountStore {
     ///
     /// `hasCredentials` / `chatSupported` / `checkinAt` 由 [`Self::public_account`]
     /// 统一注入（跨家事实，见那里的说明）；自定义账号的 `hasCredentials`
-    /// 判据是 `apiKey` 非空（见 `state::has_credentials` 的第三条）。
+    /// 判据是「`apiKey` 非空 **或** 声明了无需鉴权」（见 `state::no_auth`），
+    /// 两者都没有 = 未配置凭证，界面据此标出「转发会被跳过」。
     pub(crate) fn to_custom_public_account(&self, record: &StoredAccount) -> Value {
         let fields = record.fields();
         let mut public = Map::new();
@@ -400,6 +461,13 @@ impl AccountStore {
             "tokenTail".to_string(),
             value_or(fields.get("tokenTail"), Value::String(String::new())),
         );
+        // ── 凭证形态的两个读数（界面「设置」里改凭证要用）──────────
+        // `hasApiKey` 恒给一个布尔：输入框的提示文案要区分「已配置，留空则
+        // 不修改」与「还没配」；`noAuth` 恒给布尔（缺键即 false）—— 开关的
+        // 初值由它决定。**apiKey 本身绝不透出**（值与尾号两条管道分开，
+        // 见 `custom_credential_by_id` 的说明）。
+        public.insert("hasApiKey".to_string(), Value::Bool(record.has_api_key()));
+        public.insert("noAuth".to_string(), Value::Bool(record.no_auth()));
         // 覆盖项：记录里**写了键**才透出（缺键 = 未覆盖，语义见函数头）
         if let Some(base_url) = fields.get("baseUrl") {
             public.insert("baseUrl".to_string(), base_url.clone());
@@ -410,7 +478,15 @@ impl AccountStore {
         public.insert("addedAt".to_string(), Value::from(record.added_at()));
         public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
         public.insert("proxy".to_string(), describe_account_proxy(Some(&record.proxy())));
-        public.insert("available".to_string(), Value::Bool(true));
+        // 「可用」= 凭证完整（与各家同一语义，见 `accounts-shared` 的 available 说明）。
+        // 自定义账号这一项以前恒 true，于是「没填 Key 也没勾无需鉴权」的账号照样出现在
+        // 「模型来源」下拉里（界面按 `available !== false` 过滤，见 models-fetch-modal）
+        // ——它去拉清单必然报「请先添加账号」，那条选项本身就是误导。
+        // 现在按 `has_credentials` 如实给：这类账号在界面上显示为「未配置凭证」。
+        public.insert(
+            "available".to_string(),
+            Value::Bool(record.enabled() && record.has_credentials()),
+        );
         // 单账号并发上限（与 to_public_account 同口径，兜底共用
         // `max_concurrent_public`）：0 = 不限，缺键同样输出 0
         public.insert(
@@ -418,5 +494,55 @@ impl AccountStore {
             Value::from(max_concurrent_public(fields.get("maxConcurrent"))),
         );
         Value::Object(public)
+    }
+}
+
+/// 记录上的 `usageQuery` → 公开形态的规范化形状（恒为对象）。
+///
+/// 读侧只做**容错展开**、不校验：合法性由写入侧（`apply_patch` 的
+/// `normalize_usage_query`）保证，这里负责把缺失 / 脏值收敛成缺省形状，让
+/// 调度与前端都按「恒定形状」读。缺省与 `usage_records::query_interval_of`
+/// 同一口径 —— **未配置 = 开启、1 分钟**（对齐全局任务时代「默认就在查」的
+/// 行为，升级后余额列不停更），只有显式 `{enabled:false}` 才是关。
+fn usage_query_public(value: Option<&Value>) -> Value {
+    use crate::server::core::usage_records::{
+        DEFAULT_QUERY_INTERVAL_SECONDS, MAX_QUERY_INTERVAL_SECONDS, MIN_QUERY_INTERVAL_SECONDS,
+    };
+    let Some(fields) = value.and_then(Value::as_object) else {
+        return json!({ "enabled": true, "interval": DEFAULT_QUERY_INTERVAL_SECONDS });
+    };
+    let enabled = fields.get("enabled").map(js_truthy).unwrap_or(true);
+    let interval = fields.get("interval").and_then(Value::as_i64).unwrap_or(0);
+    // 开着但间隔缺失 / 越界（脏值）→ 缺省间隔；关着则原样透出（0 = 未设过）
+    let interval = if enabled
+        && !(MIN_QUERY_INTERVAL_SECONDS..=MAX_QUERY_INTERVAL_SECONDS).contains(&interval)
+    {
+        DEFAULT_QUERY_INTERVAL_SECONDS
+    } else {
+        interval
+    };
+    json!({ "enabled": enabled, "interval": interval })
+}
+
+/// 记录上的 `lowBalance` → 公开形态的规范化形状。
+///
+/// 缺省（无配置）= `skip`、阈值 1（与 `usage_records::balance_blocked` 同一口径）；
+/// 显式 `off` 必须保持 off —— 那是用户关掉的，缺省不能覆盖它。skip / disable
+/// 档下阈值缺失或非法时回落缺省 1。
+fn low_balance_public(value: Option<&Value>) -> Value {
+    use crate::server::core::usage_records::DEFAULT_LOW_BALANCE_THRESHOLD;
+    let Some(fields) = value.and_then(Value::as_object) else {
+        return json!({ "mode": "skip", "threshold": DEFAULT_LOW_BALANCE_THRESHOLD });
+    };
+    let mode = fields.get("mode").and_then(Value::as_str).unwrap_or("skip");
+    let threshold = fields
+        .get("threshold")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_LOW_BALANCE_THRESHOLD);
+    match mode {
+        "skip" => json!({ "mode": "skip", "threshold": threshold }),
+        "disable" => json!({ "mode": "disable", "threshold": threshold }),
+        _ => json!({ "mode": "off", "threshold": 0.0 }),
     }
 }

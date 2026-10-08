@@ -1,343 +1,315 @@
-//! Loomy（讯飞办公助手）适配器。
+//! Loomy（讯飞）适配器：账号管理（手机号验证码登录）**加推理转发**。
 //!
-//! ── 上游长什么样（移植来源：参考实现 `src/loomy*.ts`）──────────
-//!   - 对话：`POST {apiBase}/chat/completions`，**标准 OpenAI 兼容 +
-//!     标准 SSE**（`data:` 帧 + 空 `data:` 终止帧，思考在
-//!     `delta.reasoning_content`，无加密、无信封、无格式转换）。
-//!     因此走**无状态**转发路径（与 raccoon / autoclaw 同构）。
-//!   - 认证：chat 端点只认 `Authorization: Bearer`，业务端点只认小写
-//!     `token` 头 —— chat 请求**两个都发**（官方客户端同款，见 `client.rs`）。
-//!   - 登录：短信验证码（`core::login` 的 sms 分派 + `api/session` 两条路由），
-//!     签名见 `sign.rs`。
-//!   - **没有 refresh 端点**：`supports_refresh` / `credentials_expiring`
-//!     恒 false（诚实标记；14 天后重新短信登录）。
+//! ── 上游长什么样（逆向来源：`D:\Program Files\Loomy\resources\app.asar`）──
+//! 三套平面（细节见各子模块的模块头）：
 //!
-//! ── 思考档位 ────────────────────────────────────────────────
-//! 远端 `GET /models` 直接下发 `reasoning_efforts`（实测 8 个模型完全一致：
-//! `none/low/medium/high/xhigh`）与 `default_reasoning_effort`。
-//! 注入字段是 `reasoning_effort`，取值必须在该模型的 efforts 内 ——
-//! `none` 是官方档位之一（「关闭思考」），有实测支撑，因此本家对 `off`/`none`
-//! 的处理是**查档位表**而不是一律 Skip。
+//! ```text
+//!   账号 CAccount     POST https://account.xfinfr.com/login/phone/{sendMsgCode,checkCode}
+//!                     HMAC-SHA1 签名头（客户端内置 AccessKey 对，见 sign.rs）
+//!   集成网关（积分）  https://loomyad.xunfei.cn        header: token: <session>
+//!   模型网关          {集成网关}/api/v1                 OpenAI 兼容，token + Bearer 双头
+//! ```
 //!
-//! ── 子模块 ─────────────────────────────────────────────────
-//!   product.rs      常量（双基址 / 签名密钥 / 兜底模型表）
-//!   sign.rs         HMAC-SHA1 签名（9 段拼串，纯函数 + 单测锁死）
-//!   credentials.rs  凭据结构 + 信封解析 + 展示名倍率规范化
-//!   client.rs       两套认证头 + 账号请求体 + JSON 请求工具
-//!   oauth.rs        短信发码 / 校验登录
-//!   models.rs       模型目录（type=chat 过滤 + 兜底 8 条 + 档位元数据）
-//!   checkin.rs      first-login 签到（幂等判据 alreadyProcessed）
-//!   balance.rs      两池积分（records 只读）
+//! 本家**无状态**（一次 HTTP 请求 = 一次回答，OpenAI 协议），与 AutoClaw 同构：
+//! `supports_chat` / `is_stateful` 走默认值，转发链只需 `build_chat_request`。
 //!
-//! ── panic=abort ────────────────────────────────────────────
-//! 本文件在对话链路上，绝不 unwrap/expect/panic。
-
-use std::pin::Pin;
-
-use axum::http::HeaderMap;
-use serde_json::Value;
-
-use crate::server::core::account_store::AccountStore;
-use crate::server::errors::GatewayError;
-
-use super::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
-};
-use super::{kind_id, ProviderKind};
+//! ── 三处与别家不同的取舍（都写在各自模块头，这里给索引）──────
+//!   1. **没有续期**（`supports_refresh = false`）：session 14 天，上游没有
+//!      refresh 接口，过期（`020002` / `100002`）只能重新短信登录 ——
+//!      见 `credentials.rs` 的模块头；
+//!   2. **没有桌面端导入**：登录态不在可读文件里（Accio / ZCode 同一处境）；
+//!   3. **没有内置兜底模型清单**：官方 imodel 网关 `/models` 拉不到就如实报错，
+//!      不编模型名 —— 见 `models.rs` 的模块头。
+//!
+//! ── 思考等级 ────────────────────────────────────────────────
+//! 客户端给模型挂 OpenCode variant（low/medium/high）→ AI SDK 发
+//! `reasoning_effort`；网关侧把通用档位折成这三档注入（客户端显式指定时让位）。
+//! 只有 spark-x 是真思考模型，但上游对非思考模型忽略该字段是已知行为
+//! （客户端对全部 OpenAI 兼容模型都挂了 variants），因此不做按模型的收窄。
+//!
+//! ── 硬约束 ──────────────────────────────────────────────────
+//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
 pub mod balance;
 pub mod checkin;
 pub mod client;
 pub mod credentials;
+pub mod endpoints;
+pub mod images;
+pub mod login;
 pub mod models;
-pub mod oauth;
-pub mod product;
+pub mod onboarding;
 pub mod sign;
 
-/// 提供商 id（注册表与 `ProviderKind` 用同一条）。
-pub const PROVIDER_ID: &str = super::kind_id(ProviderKind::Loomy);
+use axum::http::HeaderMap;
+use serde_json::Value;
 
-/// Loomy 适配器（无状态单例）。
+use crate::server::core::account_store::AccountStore;
+use crate::server::core::providers::adapter::{
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
+};
+use crate::server::core::providers::{content_block, ProviderKind};
+use crate::server::errors::GatewayError;
+use crate::server::logging;
+
+/// 适配器实例（`adapter_for(ProviderKind::Loomy)` 返回这一个）。
+///
+/// **无状态**：它不持有任何数据 —— 凭证在账号存储、目录在 `models.rs` 的
+/// 进程级句柄。这与 `AutoClawAdapter` 持有 `region` 不同：本家没有两地区。
 pub struct LoomyAdapter;
 
-/// 进程级实例（`adapter_for` 返回它的引用）。
+/// 静态单例
 pub static LOOMY_ADAPTER: LoomyAdapter = LoomyAdapter;
-
-impl LoomyAdapter {
-    /// 取某账号的凭据快照（`account_id` 为空 = 这一家的队首可用账号）。
-    fn snapshot_for(store: &AccountStore, account_id: &str) -> Result<Value, GatewayError> {
-        let record = store.loomy_account_record(account_id);
-        if !account_id.is_empty() && record.is_none() {
-            return Err(GatewayError::with_status(404, "账号不存在"));
-        }
-        record.ok_or_else(|| {
-            GatewayError::with_status(
-                401,
-                format!("没有可用的 {} 账号", kind_id(ProviderKind::Loomy)),
-            )
-        })
-    }
-}
 
 impl ProviderAdapter for LoomyAdapter {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Loomy
     }
 
+    /// 模型清单来自远程目录（`models.rs` 的进程缓存 + 落盘缓存）
     fn list_models(&self) -> Vec<Value> {
         models::list()
     }
 
-    /// 构造 `POST {apiBase}/chat/completions`（body 原样透传）。
+    /// 构造 `POST {模型网关}/chat/completions`（OpenAI 协议，body 原样透传）。
+    ///
+    /// 鉴权是**双头**（客户端 `fetchModelsFromProvider` 的 authMode: 'token' 同款）：
+    /// `token: <session>` 与 `Authorization: Bearer <session>` 都发 —— 上游两个
+    /// 网关（模型 / 积分）对头名的偏好不同，双写是对两边都安全的做法。
+    ///
+    /// `account` 是会话形态（`store.get_session_by_id` 的返回值）：
+    /// session 从 `auth.accessToken` 取，与另外几家同一约定。
     fn build_chat_request(
         &self,
         account: &Value,
         body: &Value,
         _client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError> {
-        let credential = credentials::Credential::from_value(account);
-        if !credential.valid() {
-            return Err(GatewayError::with_status(401, "Loomy 账号缺少 session，无法转发"));
+        let token = account
+            .get("auth")
+            .and_then(|auth| auth.get("accessToken"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if token.is_empty() {
+            return Err(GatewayError::with_status(
+                401,
+                "Loomy 账号缺少 session，无法转发（请重新登录）",
+            ));
         }
-        let headers = client::chat_headers(&credential.access_token);
-        let url = format!("{}{}", product::API_BASE, product::CHAT_PATH);
-        Ok(ChatRequestPlan::chat(url, headers, body.clone()))
-    }
-
-    /// 思考档位翻译：注入 `reasoning_effort`（取值必须在该模型的 efforts 内）。
-    ///
-    /// `off` / `none`：Loomy 的官方档位表里就有 `none`（「关闭思考」），
-    /// 因此查表命中就注入，不套用「一律不注入」的全局判据（本家有实测支撑）。
-    fn reasoning_patch(&self, level: &str, model: &str, body: &Value) -> ReasoningPatch {
-        // 客户端已显式指定时不覆盖
-        if crate::server::core::model_rules::read_client_level(body).is_some() {
-            return ReasoningPatch::Skip { reason: "客户端请求体里已指定思考等级" };
-        }
-        let Some(efforts) = models::efforts_of(model) else {
-            return ReasoningPatch::Skip { reason: "该模型没有思考档位声明（远端未下发 reasoning_efforts）" };
-        };
-        let wanted = if crate::server::core::model_rules::reasoning_is_off(level) {
-            "none"
-        } else {
-            level
-        };
-        if efforts.iter().any(|item| item == wanted) {
-            ReasoningPatch::Set {
-                field: "reasoning_effort",
-                value: Value::String(wanted.to_string()),
-            }
-        } else {
-            ReasoningPatch::Skip { reason: "该等级不在本家接受的档位内（模型档位表里没有它）" }
-        }
-    }
-
-    /// 上游错误分类。
-    ///
-    /// Loomy 业务失败恒 HTTP 200（信封判据在实现内部处理），chat 走标准 SSE ——
-    /// 这里按 HTTP 状态码分类：401/403 → 刷新重试（本家无刷新，会让用户重登）、
-    /// 429 → 限额换号、其余透传。
-    fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
-        let message = error_body
-            .get("message")
+        let headers: Vec<(String, String)> = vec![
+            // send_raw 会自动补 Content-Type；这里只加本家的鉴权双头与 Accept
+            ("token".to_string(), token.clone()),
+            ("Authorization".to_string(), format!("Bearer {token}")),
+            ("Accept".to_string(), "text/event-stream".to_string()),
+        ];
+        // model 原样透传：Loomy 的模型 id 就是上游 id（没有路由前缀那套），
+        // 入口校验已按目录收窄过，这里不需要二次映射。
+        //
+        // 图片格式适配（见 `images` 模块头）：deepseek 系模型只认
+        // `<image_base64>` 标记，标准 image_url 会被上游当文本读（用户报的
+        // 「图片被截断/不支持图片识别」）；其余模型保持 image_url。
+        // 判断用**客户端请求名**（body.model 此刻还没被 wire 改写）：
+        // 目录名与映射别名都含 `deepseek`，宽松匹配两段链路都成立。
+        let requested_model = body
+            .get("model")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let code = error_body
+        let payload = if images::prefers_tag_format(&requested_model) {
+            let (rewritten, converted) = images::rewrite_to_tag(body);
+            if converted > 0 {
+                logging::verbose(
+                    "[Loomy]",
+                    &format!(
+                        "模型 {requested_model} 只认 <image_base64> 标记：已转换 {converted} 个图片块"
+                    ),
+                );
+            }
+            rewritten
+        } else {
+            body.clone()
+        };
+        Ok(ChatRequestPlan::chat(
+            format!("{}/chat/completions", endpoints::model_base_url()),
+            headers,
+            payload,
+        ))
+    }
+
+    /// 上游错误分类：
+    ///   - HTTP 401 / 403 → `TokenExpired`（刷新链对无续期的家会走到重登提示）；
+    ///   - 业务码 `020002` / `100002`（HTTP 200 或非 2xx 里的 body）→ `TokenExpired`；
+    ///   - HTTP 429 → `QuotaLimited`（上游不给结构化恢复时间）；
+    ///   - 其余 → 内容拦截分类（审核文案）或原样透传。
+    fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
+        let raw = error_body
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("上游错误");
+        let message = format!("上游返回 {status}: {raw}");
+        let body_code = error_body
             .get("code")
-            .and_then(|value| {
-                value
-                    .as_i64()
-                    .map(|number| number.to_string())
-                    .or_else(|| value.as_str().map(str::to_string))
-            })
-            .unwrap_or_default();
-        // 登录失效：HTTP 401/403 或信封码 100002
-        if status == 401 || status == 403 || code == credentials::AUTH_ERROR_CODE {
-            return UpstreamErrorClass::TokenExpired {
-                message: format!("上游返回 {status}: {message}"),
-            };
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if status == 401 || status == 403 || client::is_auth_error_code(body_code) {
+            return UpstreamErrorClass::TokenExpired { message };
         }
         if status == 429 {
             return UpstreamErrorClass::QuotaLimited {
                 reset_at: None,
-                message: format!("上游返回 {status}: {message}"),
+                message,
                 upstream_code: error_body.get("code").and_then(Value::as_i64),
                 status,
             };
         }
-        UpstreamErrorClass::Fatal {
+        content_block::classify_or_fatal(
             status,
-            message: format!("上游返回 {status}: {message}"),
-            upstream_code: error_body.get("code").and_then(Value::as_i64),
-        }
+            error_body,
+            message,
+            error_body.get("code").and_then(Value::as_i64),
+        )
     }
 
-    /// 取可用 access token。
-    ///
-    /// 本家**没有刷新端点**：过期就直接报「请重新短信登录」，
-    /// 不做任何假装的续期尝试（那只会把一条清楚的错误变成两条）。
+    /// 取可用 session。本家**没有续期**：这里只做「记录里有没有 session」的检查，
+    /// 临期与否只影响账号页的提示（`credentials_expiring`），不影响转发 ——
+    /// 服务端拒了就是 401，编排层会把它归成 `TokenExpired` 并在刷新失败后
+    /// 如实报给客户端。
     fn ensure_access_token<'a>(
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>>
+    {
         Box::pin(async move {
-            let record = Self::snapshot_for(store, account_id)?;
-            let credential = credentials::Credential::from_value(&record);
-            if !credential.valid() {
-                return Err(GatewayError::with_status(401, "该账号没有可用凭证，无法转发"));
+            let record = store.loomy_account_record(account_id);
+            if !account_id.is_empty() && record.is_none() {
+                return Err(GatewayError::with_status(
+                    401,
+                    format!("Loomy 账号 {account_id} 不存在（请重新添加）"),
+                ));
             }
-            // 本地推算的 14 天有效期过了：如实报「重新登录」（服务端是否仍认由
-            // 401 那条链兜底 —— 本地读数只用于提前提示，不阻止请求）
-            if credentials::is_expired(&credential, crate::server::logging::now_ms()) {
-                crate::server::logging::verbose(
-                    "[Accounts]",
-                    "Loomy 凭据已过本地推算的有效期，仍按可用处理（服务端 401 时再提示重登）",
+            let credentials = credentials::from_record(record.as_ref())?;
+            if credentials.expiring() {
+                logging::verbose(
+                    "[Loomy]",
+                    "账号凭证已过期或临期（会话 14 天、无续期接口），如遇 401 请重新短信登录",
                 );
             }
-            Ok(credential.access_token)
+            Ok(credentials.session)
         })
     }
 
-    /// 本家**不支持**主动刷新（没有 refresh 端点）。
+    /// 没有续期手段（上游没有 refresh 接口）——维护任务不问本家
     fn supports_refresh(&self) -> bool {
         false
     }
 
-    /// 本家判不出「该刷新了」—— 恒 false（没有刷新手段，进维护队列只会白跑）。
-    fn credentials_expiring(&self, _store: &AccountStore, _account_id: &str) -> bool {
+    /// 临期判定：取记录 → 凭证的 `expiring()`（登录时间 + 14 天，提前 1 天）
+    fn credentials_expiring(&self, store: &AccountStore, account_id: &str) -> bool {
+        if account_id.is_empty() {
+            return false;
+        }
+        match store.loomy_account_record(account_id) {
+            Some(record) => credentials::from_record(Some(&record))
+                .map(|credentials| credentials.expiring())
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Loomy **没有**「默认模型」概念（不指定模型时由目录决定）
+    fn supports_default_model(&self) -> bool {
         false
     }
 
-    fn supports_usage(&self) -> bool {
-        true
+    /// 思考等级绑定 → `reasoning_effort`（low / medium / high）。
+    ///
+    /// 依据：客户端给 OpenAI 兼容模型挂的低中高三档 variant 最终就是
+    /// `reasoningEffort`（`model-service.js` 的 `buildThinkingVariants`），
+    /// 由 AI SDK 落到请求体的 `reasoning_effort`。通用 6 档折成三档：
+    /// `minimal|low → low`、`medium → medium`、`high|max → high`。
+    ///
+    /// 客户端显式指定时让位（用户的明确意图比映射默认值更具体）；
+    /// `off` / `none` 不注入（客户端没有「关闭思考」的可靠表达）；表外自定义
+    /// 等级不注入（上游对未知档位要么忽略要么 400，不如明确跳过）。
+    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value) -> ReasoningPatch {
+        if crate::server::core::model_rules::reasoning_is_off(level) {
+            return ReasoningPatch::Skip {
+                reason: "Loomy 没有「关闭思考」的可靠表达，跳过注入",
+            };
+        }
+        if crate::server::core::model_rules::read_client_level(body).is_some() {
+            return ReasoningPatch::Skip {
+                reason: "客户端请求体里已指定思考等级，绑定让位",
+            };
+        }
+        let Some(rank) = crate::server::core::model_rules::reasoning_rank(level) else {
+            return ReasoningPatch::Skip {
+                reason: "该等级不在通用档位表内，Loomy 不注入未知档位",
+            };
+        };
+        let effort = match rank {
+            0 | 1 => "low",
+            2 | 3 => "medium",
+            _ => "high",
+        };
+        ReasoningPatch::Set {
+            field: "reasoning_effort",
+            value: Value::String(effort.to_string()),
+        }
     }
 
-    fn query_usage<'a>(
-        &'a self,
-        store: &'a AccountStore,
-        account_id: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>> {
-        Box::pin(async move { balance::query_usage(store, account_id).await })
-    }
-
-    /// 本家**有**远程模型目录（`GET /models`）。
+    /// 有远程目录（`GET {网关}/api/v1/models`，见 `models.rs`）
     fn supports_model_refresh(&self) -> bool {
         true
     }
 
+    /// 刷模型目录：用指定账号（空串 = 库里第一个可用账号）的 session。
+    ///
+    /// 本家**没有环境变量旁路**，因此「一个账号都没有」时不是失败 ——
+    /// 那是「用户还没添加账号」的正常状态，返回 `unchanged()`（与 AutoClaw
+    /// 在无登录态时的处置一致：脚本 / CI 不该看到一个红色失败）。
     fn refresh_models<'a>(
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-        _force: bool,
-    ) -> Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>> {
+        force: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>> {
         Box::pin(async move {
-            let record = match Self::snapshot_for(store, account_id) {
-                Ok(record) => record,
+            let record = store.loomy_account_record(account_id);
+            if record.is_none() {
+                if account_id.is_empty() {
+                    logging::verbose("[Models]", "Loomy 模型目录刷新跳过：尚未添加账号");
+                    return ModelRefreshOutcome::unchanged();
+                }
+                return ModelRefreshOutcome::failed("指定的账号不存在或不可用，请重新选择");
+            }
+            let credentials = match credentials::from_record(record.as_ref()) {
+                Ok(credentials) => credentials,
                 Err(error) => return ModelRefreshOutcome::failed(error.message),
             };
-            let credential = credentials::Credential::from_value(&record);
-            if !credential.valid() {
-                return ModelRefreshOutcome::failed("该账号没有可用凭证，无法刷新模型目录");
-            }
-            let (count, error) = models::refresh(&credential.access_token).await;
-            match error {
-                Some(reason) => ModelRefreshOutcome::failed(reason),
-                None => ModelRefreshOutcome::refreshed(count),
-            }
+            models::refresh(&credentials.session, force).await
         })
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// 转发入口拿的是**会话形态**（凭证在 `auth` 下）—— 它必须能构造出请求，
-    /// 且 chat 端点那两个头（`Authorization` + 小写 `token`）都带上。
-    ///
-    /// 这条用例钉的是「每一次转发都 401」那个缺陷：只认平铺的记录形态时，
-    /// 这里会以「Loomy 账号缺少 session，无法转发」返回 Err。
-    #[test]
-    fn build_request_accepts_session_shape() {
-        let session = json!({
-            "endpoint": "https://loomy.xunfei.cn",
-            "auth": { "accessToken": "sess-nested", "tokenType": "Bearer" },
-            "account": { "uid": "123456789012345678" },
-        });
-        let body = json!({
-            "model": "MiniMax-M3",
-            "messages": [{ "role": "user", "content": "hi" }],
-            "stream": true,
-        });
-        let plan = LOOMY_ADAPTER
-            .build_chat_request(&session, &body, &HeaderMap::new())
-            .expect("会话形态必须能构造请求（否则转发恒 401）");
-        // chat 端点两个头都发（见 client.rs 的实测口径）
-        assert!(plan
-            .headers
-            .iter()
-            .any(|(name, value)| name == "Authorization" && value == "Bearer sess-nested"));
-        assert!(plan
-            .headers
-            .iter()
-            .any(|(name, value)| name == "token" && value == "sess-nested"));
-        assert!(plan.url.ends_with("/chat/completions"), "{}", plan.url);
-        // body 原样透传
-        assert_eq!(plan.body, body);
+    /// 有积分概念（双账户：永久 + 每日赠送）
+    fn supports_usage(&self) -> bool {
+        true
     }
 
-    /// 会话形态缺 session 时仍要如实报错。
-    #[test]
-    fn build_request_rejects_session_without_token() {
-        let session = json!({ "auth": { "refreshToken": "rt-only" } });
-        let body = json!({ "model": "MiniMax-M3", "messages": [] });
-        // `ChatRequestPlan` 没有 Debug，用 match 而不是 expect_err
-        // （不为此给共享结构加派生）。
-        let error = match LOOMY_ADAPTER.build_chat_request(&session, &body, &HeaderMap::new()) {
-            Ok(_) => panic!("没有 session 必须报错"),
-            Err(error) => error,
-        };
-        assert_eq!(error.status_code, 401);
-        assert!(error.message.contains("session"), "文案要点明缺什么：{}", error.message);
-    }
-
-    #[test]
-    fn error_classification() {
-        let class = LOOMY_ADAPTER.classify_error(401, &json!({"message": "unauthorized"}));
-        assert!(matches!(class, UpstreamErrorClass::TokenExpired { .. }));
-        let class = LOOMY_ADAPTER.classify_error(200, &json!({"code": "100002", "desc": "缺少 token"}));
-        assert!(matches!(class, UpstreamErrorClass::TokenExpired { .. }));
-        let class = LOOMY_ADAPTER.classify_error(429, &json!({"message": "too many"}));
-        assert!(matches!(class, UpstreamErrorClass::QuotaLimited { .. }));
-        let class = LOOMY_ADAPTER.classify_error(500, &json!({"message": "oops"}));
-        assert!(matches!(class, UpstreamErrorClass::Fatal { status: 500, .. }));
-    }
-
-    #[test]
-    fn reasoning_patch_checks_model_efforts() {
-        // 兜底路径：8 个模型统一 5 档
-        let patch = LOOMY_ADAPTER.reasoning_patch("high", "MiniMax-M3", &json!({}));
-        match patch {
-            ReasoningPatch::Set { field, value } => {
-                assert_eq!(field, "reasoning_effort");
-                assert_eq!(value, json!("high"));
-            }
-            other => panic!("应注入 high：{other:?}"),
-        }
-        // off → none（官方档位之一）
-        let patch = LOOMY_ADAPTER.reasoning_patch("off", "MiniMax-M3", &json!({}));
-        match patch {
-            ReasoningPatch::Set { value, .. } => assert_eq!(value, json!("none")),
-            other => panic!("应注入 none：{other:?}"),
-        }
-        // 不在档位内 → Skip
-        let patch = LOOMY_ADAPTER.reasoning_patch("max", "MiniMax-M3", &json!({}));
-        assert!(matches!(patch, ReasoningPatch::Skip { .. }));
-        // 客户端已指定 → Skip
-        let patch = LOOMY_ADAPTER.reasoning_patch("high", "MiniMax-M3", &json!({"reasoning_effort": "low"}));
-        assert!(matches!(patch, ReasoningPatch::Skip { .. }));
+    /// 查积分：`GET /api/v2/points/records` 的摘要（见 `balance.rs`）。
+    /// 401 由调用方走统一的「刷新后重试」链路 —— 本家刷新必失败，最终如实报重登。
+    fn query_usage<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
+    {
+        Box::pin(async move { balance::query_usage(store, account_id).await })
     }
 }

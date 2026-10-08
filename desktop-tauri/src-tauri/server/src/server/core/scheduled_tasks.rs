@@ -1,15 +1,21 @@
 //! 间隔型定时任务注册表与调度循环。
 //!
 //! ── 两类任务（区别是**谁来执行**，不是可配性）─────────────────
-//!   - `Runner::Backend`：凭证自动维护、定时查询积分、模型目录刷新、软件版本检查。
+//!   - `Runner::Backend`：凭证自动维护、模型目录刷新、软件版本检查。
 //!     后端循环执行，因此有「上次执行 / 下次执行 / 立即执行」这些运行状态。
 //!   - `Runner::Frontend`：日志页 / 请求日志页 / 报表页的自动刷新。定时器天然长在
 //!     页面上（只在页面可见时该走），后端只存开关与间隔，界面自己读。
 //!
 //! ── 本模块只做「何时做」，不做事 ─────────────────────────────
-//! 每条任务的动作在各自模块里（`credential_maintenance` / `usage_query` /
+//! 每条任务的动作在各自模块里（`credential_maintenance` /
 //! `providers::catalog_refresh` / `update::check`），本文件负责把它们按配置的
 //! 开关与间隔串起来 —— 与 `auto_checkin` 同一分工。
+//!
+//! ── 余额查询为什么不在这个清单里 ─────────────────────────────
+//! 它已退役成**每账号各自配置**的自动查询（间隔与「余额不足处理」都在账号
+//! 设置里配），调度与判定在 `core::usage_query` / `core::usage_records`：
+//! 「每账号独立间隔」与这里的「全局一条任务」不是同一个形状，硬塞进
+//! `{enabled, interval}` 会逼着两边都变形（与自动签到不在此清单的理由同理）。
 //!
 //! ── 排期为什么不在这个模块里 ─────────────────────────────────
 //! 「上次尝试 / 上次成功 / 下次执行 / 失败冷却 / 在途占位」全部委托给
@@ -71,12 +77,11 @@ pub struct TaskDef {
 pub const TASK_CREDENTIAL_MAINTENANCE: &str = config::KEY_CREDENTIAL_MAINTENANCE;
 pub const TASK_MODEL_REFRESH: &str = config::KEY_MODEL_REFRESH;
 pub const TASK_UPDATE_CHECK: &str = config::KEY_UPDATE_CHECK;
-pub const TASK_USAGE_QUERY: &str = config::KEY_USAGE_QUERY;
 pub const TASK_LOGS_AUTO_REFRESH: &str = config::KEY_LOGS_AUTO_REFRESH;
 pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
 pub const TASK_REPORT_AUTO_REFRESH: &str = config::KEY_REPORT_AUTO_REFRESH;
 
-pub const TASKS: [TaskDef; 7] = [
+pub const TASKS: [TaskDef; 6] = [
     TaskDef {
         id: TASK_CREDENTIAL_MAINTENANCE,
         label: "凭证自动维护",
@@ -86,16 +91,6 @@ pub const TASKS: [TaskDef; 7] = [
         min: config::INTERVAL_MIN_MINUTES,
         max: config::INTERVAL_MAX_MINUTES,
         default_interval: config::DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES,
-    },
-    TaskDef {
-        id: TASK_USAGE_QUERY,
-        label: "定时查询积分",
-        description: "定期查询已启用账号的余额 / 积分。启动先展示上次结果，到期再查询；失败会保留查询时间与错误，不因重启反复请求上游。",
-        unit: "minutes",
-        runner: Runner::Backend,
-        min: config::INTERVAL_MIN_MINUTES,
-        max: config::INTERVAL_MAX_MINUTES,
-        default_interval: config::DEFAULT_USAGE_QUERY_MINUTES,
     },
     TaskDef {
         id: TASK_MODEL_REFRESH,
@@ -110,7 +105,7 @@ pub const TASKS: [TaskDef; 7] = [
     TaskDef {
         id: TASK_UPDATE_CHECK,
         label: "软件版本检查",
-        description: "定期向 GitHub 查询最新发布版本，默认每 20 分钟一次。检查结果、排期和限流冷却跨重启保留；手动检查也会合并重复请求并遵守冷却。",
+        description: "定期向 GitHub 查询最新发布版本，默认每 20 分钟一次。检查结果、排期和限流冷却跨重启保留；手动检查也会合并重复请求并遵守冷却。开关与间隔在「软件更新」面板的「更新设置」弹窗里配置（定时任务页不再渲染这一条）。",
         unit: "minutes",
         runner: Runner::Backend,
         min: config::INTERVAL_MIN_MINUTES,
@@ -158,7 +153,6 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         TASK_CREDENTIAL_MAINTENANCE => settings.credential_maintenance,
         TASK_MODEL_REFRESH => settings.model_refresh,
         TASK_UPDATE_CHECK => settings.update_check,
-        TASK_USAGE_QUERY => settings.usage_query,
         TASK_LOGS_AUTO_REFRESH => settings.logs_auto_refresh,
         TASK_REQUESTS_AUTO_REFRESH => settings.requests_auto_refresh,
         TASK_REPORT_AUTO_REFRESH => settings.report_auto_refresh,
@@ -287,6 +281,22 @@ pub async fn run_now(store: &AccountStore, update: &UpdateManager, id: &str) -> 
     run_backend(store, update, task, true).await
 }
 
+/// 「部分账号失败」算不算这一轮失败（`RunGuard::finish` 的 `success`）。
+///
+/// ── 为什么不算 ──────────────────────────────────────────────
+/// `success = false` 会按失败次数做指数退避（最长 24 小时，见 `core::task_state`
+/// 的 `RunGuard::finish`）。而后端任务的失败常常是**按账号**的：一个账号的登录态
+/// 被上游作废（refreshToken 废了、接口稳定 401）就足以让每一轮都判失败一次，
+/// 整条任务于是被推到几小时后再跑，其余账号跟着一起变旧。失败本身已经如实进了
+/// 结果与日志，不需要再把整轮一起罚掉。
+///
+/// ── 为什么「一个都没成功」仍算失败 ───────────────────────────
+/// 全失败通常意味着更上游的问题（断网、出口被挡、上游整体故障）：这时保留退避，
+/// 别按原间隔反复打上游。判据因此是「有失败 **且** 一个都没成功」。
+fn round_succeeded(succeeded: usize, failed: usize) -> bool {
+    failed == 0 || succeeded > 0
+}
+
 async fn run_backend(
     store: &AccountStore,
     update: &UpdateManager,
@@ -304,13 +314,15 @@ async fn run_backend(
             summary
         } else { "已完成版本检查".to_string() });
     }
-    // 「模型目录刷新」的手动执行与界面上的「获取模型」是同一件事（都走
-    // `refresh_implemented_forced`），因此同样越过失败冷却；其余任务的手动执行
-    // 保持「只提前排期」—— 那些冷却记的是上游配额桶的恢复时刻（见 ManualBackoff）。
-    let backoff = if task.id == TASK_MODEL_REFRESH {
-        task_state::ManualBackoff::Bypass
-    } else {
-        task_state::ManualBackoff::Respect
+    // 手动执行越不越过失败冷却：按**冷却记的是什么**分两类（见 `ManualBackoff`）。
+    //   · 记「上一轮为什么没成功」的（模型目录刷新、凭证维护）——
+    //     用户按按钮往往正是刚把那个原因修好（换了账号、重新登录、把坏账号删了），
+    //     继续拿旧结论挡着只会让按钮看起来是坏的；
+    //   · 记「上游配额桶什么时候恢复」的（检查更新）—— 提前打一次只会再吃一次
+    //     403 并把恢复时刻重新顶到未来，如实告诉用户还要等多久更有用。
+    let backoff = match task.id {
+        TASK_MODEL_REFRESH | TASK_CREDENTIAL_MAINTENANCE => task_state::ManualBackoff::Bypass,
+        _ => task_state::ManualBackoff::Respect,
     };
     let guard = match task_state::claim(task.id, interval_ms(task), manual, backoff, 1_000)? {
         Claim::Acquired(guard) => guard,
@@ -324,7 +336,7 @@ async fn run_backend(
             if refreshed > 0 || failed > 0 {
                 logging::log_with_level("[Maintenance]", &format!("凭证自动维护：{summary}"), if failed > 0 { "error" } else { "info" });
             }
-            (summary, failed == 0)
+            (summary, round_succeeded(refreshed, failed))
         }
         TASK_MODEL_REFRESH => {
             let results = if manual {
@@ -343,15 +355,6 @@ async fn run_backend(
                 format!("成功 {refreshed} 家，跳过 {skipped} 家，失败 {failed} 家")
             };
             (summary, failed == 0)
-        }
-        TASK_USAGE_QUERY => {
-            match crate::server::core::usage_query::query_all(store, None).await {
-                Ok(report) => {
-                    let (ok, failed) = crate::server::core::usage_query::store_snapshot(report);
-                    (format!("成功 {ok} 个，失败 {failed} 个"), failed == 0)
-                }
-                Err(error) => (format!("查询失败：{}", error.message), false),
-            }
         }
         _ => return Err("未知后端任务".to_string()),
     };

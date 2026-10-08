@@ -1,349 +1,307 @@
-//! Loomy 模型目录：远程拉取（`GET /models`）+ 兜底表。
+//! Loomy 模型目录：`GET {集成网关}/api/v1/models`（OpenAI 格式）+ 持久化缓存。
 //!
-//! ── 过滤判据是 `type === 'chat'` ─────────────────────────────
-//! **不能**看 `input_modalities`：实测 5 个 chat 模型的输入模态含 `image`
-//! （能看图），那是输入多模态，与「是不是生图模型」无关。
-//!
-//! ── 展示名规范化 ────────────────────────────────────────────
-//! 远端原值是三种括号风格混用（`MiniMax M3 （x4.0）` / `Qwen 3.8 Max (x12.0)`
-//! / `GLM 5.3 Flash(x0.8)`），统一经 `credentials::display_name` 规范成
-//! `{name} · x{n}` —— 倍率写进 `name`（不是 description），
-//! 因为客户端的模型切换菜单只渲染 `name`。
+//! ── 上游形态（客户端 `electron/model-service.js` 的 `fetchModelsFromProvider`）──
+//! 标准 OpenAI 形态 `{data:[{id, ...}]}`；鉴权是**双头**：`token: <session>` 与
+//! `Authorization: Bearer <session>`（客户端 `authMode: 'token'` 时两个都发）。
+//! 拉取失败（500/404）时客户端会按 baseURL 用**内置兜底清单** —— 但那条兜底
+//! 只服务用户自配的 `spark-api-open.xf-yun.com`（`getSparkFallbackModels`），
+//! Loomy 官方 imodel 网关没有内置清单（`BUILTIN_FALLBACK_MODELS` 为空表）。
+//! 因此这里如实报失败、保留旧清单，不编造模型名。
 //!
 //! ── 缓存 ────────────────────────────────────────────────────
-//! 进程内：原始条目 + 上次成功时刻；持久化：`catalog_cache` 的
-//! `SCOPE_LOOMY` 一条。失败**保留上一份成功结果**不清空。
+//! 与各家同款：内存缓存 + `providers::catalog_cache` 落盘（进程重启后读回）。
+//! 自动路径 10 分钟 TTL；用户手动「刷新模型清单」时 `force = true` 绕过。
+//!
+//! ── 能力位 ──────────────────────────────────────────────────
+//! 思考 / 工具 / 图片 / 视频位都读上游条目的 `capabilities`（`reasoning` /
+//! `function_calling` / `vision` / `input_modalities`，实测 2026-10 每个条目都
+//! 带这四个键，见 `map_entry`）。旧实现只按模型 id 判思考位（spark-x）、硬编码
+//! 工具位 —— 那会丢掉 GLM-5.3-Flash 等模型的 vision 声明，目录里全部显示成
+//! 不支持图片。
+//!
+//! ── 硬约束 ──────────────────────────────────────────────────
+//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::server::core::providers::catalog_cache;
-use crate::server::logging;
+use crate::server::errors::GatewayError;
 
 use super::client;
-use super::credentials;
-use super::product;
 
-/// 目录状态：**原始条目**（上游形态）+ 上次成功刷新时刻。
-#[derive(Default, Clone)]
+/// 本家在 `catalog_cache` 里的 scope 名
+pub const SCOPE: &str = catalog_cache::SCOPE_LOOMY;
+
+/// 自动路径的缓存 TTL（与客户端自己的轮询周期同档）
+const TTL_MS: i64 = 10 * 60 * 1000;
+
+/// 模型列表路径（相对集成网关）
+pub const MODELS_PATH: &str = "/api/v1/models";
+
+/// 进程内缓存（首次访问时从落盘缓存读回）
 struct CatalogState {
-    raw: Vec<Value>,
+    models: Vec<Value>,
     fetched_at: i64,
 }
 
-fn catalog() -> &'static RwLock<CatalogState> {
-    static SLOT: OnceLock<RwLock<CatalogState>> = OnceLock::new();
-    SLOT.get_or_init(|| RwLock::new(restored_state()))
+static STATE: OnceLock<Mutex<Option<CatalogState>>> = OnceLock::new();
+
+/// 取状态句柄（毒锁按「上一个持有者 panic 过、数据可能半更新」处理：
+/// 本项目的取值是「继续用」，因为这份缓存是可重建的展示数据，不值得让进程挂掉）
+fn state() -> &'static Mutex<Option<CatalogState>> {
+    STATE.get_or_init(|| Mutex::new(None))
 }
 
-fn restored_state() -> CatalogState {
-    match catalog_cache::load(catalog_cache::SCOPE_LOOMY) {
-        Some(cached) => CatalogState { raw: cached.models, fetched_at: cached.fetched_at },
-        None => CatalogState::default(),
-    }
-}
-
-fn read_state() -> CatalogState {
-    match catalog().read() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
-}
-
-/// 本家清单（远程优先，否则兜底表）。
-pub fn list() -> Vec<Value> {
-    let state = read_state();
-    if !state.raw.is_empty() {
-        return normalize_entries(&state.raw);
-    }
-    fallback_models()
-}
-
-/// 最近一次成功刷新时刻（毫秒；0 = 从未成功过）。
-pub fn last_refreshed_at() -> i64 {
-    read_state().fetched_at
-}
-
-/// 当前清单是不是远程拉来的（`true` = 至少成功拉过一次）。
-pub fn remote_refreshed() -> bool {
-    !read_state().raw.is_empty()
-}
-
-/// 兜底模型表 → 聚合层形态（8 条）。
-pub fn fallback_models() -> Vec<Value> {
-    product::FALLBACK_MODELS
-        .iter()
-        .map(|model| {
-            let mut entry = serde_json::Map::new();
-            entry.insert("id".to_string(), Value::String(model.id.to_string()));
-            entry.insert("name".to_string(), Value::String(model.name.to_string()));
-            entry.insert(
-                "maxInputTokens".to_string(),
-                Value::from(model.context_window),
-            );
-            // 兜底表声明思考可用（实测 8 个模型全有档位）
-            entry.insert("supportsReasoning".to_string(), Value::Bool(true));
-            insert_credits(&mut entry, model.name);
-            Value::Object(entry)
-        })
-        .collect()
-}
-
-/// 把展示名末尾的倍率拆出来，**另存到 `credits`**（管理页的倍率列只认它）。
-///
-/// ── 为什么倍率要存两份（真实缺陷）────────────────────────────
-/// 本家的远端把倍率写在 `name` 字符串里（`DeepSeek V4 Flash 0731 · x3.0`），
-/// 没有独立字段 —— 于是 `display_name` 把它规范进 `name` 之后，倍率**只**以
-/// 文本尾巴的形式存在。而管理页的倍率列读的是 `credits`
-/// （见 `providers::catalog::view::manage_view`：`credits` → `usageMultiple`
-/// → 都没有就如实给 null），本家从来没写过这个键，那一列因此恒为空 `—`。
-///
-/// 症状极具迷惑性：名字里明明写着 `· x3.0`，旁边那列却是空的 —— 看起来像
-/// 「上游没给倍率」，实际是**我们自己没把它从名字里取出来**。
-///
-/// 两份都留是有意的：`name` 里的那份是给客户端的模型切换菜单看的
-/// （它只渲染 `name`，见 `display_name` 的说明），`credits` 这份是给管理页的
-/// 倍率列看的。`split_rate` 幂等，两处取的是同一个值，不会漂移。
-fn insert_credits(entry: &mut serde_json::Map<String, Value>, raw_name: &str) {
-    let (_, rate) = credentials::split_rate(raw_name);
-    // 无倍率（如生图模型）不写这个键：`list_item` 会把缺失读成空串、
-    // `manage_view` 读成 null，两处都渲染成 `—`，与「0 倍」区分得开
-    //（与 codearts / qoder 的「非空才写 credits」同一口径）
-    if rate.is_empty() {
-        return;
-    }
-    entry.insert("credits".to_string(), Value::String(rate));
-}
-
-/// 某模型的可用思考档位（远程清单里查；兜底表给统一的 5 档）。
-///
-/// 返回 `None` 表示**该模型不提供档位选择**（此时不注入 —— 发一个
-/// 上游不认的档位比不发更糟）。
-pub fn efforts_of(model: &str) -> Option<Vec<String>> {
-    let state = read_state();
-    if state.raw.is_empty() {
-        // 兜底路径：统一 5 档（实测 8 个模型完全一致）
-        return product::FALLBACK_MODELS
-            .iter()
-            .any(|item| item.id == model)
-            .then(|| product::FALLBACK_EFFORTS.iter().map(|item| item.to_string()).collect());
-    }
-    state
-        .raw
-        .iter()
-        .find(|item| credentials::read_string(item, "id") == model)
-        .and_then(|item| {
-            let efforts = item.get("reasoning_efforts").and_then(Value::as_array)?;
-            let list: Vec<String> = efforts
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-                .collect();
-            (!list.is_empty()).then_some(list)
-        })
-}
-
-/// 是否为可对话的 chat 模型（`type === 'chat'`）。
-fn is_chat_model(entry: &Value) -> bool {
-    let id = credentials::read_string(entry, "id");
-    !id.trim().is_empty() && entry.get("type").and_then(Value::as_str) == Some("chat")
-}
-
-/// 原始条目 → 聚合层形态。
-fn normalize_entries(raw: &[Value]) -> Vec<Value> {
-    let mut models = Vec::new();
-    for item in raw {
-        if !is_chat_model(item) {
-            continue;
+/// 在锁内执行一段取值，并在首次访问时把落盘缓存装回内存
+fn with_state<R>(f: impl FnOnce(&mut Option<CatalogState>) -> R) -> R {
+    let mutex = state();
+    let mut guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        if let Some(cached) = catalog_cache::load(SCOPE) {
+            *guard = Some(CatalogState {
+                models: cached.models,
+                fetched_at: cached.fetched_at,
+            });
         }
-        let id = credentials::read_string(item, "id");
-        let raw_name = credentials::read_string(item, "name");
-        let raw_name = if raw_name.is_empty() { id.clone() } else { raw_name };
-        let mut entry = serde_json::Map::new();
-        entry.insert("id".to_string(), Value::String(id));
-        entry.insert(
-            "name".to_string(),
-            Value::String(credentials::display_name(&raw_name)),
-        );
-        // 倍率另存一份到 `credits`：管理页的倍率列读它，不读 `name` 的尾巴
-        // （理由见 `insert_credits`）。`split_rate` 幂等，所以远端给的是
-        // `（x3.0）` 还是已规范的 ` · x3.0`，取到的都是同一个值。
-        insert_credits(&mut entry, &raw_name);
-        if let Some(window) = credentials::read_number(item, "context_length") {
-            if window > 0.0 {
-                entry.insert("maxInputTokens".to_string(), Value::from(window as i64));
-            }
-        }
-        // 输入模态：`capabilities.input_modalities` 含 image（与参考实现同口径）
-        let supports_image = item
-            .get("capabilities")
-            .and_then(|value| value.get("input_modalities"))
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .any(|text| text.eq_ignore_ascii_case("image"))
-            })
-            .unwrap_or(false);
-        if supports_image {
-            entry.insert("supportsImages".to_string(), Value::Bool(true));
-        }
-        let supports_thinking = item
-            .get("capabilities")
-            .and_then(|value| value.get("reasoning"))
-            .and_then(Value::as_bool)
-            == Some(true);
-        if supports_thinking {
-            entry.insert("supportsReasoning".to_string(), Value::Bool(true));
-        }
-        models.push(Value::Object(entry));
     }
-    models
+    f(&mut guard)
 }
 
-/// 拉取远程目录并落地。返回 `(条数, 失败原因)`；失败**不清空既有清单**。
-pub async fn refresh(token: &str) -> (usize, Option<String>) {
-    if token.trim().is_empty() {
-        return (0, Some("缺少登录态".to_string()));
-    }
-    let reply = match client::get_business(product::MODELS_PATH, &client::business_headers(token), None).await {
-        Ok(reply) => reply,
-        Err(error) => return (0, Some(error.message)),
-    };
-    if !(200..300).contains(&reply.status) {
-        return (0, Some(format!("上游返回 HTTP {}", reply.status)));
-    }
-    let Some(body) = reply.json() else {
-        return (0, Some("响应不是 JSON".to_string()));
-    };
-    // 信封：`{code:"000000", data:[...]}`；`data` 也可能是裸数组
-    let list = if let Some(array) = body.as_array() {
-        array.clone()
+/// 该模型 id 是不是思考模型（客户端只对 spark-x 挂 reasoning 能力位）
+fn is_reasoning_model(id: &str) -> bool {
+    id.eq_ignore_ascii_case("spark-x") || id.to_ascii_lowercase().contains("spark-x")
+}
+
+/// 从上游展示名里拆出**积分倍率**后缀（`(x3.0)` / `(x0.8)` / `（x12）`）。
+///
+/// ── 为什么倍率要从名字里拆（有实测依据，不是猜）────────────────
+/// 上游 `/models` **没有**结构化的倍率字段，它把倍率拼在展示名尾部 ——
+/// 实测（2026-10，真实账号拉下来的 11 条目录）：
+/// `DeepSeek V4 Flash 0731 (x3.0)`、`GLM 5.3 Flash(x0.8)`、`Spark X2.5 (x0.1)`。
+/// 而本网关的「倍率」列读的是 `credits`（`core/models/shape.rs::list_item`），
+/// 不拆的话那一列永远显示 `—`（就是用户报的那个现象）。
+///
+/// ── 括号口径与客户端同源 ────────────────────────────────────
+/// 客户端自己也这么拆（`src/lib/model-metadata.js` 的 `splitModelDisplayName`：
+/// 末尾括号内容作为展示标签，ASCII 与全角括号都认），这里跟随同一口径。与客户端
+/// 唯一的差别：**只把 `x<数字>` 形态的括号算倍率** —— 其余标签（如「限时免费」）
+/// 本网关没有承载字段，原样留在名字里，不静默丢弃信息。
+///
+/// 拆出来的形态用 `x3.0`（前端 `formatCredits` 认 `x\d` 并显示成 `3.0x`），
+/// 与 AutoClaw（`低/中/高`）和 CodeArts（`0.7x`）两家「上游给什么就透什么」
+/// 的口径一致 —— 这里只是把上游已经给的信息换个字段承载，没有换算、没有编造。
+///
+/// 同时把后缀从展示名里去掉（只在这一种形态下）：不去掉的话同一个数会出现两次
+/// （名称子行 + 倍率列）。去掉后名字为空（整名就是倍率）时保留原名，不返回空串。
+fn split_rate_suffix(name: &str) -> (String, Option<String>) {
+    let trimmed = name.trim_end();
+    // 两种括号都认（口径见上）；只有「末尾括号 + 内容非空」才继续
+    let (body, inner) = if let Some(body) = trimmed.strip_suffix(')') {
+        match body.rfind('(') {
+            Some(open) => (&body[..open], body[open + 1..].trim()),
+            None => return (name.to_string(), None),
+        }
+    } else if let Some(body) = trimmed.strip_suffix('）') {
+        match body.rfind('（') {
+            Some(open) => (&body[..open], body[open + '（'.len_utf8()..].trim()),
+            None => return (name.to_string(), None),
+        }
     } else {
-        match credentials::parse_envelope(&body) {
-            Ok(envelope) => envelope.data.as_array().cloned().unwrap_or_default(),
-            Err(failure) => {
-                // 登录失效码单独报，其余按失败透出
-                if failure.code == credentials::AUTH_ERROR_CODE {
-                    return (0, Some("登录态已失效：请重新短信登录".to_string()));
-                }
-                return (0, Some(format!("模型列表查询失败：{}", failure.message)));
-            }
-        }
+        return (name.to_string(), None);
     };
-    let models = normalize_entries(&list);
+    let Some(number) = inner.strip_prefix('x').or_else(|| inner.strip_prefix('X')) else {
+        return (name.to_string(), None);
+    };
+    let number = number.trim();
+    if number.is_empty()
+        || !number.chars().any(|ch| ch.is_ascii_digit())
+        || !number.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+    {
+        return (name.to_string(), None);
+    }
+    let cleaned = body.trim_end();
+    if cleaned.is_empty() {
+        return (name.to_string(), Some(format!("x{number}")));
+    }
+    (cleaned.to_string(), Some(format!("x{number}")))
+}
+
+/// 从上游 `capabilities` 对象里取布尔位（缺失 / 非布尔一律 false）
+fn caps_bool(caps: Option<&serde_json::Map<String, Value>>, key: &str) -> bool {
+    caps.and_then(|caps| caps.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// `capabilities.input_modalities` 数组里有没有指定模态（大小写不敏感）
+fn caps_modal(caps: Option<&serde_json::Map<String, Value>>, modal: &str) -> bool {
+    caps.and_then(|caps| caps.get("input_modalities"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|value| {
+                value.as_str().is_some_and(|text| text.eq_ignore_ascii_case(modal))
+            })
+        })
+}
+
+/// 把一个 OpenAI 目录条目映射成聚合层认的形态
+/// （键名对照 `core/models/shape.rs::list_item`：`id` / `name` /
+/// `maxInputTokens` / `maxOutputTokens` / `supportsImages` / `supportsVideo` /
+/// `supportsReasoning` / `supportsToolCall`）。
+///
+/// 能力位以上游 `capabilities` 为准（实测 2026-10：条目都带
+/// `{reasoning, vision, function_calling, input_modalities, ...}`，见模块头的
+/// 上游形态说明）。`vision` / `input_modalities` 双读判定图片位，防一端缺失时
+/// 静默丢能力 —— 生图模型（Hy image / qwen image）的 `vision:true` 也由此落入
+/// `supportsImages`，与目录展示口径一致。缺失时保守回落：工具调用按 OpenAI
+/// 兼容网关的既有能力给 true（照 `autoclaw::models` 的处置），思考位保留
+/// 按 id 的旧判断兜底。倍率从展示名后缀拆出（见 [`split_rate_suffix`]）。
+fn map_entry(row: &Value) -> Option<Value> {
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let raw_name = row
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(id);
+    let (name, rate) = split_rate_suffix(raw_name);
+    let caps = row.get("capabilities").and_then(Value::as_object);
+    let tool_call = caps_bool(caps, "function_calling") || caps.is_none();
+    let reasoning = caps_bool(caps, "reasoning") || is_reasoning_model(id);
+    let mut item = json!({
+        "id": id,
+        "name": name,
+        "supportsToolCall": tool_call,
+        "supportsReasoning": reasoning,
+    });
+    if caps_bool(caps, "vision") || caps_modal(caps, "image") {
+        if let Some(object) = item.as_object_mut() {
+            object.insert("supportsImages".to_string(), Value::Bool(true));
+        }
+    }
+    if caps_modal(caps, "video") {
+        if let Some(object) = item.as_object_mut() {
+            object.insert("supportsVideo".to_string(), Value::Bool(true));
+        }
+    }
+    if let Some(rate) = rate {
+        if let Some(object) = item.as_object_mut() {
+            object.insert("credits".to_string(), Value::String(rate));
+        }
+    }
+    // 上游给了上下文 / 输出上限就透传。键名取自**客户端自己的规范化器**
+    // （`src/lib/model-metadata.js::normalizeFetchedModelMetadata` 读的就是
+    // `context_length` / `input_token_limit` / `max_input_tokens` /
+    // `max_output_tokens` / `max_completion_tokens` —— 这是上游字段名的一手依据，
+    // 不是我们猜的）。
+    if let Some(object) = item.as_object_mut() {
+        let pick_number = |keys: &[&str]| -> Option<i64> {
+            for key in keys {
+                if let Some(value) = row.get(*key).and_then(Value::as_i64) {
+                    if value > 0 {
+                        return Some(value);
+                    }
+                }
+            }
+            None
+        };
+        if let Some(max_input) = pick_number(&[
+            "context_length",
+            "context_window",
+            "input_token_limit",
+            "max_input_tokens",
+            "maxInputTokens",
+        ]) {
+            object.insert("maxInputTokens".to_string(), Value::from(max_input));
+        }
+        if let Some(max_output) = pick_number(&[
+            "max_output_tokens",
+            "max_completion_tokens",
+            "max_tokens",
+            "maxOutputTokens",
+        ]) {
+            object.insert("maxOutputTokens".to_string(), Value::from(max_output));
+        }
+    }
+    Some(item)
+}
+
+/// 解析 `/models` 响应（OpenAI `{data:[...]}` 或裸数组）
+pub fn parse_models(payload: &Value) -> Vec<Value> {
+    let rows = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| payload.as_array())
+        .cloned()
+        .unwrap_or_default();
+    rows.iter().filter_map(map_entry).collect()
+}
+
+/// 当前模型清单（内存 → 落盘缓存；都没有时为空，由刷新路径填）
+pub fn list() -> Vec<Value> {
+    with_state(|slot| slot.as_ref().map(|state| state.models.clone()).unwrap_or_default())
+}
+
+/// 这份清单是否来自**远程拉取**（`catalog::refresh_meta` 的「来源」列判据）。
+/// Loomy 没有内置兜底清单：有内容就等于远程拉到过。
+pub fn remote_refreshed() -> bool {
+    with_state(|slot| {
+        slot.as_ref()
+            .map(|state| !state.models.is_empty())
+            .unwrap_or(false)
+    })
+}
+
+/// 最近一次成功刷新的时刻（毫秒；没刷过为 0）—— 界面「更新日期」列读它
+pub fn last_refreshed_at() -> i64 {
+    with_state(|slot| slot.as_ref().map(|state| state.fetched_at).unwrap_or(0))
+}
+
+/// 拉一次模型目录并落地（内存 + 持久化缓存）。
+///
+/// `force = false`（自动路径）时 10 分钟 TTL 内早退为 `unchanged()`；
+/// `force = true`（用户手动刷新）真打上游。
+pub async fn refresh(session: &str, force: bool) -> ModelRefreshOutcome {
+    let now = crate::server::logging::now_ms();
+    if !force {
+        let fresh = with_state(|slot| {
+            slot.as_ref()
+                .map(|state| !state.models.is_empty() && now - state.fetched_at < TTL_MS)
+                .unwrap_or(false)
+        });
+        if fresh {
+            return ModelRefreshOutcome::unchanged();
+        }
+    }
+    let payload = match client::token_request("GET", MODELS_PATH, session, None, "模型目录查询").await {
+        Ok(payload) => payload,
+        Err(error) => return ModelRefreshOutcome::failed(error.message),
+    };
+    let models = parse_models(&payload);
     if models.is_empty() {
-        return (0, Some("上游没有返回可用模型".to_string()));
+        return ModelRefreshOutcome::failed("Loomy 模型目录为空或格式不认识（保留现有清单）");
     }
     let count = models.len();
-    let fetched_at = logging::now_ms();
-    match catalog().write() {
-        Ok(mut guard) => {
-            guard.raw = list.clone();
-            guard.fetched_at = fetched_at;
-        }
-        Err(poisoned) => {
-            let mut guard = poisoned.into_inner();
-            guard.raw = list.clone();
-            guard.fetched_at = fetched_at;
-        }
-    }
-    catalog_cache::save(catalog_cache::SCOPE_LOOMY, &list, fetched_at);
-    logging::log("[Models]", &format!("Loomy 模型目录已刷新：{count} 个模型"));
-    (count, None)
+    with_state(|slot| {
+        *slot = Some(CatalogState {
+            models: models.clone(),
+            fetched_at: now,
+        });
+    });
+    catalog_cache::save(SCOPE, &models, now);
+    ModelRefreshOutcome::refreshed(count)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+/// 模型目录刷新结果（用于 `ProviderAdapter::refresh_models` 的返回）
+pub use crate::server::core::providers::adapter::ModelRefreshOutcome;
 
-    #[test]
-    fn chat_filter_ignores_output_modalities() {
-        let raw = vec![
-            json!({"id": "a", "type": "chat", "name": "A", "context_length": 1000}),
-            json!({"id": "b", "type": "image", "name": "B"}),
-            json!({"id": "", "type": "chat"}),
-        ];
-        let models = normalize_entries(&raw);
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0]["id"], "a");
-    }
-
-    #[test]
-    fn normalize_applies_display_name_and_modalities() {
-        let raw = vec![json!({
-            "id": "MiniMax-M3",
-            "type": "chat",
-            "name": "MiniMax M3 （x4.0）",
-            "context_length": 1048576,
-            "capabilities": {"reasoning": true, "input_modalities": ["text", "image"]},
-            "reasoning_efforts": ["none", "low", "medium", "high", "xhigh"]
-        })];
-        let models = normalize_entries(&raw);
-        assert_eq!(models[0]["name"], "MiniMax M3 · x4.0");
-        assert_eq!(models[0]["maxInputTokens"], 1_048_576);
-        assert_eq!(models[0]["supportsImages"], true);
-        assert_eq!(models[0]["supportsReasoning"], true);
-    }
-
-    #[test]
-    fn fallback_has_8_entries() {
-        assert_eq!(fallback_models().len(), 8);
-        assert_eq!(fallback_models()[0]["id"], "deepseek-v4-flash-0731");
-    }
-
-    /// 倍率必须**另存**到 `credits` —— 管理页的倍率列只读它。
-    ///
-    /// ── 这条用例钉的是什么（真实缺陷）────────────────────────────
-    /// 本家的远端把倍率写在 `name` 字符串尾巴里（`DeepSeek V4 Flash 0731 · x3.0`），
-    /// 没有独立字段。管理页的倍率列读的是 `credits`
-    /// （`providers::catalog::view::manage_view`：`credits` → `usageMultiple`
-    /// → 都没有就如实给 null），而本家从来没写过这个键 —— 于是名字里明写着
-    /// `· x3.0`，旁边那列却是空 `—`，看起来像「上游没给倍率」。
-    ///
-    /// 因此这里断言的是**两个出口**都带 `credits`，且值与 `name` 尾巴一致：
-    /// 远端路径（`normalize_entries`）与兜底路径（`fallback_models`）是两份
-    /// 独立的构造代码，只测一边会让另一边继续空着。
-    #[test]
-    fn rate_is_exposed_as_credits_on_both_paths() {
-        // 兜底路径：用户看到的那条（名字与倍率逐字取自 FALLBACK_MODELS[0]）
-        let fallback = fallback_models();
-        let first = fallback
-            .iter()
-            .find(|item| item["id"] == "deepseek-v4-flash-0731")
-            .expect("兜底表第一条");
-        assert_eq!(first["name"], "DeepSeek V4 Flash 0731 · x3.0");
-        assert_eq!(
-            first["credits"], "x3.0",
-            "兜底路径必须把 name 尾巴里的倍率另存到 credits，否则管理页倍率列是空的"
-        );
-
-        // 远端路径：三种括号风格都要拆出来（远端原值不是已规范形态）
-        let raw = vec![
-            json!({"id": "a", "type": "chat", "name": "DeepSeek V4 Flash 0731 （x3.0）"}),
-            json!({"id": "b", "type": "chat", "name": "Qwen 3.8 Max (x12.0)"}),
-            json!({"id": "c", "type": "chat", "name": "GLM 5.3 Flash(x0.8)"}),
-            // 已规范化形态也要认（`split_rate` 幂等）：缓存恢复的条目走这条
-            json!({"id": "d", "type": "chat", "name": "MiniMax M3 · x4.0"}),
-            // 无倍率：不写这个键（界面渲染 `—`，与「0 倍」区分开）
-            json!({"id": "e", "type": "chat", "name": "Spark X2.5"}),
-        ];
-        let models = normalize_entries(&raw);
-        let credits_of = |id: &str| {
-            models
-                .iter()
-                .find(|item| item["id"] == id)
-                .and_then(|item| item.get("credits"))
-                .cloned()
-        };
-        assert_eq!(credits_of("a"), Some(json!("x3.0")), "全角括号");
-        assert_eq!(credits_of("b"), Some(json!("x12.0")), "半角括号");
-        assert_eq!(credits_of("c"), Some(json!("x0.8")), "括号紧贴无空格");
-        assert_eq!(credits_of("d"), Some(json!("x4.0")), "已规范化形态（幂等）");
-        assert_eq!(credits_of("e"), None, "无倍率时不要编一个出来");
-    }
+/// 由 `GatewayError` 起一个「目录不可用」的占位（供目录为空时的适配器兜底）
+pub fn unavailable_error() -> GatewayError {
+    GatewayError::with_status(503, "Loomy 模型目录尚未拉取：请先在模型管理页点「刷新模型清单」")
 }

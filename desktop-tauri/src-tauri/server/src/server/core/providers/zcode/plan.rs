@@ -218,6 +218,20 @@ pub(super) fn build_request(
 
     let mut payload = anthropic_outbound::anthropic_request_from_chat(body, &model)
         .map_err(|message| GatewayError::with_status(400, format!("请求体转换失败：{message}")))?;
+    // ── 思考装配（GLM-5.3 家族）────────────────────────────────
+    // 放在转换之后、官方段装配之前：它要**覆盖**转换层按通用档位表注入的
+    // `thinking`（那张表服务所有上游，而 5.3 家族有官方目录给的三档，见
+    // `super::reasoning` 的模块头），并且把预算加到 `max_tokens` 之上 ——
+    // 少了这一步，思考会把客户端的输出额度吃光，上游回 200 + 空正文
+    // （issue #52 / #54 的根因）。取值从**发送体**读：客户端原始请求里的
+    // `reasoning_effort`，或映射上绑的默认档（适配器的 `reasoning_patch`
+    // 在更早一步注进同一个键）—— 两条来路在这里汇成一个旋钮。
+    super::reasoning::apply_to_anthropic(
+        &mut payload,
+        &model,
+        body.get(super::reasoning::EFFORT_FIELD).and_then(Value::as_str),
+        client_max_tokens(body),
+    );
     let device_mid = text_of("deviceMid");
     // 官方装配是否启用（设置页「系统提示词 → 按提供商 → 网关自带提示词」，
     // 默认开）、以及用户改过的正文（同一处的「编辑正文」，逐段覆盖官方原文）。
@@ -239,13 +253,14 @@ pub(super) fn build_request(
     // ── 人机验证令牌（一次一用，每个请求取一个）──────────────────
     // 取不到就**当场失败**而不是发一个缺头的请求：上游对缺令牌的响应是
     // 400 + 3007（一句英文），用户看到的是「网关报了个英文错」；这里的文案
-    // 才说得清「谁该补令牌、去哪儿补」。
+    // 才说得清「谁该补令牌、去哪儿补」。本错误会原样落进请求日志的错误列，
+    // 轻量模式下窗口被销毁、令牌池无人铸造时，用户正是从那里看到这句指引。
     let Some((captcha_param, captcha_region)) = super::captcha::take() else {
         return Err(GatewayError::with_status(
             503,
             "活动套餐通道需要人机验证令牌，当前令牌池为空：\
-             令牌由桌面端界面自动铸造，请确认应用界面正在运行\
-             （headless 部署无法铸造，请在账号设置里把「使用套餐」切回编码套餐）",
+             令牌由桌面端界面自动铸造，轻量模式下请先打开主窗口补充令牌\
+             （headless 部署无法铸造，可在账号设置里把「使用套餐」切回编码套餐）",
         ));
     };
     let mut headers: Vec<(String, String)> = vec![
@@ -284,6 +299,22 @@ pub(super) fn build_request(
         // （见 `upstream::translate`）
         response: UpstreamResponse::Anthropic,
     })
+}
+
+/// 客户端原始请求里的输出额度（chat 侧两个字段名都认，与
+/// `anthropic_outbound` 的取值链同口径）。
+///
+/// 取的是**客户端给的那个数**，不是转换后 payload 里的——转换层可能已经按
+/// 自己的通用档位表把额度抬过一次，那份额度是它为了让通用思考注入成立而加的，
+/// 不能当客户端的意图再叠加一遍（会越叠越大）。
+fn client_max_tokens(body: &Value) -> Option<i64> {
+    ["max_tokens", "max_completion_tokens"]
+        .iter()
+        .find_map(|key| {
+            body.get(*key)
+                .and_then(Value::as_i64)
+                .filter(|value| *value > 0)
+        })
 }
 
 /// 活动套餐网关的基址（环境变量可覆盖，理由与 `Region::openai_base_url` 同）。

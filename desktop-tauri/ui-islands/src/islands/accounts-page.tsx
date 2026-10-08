@@ -61,10 +61,10 @@ import {
 } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
 import { shared, type AccountRecord, type ColSettingsHandle } from './accounts-shared'
-import { checkinableAccounts, isDesktopAccount, isEnabled, supportsUsage } from './accounts-domain'
-import { ACCOUNT_COLUMNS, bindColumnGrips, columnWidths } from './accounts-columns'
+import { isDesktopAccount, isEnabled, supportsUsage } from './accounts-domain'
+import { ACCOUNT_COLUMNS, bindColumnGrips, columnWidths, tableMinWidth } from './accounts-columns'
 import {
-  allAccounts, checkinAll, clearLimits, clearSelection, ensureProxyPoolOptions,
+  allAccounts, clearLimits, clearSelection, ensureProxyPoolOptions,
   getStore, installAccountsApi, normalizeFilter, openBatchDialog, panelOpen, providerSummaryList,
   queryAllUsage, rowContext, seats, segmentCounts, setAllPicked, setProviderFilter, setSegmentFilter,
   snapshot, startConnectionsPolling, subscribe, togglePick, visibleList,
@@ -308,12 +308,8 @@ function AccountsPage() {
               }}>添加账号</Button>
             <Button id='btn-query-usage' variant='outline'
               disabled={store.usageBusy || !all.some(supportsUsage)}
-              title='查询全部启用账号的余额'
+              title='查询全部账号的余额（含已禁用账号 —— 禁用只表示不参与转发）'
               onClick={() => void queryAllUsage()}>{store.usageBusy ? '查询中…' : '查询余额'}</Button>
-            <Button id='btn-checkin-all' variant='outline'
-              disabled={store.checkinBusy || !checkinableAccounts(all).length}
-              title='为全部可签到的账号串行签到'
-              onClick={() => void checkinAll()}>{store.checkinBusy ? '签到中…' : '全部签到'}</Button>
           </div>
         </div>
 
@@ -357,7 +353,10 @@ function AccountsPage() {
           ) : !visible.length ? (
             <div className='empty'>当前筛选条件下没有账号</div>
           ) : (
-            <table className='acct-table' ref={setTableElement}>
+            <table className='acct-table' ref={setTableElement}
+              style={{ minWidth: `${tableMinWidth(columns.map(column => column.key))}px` }}>
+              {/* 上面那条 min-width 是「弹性列压到只剩 FLEX_MIN_WIDTH、再窄就横滚」的那条线，
+                  由列宽算出（不再由 CSS 写死，见 accounts-columns 的 tableMinWidth） */}
               <ColGroup />
               <TableHead namesHidden={store.namesHidden} allPicked={allPicked} somePicked={somePicked}
                 disabled={!visibleIds.length} onToggleAll={next => setAllPicked(visibleIds, next)} />

@@ -267,10 +267,21 @@ pub async fn checkin_for(
             claim_result(id, name, &display, true, claim)
         }
         "loomy" => {
-            // `POST /points/first-login`（触发每日额度初始化，消耗后不回补）；
-            // 幂等判据是响应体的 `alreadyProcessed`。
+            // Loomy 没有独立的签到接口：「每日赠送积分」由**每日首次登录**
+            // 触发刷新（`POST /api/v1/points/first-login`，见 `loomy::checkin`
+            // 的模块头）。自动签到框架对它就是「每天替账号打一次这个接口」。
             let claim =
-                crate::server::core::providers::loomy::checkin::claim_daily_quota(store, &id)
+                crate::server::core::providers::loomy::checkin::claim_daily_login(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "kuku" => {
+            // KukuAI：「免费领积分」活动的每日任务（每日登录 / 完成一次对话），
+            // 接口幂等（重复领 reward_point=0），见 `kuku::checkin` 的模块头。
+            // 业务会话由实现内部换发 genflowpro STOKEN（`kuku::engine`）保障。
+            let claim =
+                crate::server::core::providers::kuku::checkin::claim_daily_checkin(store, &id)
                     .await
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
@@ -284,36 +295,37 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
-        // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。
+        // 国际版 WorkBuddy：没有每日签到接口，官方奖励认的是「跑完的网页端
+        // agent 会话」—— 走每日活跃打卡（桌面端轻量对话 + 网页通道，见 `web_daily`）。
+        // 拆家后国际版是独立 provider，因此这里按 id 单独分派，不再靠 edition 兜底。
+        "workbuddy-intl" => {
+            // 今天已经打过卡就如实回一条中性结果：网页通道每跑一次都会**新建
+            // 一个 agent 会话**（真花额度），不像国内版签到那样由上游幂等挡掉
+            // —— 这里必须自己挡，否则用户多点两下就白烧几轮会话。
+            if checked_in_today(account) {
+                return claim_result(
+                    id,
+                    name,
+                    &display,
+                    false,
+                    Ok(json!({
+                        "success": false,
+                        "alreadyCompleted": true,
+                        "msg": "今日已完成每日活跃打卡",
+                    })),
+                );
+            }
+            let claim =
+                crate::server::core::providers::workbuddy::web_daily::run_daily_chat(store, account)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        // 兜底只服务默认那家（WorkBuddy 国内版）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
         // 现在落到这里的未知家明确报「未接入」，新增一家时忘了加分支会立刻暴露。
         _ if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID => {
-            // 国际版：没有每日签到接口，官方奖励认的是「跑完的网页端 agent 会话」
-            // —— 走每日活跃打卡（桌面端轻量对话 + 网页通道，见 `web_daily`）
-            if crate::server::core::providers::workbuddy::web_daily::supports_daily_chat(account) {
-                // 今天已经打过卡就如实回一条中性结果：网页通道每跑一次都会**新建
-                // 一个 agent 会话**（真花额度），不像国内版签到那样由上游幂等挡掉
-                // —— 这里必须自己挡，否则用户多点两下就白烧几轮会话。
-                if checked_in_today(account) {
-                    return claim_result(
-                        id,
-                        name,
-                        &display,
-                        false,
-                        Ok(json!({
-                            "success": false,
-                            "alreadyCompleted": true,
-                            "msg": "今日已完成每日活跃打卡",
-                        })),
-                    );
-                }
-                let claim =
-                    crate::server::core::providers::workbuddy::web_daily::run_daily_chat(store, account)
-                        .await
-                        .map_err(|error| error.message);
-                return claim_result(id, name, &display, true, claim);
-            }
             let Some(entry) = store.get_session_by_id(&id) else {
                 return json!({
                     "id": id,
@@ -332,7 +344,13 @@ pub async fn checkin_for(
             "id": id,
             "name": name,
             "claim": Value::Null,
-            "error": format!("{other} 的签到链路尚未接入"),
+            // 展示名走注册表：`other` 是 provider id，直接回显会得到
+            // 「workbuddy-intl 的签到链路尚未接入」这种读不出意思的文案
+            // （拆家后这条分支会先撞上国际版）。
+            "error": format!(
+                "{} 的签到链路尚未接入",
+                crate::server::core::providers::label_of(other)
+            ),
         }),
     }
 }
@@ -432,12 +450,15 @@ fn checkin_completed_today(claim: &Value) -> bool {
 ///
 /// `id` 为 None 时签全部符合条件的账号（定时签到走这条），范围由 `providers`
 /// 决定（配置里勾选的提供商，缺省全选；**指定 id 单签时不受范围限制**）。
-/// **串行**：避免多账号同时打上游触发 11128 风控。
+/// `reason` 只在批量轮次（id=None）进签到历史台账（`checkin_history`，签到中心
+/// 时间线的来源）；单账号签到不进台账，只更新账号的 `checkinAt`。
+/// **串行**：避免多账号同时打上游触发 11-128 风控。
 pub async fn run_checkin(
     store: &AccountStore,
     billing: &BillingService,
     providers: &[String],
     id: Option<&str>,
+    reason: &str,
 ) -> Result<Value, CheckinError> {
     let (targets, skipped) = resolve_checkin_targets(store, providers, id)?;
     let mut results = Vec::with_capacity(targets.len());
@@ -480,6 +501,19 @@ pub async fn run_checkin(
         "[Accounts]",
         &format!("签到完成: {succeeded}/{} 个账号成功领取", results.len()),
     );
+    // 批量轮次进台账（签到中心时间线）。写盘失败只记日志：上游那边积分已经
+    // 领到，台账缺一条不该让这次签到的响应报错。
+    if id.is_none() {
+        crate::server::core::checkin_history::record(
+            &json!({
+                "succeeded": succeeded,
+                "total": results.len(),
+                "skipped": skipped,
+                "results": results,
+            }),
+            reason,
+        );
+    }
     Ok(json!({
         "results": results,
         "succeeded": succeeded,

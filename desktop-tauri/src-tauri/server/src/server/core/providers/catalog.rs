@@ -17,7 +17,8 @@ use crate::server::core::models::{model_id, ModelCatalog};
 use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, PROVIDERS};
 
-use super::autoclaw::region::Region;
+use super::autoclaw::region::Region as AutoclawRegion;
+use super::workbuddy::Region as WorkBuddyRegion;
 
 pub use routing::{
     default_model_catalog, default_model_usable, forwarding_providers, model_blocked_everywhere,
@@ -56,43 +57,37 @@ fn augment_manifest(kind: ProviderKind, models: &mut Vec<Value>) {
     model_rules::apply_capability_overrides(kind_id(kind), models);
 }
 
-/// WorkBuddy 当前队首账号属于哪个版本（没有可用账号时按国内版 —— 与改造前的默认一致）。
-fn workbuddy_primary_edition(store: &AccountStore) -> &'static str {
-    let edition = store
-        .current_entry_for_provider(kind_id(ProviderKind::WorkBuddy))
-        .and_then(|entry| {
-            entry
-                .session
-                .get("edition")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    crate::server::core::models::normalize_edition(edition.as_deref())
-}
-
-/// 一家的清单（**WorkBuddy 出两条**：按版本）。
+/// 一家的清单（**WorkBuddy 的两个地区各出一条**）。
 ///
-/// ── 为什么 WorkBuddy 要按版本拆开（2026-10，参考 workbuddy2api-hub）──
+/// ── 为什么 WorkBuddy 要按地区拆开（2026-10，参考 workbuddy2api-hub）──
 /// 上游两个站点下发**两套清单**（国际版 29 个 / 国内版 55 个），交集里同名模型
 /// 的倍率也不同（`fast-model` 国际版 x0.34、国内版 x0.21；`deep-model` x3.33 /
 /// x1.20）。合成一条会同时踩两个坑：管理页显示「A 版本的名字 + B 版本的倍率」，
 /// 且后刷新的那个版本会把另一个版本的独有模型整个挤掉（国际版的 `gpt-5.x` /
 /// `grok-4.7`，国内版的 `hy3-b` / `minimax-*` 都曾这样消失）。
 ///
-/// 顺序：**当前队首账号的版本在前** —— 对外 `/v1/models` 的同名条目按先到先得
-/// 去重（`public_builtin_items` 的 `claimed`），排前面的那个版本的倍率因此与
-/// 用户实际在用的账号一致。
+/// 拆家后两个地区是**两家独立 provider**（`workbuddy` / `workbuddy-intl`，
+/// 见 `providers::workbuddy::region`），各自持有自己的目录实例与缓存槽，
+/// 因此这里对每个 kind 只出一条清单；对外的同名去重顺序由注册表顺序决定
+/// （国内版在前 = 与存量账号的归属一致）。
+///
+/// 每条仍带 `edition` 标记：管理视图按它分组、前端据此显示版本标签。
+/// 两版都有的模型再补一条 `xxx-cn` / `xxx-intl` 后缀别名（见
+/// [`append_edition_alias`]）—— 那是「同名模型想指定打哪一站」的路由手段，
+/// 与拆家正交（对外名在两家之间本来就会撞，后缀让下游能点名单边）。
 fn manifests_for(store: &AccountStore, kind: ProviderKind) -> Vec<Vec<Value>> {
-    use crate::server::core::models::{EDITION_CN, EDITION_INTL};
-    if kind != ProviderKind::WorkBuddy {
+    let Some(region) = WorkBuddyRegion::from_kind(kind) else {
         return vec![advertised_manifest_for(store, kind)];
-    }
-    let primary = workbuddy_primary_edition(store);
-    let secondary = if primary == EDITION_INTL { EDITION_CN } else { EDITION_INTL };
-    let catalog = workbuddy_catalog();
+    };
+    let edition = region.id();
+    let other = match region {
+        WorkBuddyRegion::Cn => WorkBuddyRegion::Intl,
+        WorkBuddyRegion::Intl => WorkBuddyRegion::Cn,
+    };
     // 两版各自先收窄（别名只给**留下**的模型生成，见下），再互相取 id 集：
     // 别名只补「两版都有的真模型」。
-    let curated_of = |edition: &str| workbuddy_curated(catalog.list_of(edition), edition);
+    let curated_of =
+        |region: WorkBuddyRegion| workbuddy_curated(workbuddy_catalog(region).list(), region.id());
     let ids_of = |models: &[Value]| -> std::collections::HashSet<String> {
         models
             .iter()
@@ -100,27 +95,18 @@ fn manifests_for(store: &AccountStore, kind: ProviderKind) -> Vec<Vec<Value>> {
             .filter(|id| !id.is_empty())
             .collect()
     };
-    let primary_ids = ids_of(&curated_of(primary));
-    let secondary_ids = ids_of(&curated_of(secondary));
-    [primary, secondary]
-        .into_iter()
-        .map(|edition| {
-            let mut models = curated_of(edition);
-            augment_manifest(kind, &mut models);
-            // 每条带 `edition`：管理视图按它分组、前端据此显示版本标签，
-            // 公开视图去重时也靠它说明「这条是哪个版本的读数」。
-            for item in models.iter_mut() {
-                if let Some(object) = item.as_object_mut() {
-                    object.insert("edition".to_string(), Value::String(edition.to_string()));
-                }
-            }
-            // 两版都有的模型补一条**本版本**的后缀别名（各自的倍率/名称都对：
-            // 别名从本版清单的条目克隆，不是从另一版借的）
-            let other_ids = if edition == primary { &secondary_ids } else { &primary_ids };
-            append_edition_alias(&mut models, other_ids, edition);
-            adapter_for(kind).advertise_models(store, models)
-        })
-        .collect()
+    let other_ids = ids_of(&curated_of(other));
+    let mut models = curated_of(region);
+    augment_manifest(kind, &mut models);
+    for item in models.iter_mut() {
+        if let Some(object) = item.as_object_mut() {
+            object.insert("edition".to_string(), Value::String(edition.to_string()));
+        }
+    }
+    // 两版都有的模型补一条**本版本**的后缀别名（各自的倍率/名称都对：
+    // 别名从本版清单的条目克隆，不是从另一版借的）
+    append_edition_alias(&mut models, &other_ids, edition);
+    vec![adapter_for(kind).advertise_models(store, models)]
 }
 
 // ─── WorkBuddy 清单收窄（与 workbuddy2api-hub 的 /v1/models 对齐）──────
@@ -310,8 +296,11 @@ fn workbuddy_curated(models: Vec<Value>, edition: &str) -> Vec<Value> {
 ///
 /// 每个版本只补**自己那一条**，于是对外合并时两条都在、各自的倍率来自各自
 /// 的清单（从另一版借条目会让 `-cn` 显示成国际版的倍率）。
-/// 解析在 `models::split_edition_suffix`（路由与选路共用一处），选路收窄在
-/// `upstream::rotate::restrict_workbuddy_edition`。
+/// 解析在 `models::split_edition_suffix`（路由解析与发送侧共用一处）。
+///
+/// 拆家后两个地区已是两家独立 provider：不带后缀的名字由 `forwarding_providers`
+/// 按各家清单分别命中（两个地区都会进候选链），带后缀的名字只命中对应的那一家
+/// —— 后缀因此从「选路时收窄账号」变成「按名字直接点名单边」，语义更直白。
 ///
 /// ⚠️ 生成的别名带 `editionAliasOf` 标记 —— 管理页的模型列表据此把它排除
 /// （它不是上游模型，不该占一行；见 `catalog::view::manage_view`）。
@@ -357,11 +346,11 @@ fn advertised_manifest_for(store: &AccountStore, kind: ProviderKind) -> Vec<Valu
     adapter_for(kind).advertise_models(store, manifest_for(kind))
 }
 
-fn workbuddy_catalog() -> ModelCatalog {
-    crate::server::core::models::global_catalog()
+fn workbuddy_catalog(region: WorkBuddyRegion) -> ModelCatalog {
+    crate::server::core::models::global_catalog(region)
 }
 
-fn autoclaw_catalog_state(region: Region) -> (bool, i64) {
+fn autoclaw_catalog_state(region: AutoclawRegion) -> (bool, i64) {
     (
         !super::autoclaw::catalog::remote_models(region).is_empty(),
         super::autoclaw::catalog::last_refreshed_at(region),
@@ -373,14 +362,21 @@ fn autoclaw_catalog_state(region: Region) -> (bool, i64) {
 /// 两个消费方：本模块的对外视图（`meta.source` / 管理页的「来源」列）与
 /// **适配器层的手动刷新结果**（`adapter::refresh_implemented_forced` 的
 /// `refreshedAt`，界面「更新日期」列读它）—— 后者必须走这里而不是自己按
-/// kind 拼一遍：十家的取值路径（workbuddy 的全局目录、按地区分格的三家、
+/// kind 拼一遍：十家的取值路径（workbuddy 按地区分格、按地区分格的三家、
 /// Cline 的池）各不相同，抄一份就是一处会漂移的知识。
 pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
     match kind {
-        ProviderKind::WorkBuddy => (
-            workbuddy_catalog().remote_refreshed(),
-            workbuddy_catalog().last_refreshed_at(),
-        ),
+        // WorkBuddy 的两个地区各有自己的目录实例与缓存槽（见
+        // `providers::workbuddy::region` 的模块头）：这一处也是两家分开的
+        // 语义来源之一 —— 界面「更新日期」列因此如实显示各自那次拉取。
+        ProviderKind::WorkBuddy => {
+            let catalog = workbuddy_catalog(WorkBuddyRegion::Cn);
+            (catalog.remote_refreshed(), catalog.last_refreshed_at())
+        }
+        ProviderKind::WorkBuddyIntl => {
+            let catalog = workbuddy_catalog(WorkBuddyRegion::Intl);
+            (catalog.remote_refreshed(), catalog.last_refreshed_at())
+        }
         ProviderKind::Raccoon => (
             super::raccoon::models::remote_refreshed(),
             super::raccoon::models::last_refreshed_at(),
@@ -398,8 +394,8 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             !super::catpaw::catalog::remote_models().is_empty(),
             super::catpaw::catalog::last_refreshed_at(),
         ),
-        ProviderKind::AutoClaw => autoclaw_catalog_state(Region::Cn),
-        ProviderKind::AutoClawIntl => autoclaw_catalog_state(Region::Intl),
+        ProviderKind::AutoClaw => autoclaw_catalog_state(AutoclawRegion::Cn),
+        ProviderKind::AutoClawIntl => autoclaw_catalog_state(AutoclawRegion::Intl),
         ProviderKind::ClineFree | ProviderKind::ClinePass => (
             super::cline::models::remote_refreshed(),
             super::cline::models::last_refreshed_at(),
@@ -426,14 +422,22 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::trae::models::remote_refreshed(),
             super::trae::models::last_refreshed_at(),
         ),
-        // LobsterAI / Loomy：远程目录已接真身（刷过就是远程来源）。
+        // LobsterAI：远程目录已接真身（刷过就是远程来源）。
         ProviderKind::LobsterAi => (
             super::lobsterai::models::remote_refreshed(),
             super::lobsterai::models::last_refreshed_at(),
         ),
+        // Loomy 的清单来自 `GET {集成网关}/api/v1/models`（OpenAI 格式）。
+        // 上游**没有**内置兜底清单，所以「有内容」就等于「远程拉到过」。
         ProviderKind::Loomy => (
             super::loomy::models::remote_refreshed(),
             super::loomy::models::last_refreshed_at(),
+        ),
+        // KukuAI 的清单来自远程目录（`/wenchain/genflowpro/model_list`）；
+        // 静态兜底只是离线保底，「有内容」才算远程来源（与 raccoon 同判据）。
+        ProviderKind::Kuku => (
+            super::kuku::models::remote_refreshed(),
+            super::kuku::models::last_refreshed_at(),
         ),
         // MiniMax：远程目录已接真身（刷过就是远程来源）。
         ProviderKind::Minimax => (
@@ -454,8 +458,8 @@ pub fn provider_available(store: &AccountStore, kind: ProviderKind) -> bool {
 
 /// 管理视图需要完整清单；对外视图在此基础上再应用每条绑定的开关。
 ///
-/// 返回的是 **(provider, 清单)** 列表 —— 同一家可能出现多次：WorkBuddy 按版本
-/// 出两条（见 [`manifests_for`]），下游各自按需处理（对外去重 / 管理页分组）。
+/// 返回的是 **(provider, 清单)** 列表 —— 拆家后每个 kind 只贡献一条
+/// （WorkBuddy 的两个地区已是两家 provider，各自一条；见 [`manifests_for`]）。
 pub fn active_manifests(store: &AccountStore) -> Vec<(ProviderKind, Vec<Value>)> {
     all_kinds()
         .into_iter()
@@ -473,8 +477,9 @@ fn aggregate_source(active: &[(ProviderKind, Vec<Value>)]) -> (&'static str, i64
     let Some((first, _)) = active.first() else {
         return ("none", 0);
     };
-    // 只有一家时（WorkBuddy 可能贡献两条 = 两个版本）仍按这一家的来源算，
-    // 否则单家用户的 `meta.source` 会从 `remote` 变成没头没尾的 `aggregate`
+    // 只有一家时仍按这一家的来源算，否则单家用户的 `meta.source` 会从
+    // `remote` 变成没头没尾的 `aggregate`（WorkBuddy 的两个地区是两家
+    // provider，因此「只加了国内版账号」时这里仍报 remote/builtin 而非 aggregate）
     if active.iter().all(|(kind, _)| kind == first) {
         let (remote, refreshed_at) = refresh_meta(*first);
         return (if remote { "remote" } else { "builtin" }, refreshed_at);

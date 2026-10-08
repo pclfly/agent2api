@@ -34,21 +34,26 @@ import {
   SelectTrigger,
   SelectValue,
   Switch,
+  Tooltip,
+  TooltipArrow,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
   cn,
 } from '@ui'
 import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type UsageEntry } from './accounts-shared'
 import {
-  accountTags, activeLimits, checkedInToday, checkinDoneTitle, claimDoneTitle, claimedToday,
-  displayNameOf, editionSuffix, formatResetText, identifierOf, isDesktopAccount, isEnabled,
-  providerFeatures, providerOf, RESET_UNKNOWN, supportsCheckin, supportsClaim, supportsUsage,
-  supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
+  accountTags, activeLimits, claimDoneTitle, claimedToday,
+  displayNameOf, editionSuffix, expiryMillis, formatResetText, identifierOf, isDesktopAccount, isEnabled,
+  lowBalanceBlockedOf, lowBalanceOf, providerFeatures, providerOf, RESET_UNKNOWN,
+  supportsClaim, supportsUsage, supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
 } from './accounts-domain'
 import { PRIORITY_MAX, PRIORITY_MIN, priorityOf } from './accounts-columns'
 import {
-  PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick, checkinErrorOf,
+  PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick,
   commitPriority, connectionsOf, maskName, moveAccount, openSettingsDialog, poolError,
-  proxyPoolSnapshot, queryUsageOnce, runCheckin, setAccountEnabled, setPanelOpen,
-  startCodeArtsWelfare, startZcodeClaim, toggleNamesHidden, usageEntries, usageFailureOf,
+  proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setPanelOpen,
+  startCodeArtsWelfare, startZcodeClaim, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
 /** 图标（icons.js 的内联 SVG 串）：整站共用一份图标集，这里只做注入 */
 function iconHtml(name: string, size: number): string {
@@ -206,10 +211,16 @@ export function LimitsCell({ account, open }: { account: AccountRecord; open: bo
  * 有效期：按「这家有没有版本概念」选字段（workbuddy 是 expiresAt，其余是
  * tokenExpiresAt），与域层的 tokenExpiryOf 同口径。文案收短成「30 天后」，
  * 完整句留在 title —— 列宽有限。
+ *
+ * 读数经域层 `expiryMillis` **先归一到毫秒**再判：落盘的到期值在秒与毫秒之间漂过
+ * （Trae 的凭据是从 CPA 的 auth 文件与手工粘贴进来的，那里是 10 位秒；别家与上游
+ * 刷新响应都是 13 位毫秒），不归一时 `1791009732` 当毫秒读就是 1970-01-21，账号一进
+ * 面板就红着显示「已过期」。归一规则与理由写在 accounts-domain.ts 那一处，
+ * 后端 `providers::trae::Credential::expires_at_ms` 是同一个口径。
  */
 export function ExpiryCell({ account }: { account: AccountRecord }) {
   const features = providerFeatures(providerOf(account))
-  const expiresAt = Number(features.edition ? account.expiresAt : account[features.expiry]) || 0
+  const expiresAt = expiryMillis(features.edition ? account.expiresAt : account[features.expiry])
   if (!expiresAt) return <span className='muted' title='记录里没有过期时间'>—</span>
   const left = expiresAt - Date.now()
   if (left <= 0) return <Badge variant='destructive' shape='tag' title='凭证已过期，转发时会先刷新'>已过期</Badge>
@@ -409,13 +420,30 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   if (!supportsUsage(account)) {
     return <span className='muted' title='该提供商没有余额查询'>—</span>
   }
-  const entry = usageEntries().get(account.id)
+  // 读入口走 usageEntryOf（不是裸的 usageEntries().get）：它会作废「比账号记录还旧」
+  // 的失败结论，理由与后端快照出口一致
+  const entry = usageEntryOf(account)
   const summary = usageSummary(entry)
+  // 「余额不足已跳过」徽章：与后端选路过滤同一判据（lowBalanceBlockedOf），
+  // 让「为什么这个账号不接请求」在界面上有处可看。禁用档不标 —— 那一档
+  // 状态列的「已禁用」开关就是答案；跳过档账号仍是启用的，不标就看不出。
+  const blocked = lowBalanceBlockedOf(account, entry)
   // 失败 / 未配置那些档不画进度条：读数本身就不是「还剩多少」，
   // 给它配个进度条会把一句错误装饰成一条可信的读数
   const pool = summary.kind === 'ok' || summary.kind === 'warn' ? usagePool(entry) : null
+  const blockedBadge = blocked ? (
+    <Badge variant='warning' shape='tag'
+      title={`余额低于阈值 ${lowBalanceOf(account).threshold}，转发时会跳过该账号（余额回升自动恢复）`}>
+      余额不足 · 已跳过
+    </Badge>
+  ) : null
   if (!pool) {
-    return <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
+    return (
+      <span className='usage-sum-wrap'>
+        <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
+        {blockedBadge}
+      </span>
+    )
   }
   return (
     <span className='usage-pool' title={summary.title}>
@@ -424,6 +452,7 @@ export function UsageCell({ account }: { account: AccountRecord }) {
         {pool.percent !== null ? <Progress value={pool.percent} className='usage-pool-bar' /> : null}
         <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
       </span>
+      {blockedBadge}
     </span>
   )
 }
@@ -433,44 +462,69 @@ export function UsageCell({ account }: { account: AccountRecord }) {
 /**
  * 账号：第一行名称，第二行邮箱（有才渲染），第三行只在异常时出现（代理不可用原因）。
  *
- * 标识（UID / userId）与 Token 尾号**不再上屏**（对「这条账号能不能用」没有信息量，
- * 却把副标题占掉大半），仍留在账号名的悬停提示里。健康说明放这一列而不是「状态」列：
- * 状态列只有几十像素，放不下必须读全的文案；账号列是唯一随列宽变化伸缩的一列。
+ * 主名走 displayNameOf 的纯 nameCustom 分流：显式设置过备注名（打标）的账号
+ * 备注名恒为主名；未打标的账号维持历史口径 —— 邮箱系三家（Qoder / AutoClaw
+ * 国际版 / Accio）邮箱当主名，其余昵称优先。更新前设置的旧备注没有标记，
+ * 到设置里把备注名改一次值（同值提交不打标）即生效。
  *
- * 第二行是**邮箱**（不是「桌面端」标签）：这一列要回答的是「这是谁的号」，而
- * AutoClaw 国际版这类网页登录建出来的账号，名字可能只是上游昵称，邮箱才认得出是谁。
- * 名字本身就是邮箱时不重复渲染。Qoder / AutoClaw 国际版反过来：邮箱当**主名**
- * （features.emailAsName），昵称不再占一行（要看就悬停）。
+ * 悬停气泡就是这一列的「详细信息」面板：**一行一条**，组件库 Tooltip 即现
+ * （原生 title 由浏览器控制出现时机与断行，两样都不合用），带指向箭头 ——
+ * 邮箱、标识、备注名（未生效时气泡可查）、上游昵称、更新时间、来源。
+ * 标识（UID / userId）与 Token 尾号不上屏也不进气泡：对「这条账号能不能用」
+ * 没有信息量（Token 尾号曾试过放在气泡里，用户实测反馈去掉）。
+ * 隐藏账号名开关打开时邮箱 / 昵称在气泡里同样打码 ——
+ * 不给「悬停一下就绕过打码」的口子。
  */
 export function AccountCell({ account, namesHidden }: { account: AccountRecord; namesHidden: boolean }) {
   const ident = identifierOf(account)
   const features = providerFeatures(providerOf(account))
   const name = displayNameOf(account) || '未命名账号'
   const email = String(account.email || '').trim()
-  const emailAsName = features.emailAsName && email ? email : ''
-  const title = [
+  const nickname = String(account.nickname || '').trim()
+  // 记录里原样的备注名（未经 displayNameOf 的兜底链）：未设备注时它建号时就有种子值，
+  // 主名被邮箱 / 昵称占着，这里让它在气泡里可查
+  const rawName = String(account.name || '').trim()
+  const mask = (value: string): string => (namesHidden ? maskName(value) : value)
+  const titleLines = [
+    email && email !== name ? `邮箱 ${mask(email)}` : '',
     ident ? `${features.identifier} ${ident}` : '',
-    // 邮箱顶掉了名字的位置，名字（昵称 / 备注名）改从这里看；隐藏账号名开关打开时
-    // 连这里也不给 —— 否则悬停一下就能绕过打码，那个开关就白开了
-    emailAsName && name !== email && !namesHidden ? `账号名 ${name}` : '',
+    !account.nameCustom && rawName && rawName !== email && rawName !== nickname
+      ? `备注名 ${mask(rawName)}`
+      : '',
+    nickname && nickname !== name && nickname !== email ? `昵称 ${mask(nickname)}` : '',
     isDesktopAccount(account) ? '桌面端实时登录态（凭证每次从客户端登录态文件读取）' : '',
-    account.tokenTail ? `Token 尾号 ${account.tokenTail}` : '',
     account.updatedAt ? `更新于 ${formatTime(account.updatedAt)}` : '',
     account.source ? `来源 ${account.source === 'imported' ? '旧数据导入' : '手动添加'}` : '',
-  ].filter(Boolean).join('；')
+  ].filter(Boolean)
 
-  const showEmail = !emailAsName && email && email !== name
-  const primary = emailAsName || name
-  const shown = namesHidden ? maskName(primary) : primary
+  const showEmail = email && email !== name
   const proxyError = account.proxy?.error
+  // 原生 title 的出现时机由浏览器/系统定（悬停约一秒才出，改不了），换成组件库
+  // Tooltip：Provider delay=0 悬停即现；Portal 渲染不被表格滚动容器裁剪；
+  // 内容一行一个 div（用户要的「一行一个信息」）。
+  const nameNode = titleLines.length ? (
+    <TooltipProvider delay={0}>
+      <Tooltip>
+        <TooltipTrigger render={<div className='acct-name' />}>
+          <span className='name'>{mask(name)}</span>
+        </TooltipTrigger>
+        <TooltipContent>
+          <TooltipArrow />
+          {titleLines.map((line, index) => <div key={index}>{line}</div>)}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  ) : (
+    <div className='acct-name'>
+      <span className='name'>{mask(name)}</span>
+    </div>
+  )
   return (
     <>
-      <div className='acct-name' title={title || undefined}>
-        <span className='name'>{shown}</span>
-      </div>
+      {nameNode}
       {showEmail ? (
         <div className='acct-sub'>
-          <span className='acct-email' title='账号邮箱'>{namesHidden ? maskName(email) : email}</span>
+          <span className='acct-email' title='账号邮箱'>{mask(email)}</span>
         </div>
       ) : null}
       {proxyError ? (
@@ -586,28 +640,23 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
 /* ─── 操作列 ────────────────────────────────── */
 
 /**
- * 操作：签到 / 领套餐 / 领福利 / 余额 / 设置 / ⋯，顺序固定。
+ * 操作：领套餐 / 领福利 / 余额 / 设置 / ⋯，顺序固定。
  *
- * 顺序按「点的频次」排，签到排头：它是这张表里唯一**每天都会做一次**的动作，
- * 排在第一位让手指有固定的落点 —— 按钮的显隐会随账号状态变，但**顺序不跟着变**。
+ * 顺序按「点的频次」排，按钮的显隐会随账号状态变，但**顺序不跟着变**。
  * 「设为首选」不在这里：它在 ⋯ 菜单的第二项（行上留一颗按钮去重复隔壁优先级列的
  * 信息，代价是操作列多留 50px，而那 50px 全是从账号列挤出来的）。
  *
- * 签到今天已签过时显示为**「已签到」并置灰**（这天再点也只能拿到上游「今天已签到」）。
- * `disabled` 是真的禁用属性：这才同时挡住点击与键盘操作，也让读屏念出「不可用」。
- * **禁用账号也渲染签到按钮**：签到与转发是两件事，后端单账号签到路径同样不看 enabled。
+ * （签到曾是这排的第一颗按钮，已随签到功能整体迁到「签到中心」——
+ * checkin-page.tsx 的每日签到卡承接了它的职责，含单账号签到与重签。）
  */
 export function ActionsCell({ account, atFront }: { account: AccountRecord; atFront: boolean }) {
   const [claimBusy, setClaimBusy] = React.useState(false)
   const [welfareBusy, setWelfareBusy] = React.useState(false)
   const [usageBusy, setUsageBusy] = React.useState(false)
-  const checkedIn = checkedInToday(account)
-  const canCheckin = supportsCheckin(account)
   const canUsage = supportsUsage(account)
   const canClaim = supportsClaim(account)
   const canWelfare = supportsWelfare(account)
   const welfareTaken = welfareStateOf(account)
-  const checkinFailed = checkinErrorOf(account.id)
 
   async function claim(): Promise<void> {
     // 一次领取要拖一次滑块，重复点击会开出第二个验证码流程（共用的求解器一次只允许
@@ -632,19 +681,6 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
 
   return (
     <div className='acct-actions'>
-      {canCheckin ? (
-        checkedIn ? (
-          <Button variant='outline' size='xs' disabled title={checkinDoneTitle(account)}>已签到</Button>
-        ) : (
-          // 上一次失败的原因挂在这颗按钮的 title 上（toast 几秒就没了，
-          // 而「为什么没签上」要能复看）—— 签到没有明细面板，见 accounts-data.ts
-          <Button variant='outline' size='xs'
-            title={checkinFailed ? `上次签到失败：${checkinFailed}（点此重试）` : '为该账号签到'}
-            onClick={() => void runCheckin(account.id)}>
-            签到
-          </Button>
-        )
-      ) : null}
       {canClaim ? (
         // 按钮**不因「今天领过」置灰**：同一个账号可能同时挂着几份可领套餐
         // （活动大额包 + 每日包），而上游的「已领取过」是按套餐判的 —— 领了 A
@@ -753,7 +789,7 @@ export function MoreMenu({ account, atFront }: { account: AccountRecord; atFront
   )
 }
 
-/* ─── 展开的明细行（限流 / 签到）───────────────── */
+/* ─── 展开的明细行（限流）──────────────────── */
 
 /**
  * 限流明细面板：这个账号**当前限流中的模型**逐行列出 —— 模型名、恢复时间、上游给的

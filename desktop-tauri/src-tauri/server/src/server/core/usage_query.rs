@@ -1,14 +1,38 @@
-//! 查询结果和每个账号的请求排期持久化，首屏读取快照不会触发上游请求。
+//! 余额 / 积分查询的编排层：目标集合解析、跨账号并发、结果落记录表，以及
+//! 「每账号各自到期」的心跳调度（全局「定时查询积分」任务已退役）。
+//!
+//! ── 查询的三条入口共用同一份编排 ─────────────────────────────
+//!   - 手动批量（工具栏「查询余额」→ `query_all(store, None)`）；
+//!   - 手动单查（账号行的「余额」按钮 → `query_all(store, Some(id))`）；
+//!   - 自动查询（`spawn_sweeper` 的心跳循环，每轮只查「配置了自动查询且到期」
+//!     的账号）。
+//! 三条路径查询完都**写记录表**（`core::usage_records`）：手动查询因此天然
+//! 顺延该账号的下一轮自动排期（到期 = 上次尝试 + 间隔，排期没有独立状态），
+//! 余额不足的跳过 / 禁用判定也拿到的都是最新读数。
+//!
+//! ── 每账号到期判定（没有独立排期状态）────────────────────────
+//! 到期 = `记录.last_attempt_at + 账号配置的间隔 <= now`，是「记录 + 配置」的
+//! 纯函数：重启不重置节奏（记录在库里）、手动查询天然顺延（写记录即推进
+//! last_attempt）、账号删除即失效（记录被孤儿清理扫掉）。失败**不退避**：
+//! 失败行照常写记录（上次尝试时间被推进），下一轮仍按配置间隔来 —— 与
+//! OmniProxy 的调度同口径。
+//!
+//! ── 余额不足的两档处理（与 OmniProxy 同构）───────────────────
+//!   - skip（软跳过）：不改任何状态，转发选路按 `usage_records::balance_facts`
+//!     的内存事实实时剔除（见 `upstream::rotate`），余额回升自动恢复参与；
+//!   - disable（硬禁用）：查询成功落记录后由 `enforce_low_balance_disable`
+//!     判定，低于阈值就把账号 `enabled` 置 false —— 不自动恢复，需手动启用；
+//!     自动查询**继续**跑（禁用只表示不参与转发，余额保持新鲜供用户判断）。
+//! 判定口径与余额列同一数字（`usage_records::extract_remaining`）。
 
-use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::server::config;
-use crate::server::core::task_state;
-
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::adapter::adapter_for;
+use crate::server::core::usage_records;
+
 use crate::server::logging;
 
 /// 余额查询失败的原因：区分「没有凭证」（Node 的早退分支，少 name 键）与
@@ -31,17 +55,26 @@ pub struct TargetError {
     pub status_code: u16,
 }
 
-/// 批量操作的目标集合：**全部可用账号中被启用的那些**，外加被跳过的数量。
+/// 批量操作的目标集合：**全部可用账号**（`available: false` 的除外），外加
+/// 被跳过的数量。
 ///
 /// `provider`：`Some(id)` 只取该家；`None` 跨四家取（**余额查询**用它 ——
 /// 四家的余额接口各不相同、由各自适配器负责）。显式指定 id 时**不做过滤**
 /// （与「显式指定就执行」的既有语义一致）。
 ///
+/// ── 为什么不再按 `enabled` 过滤 ─────────────────────────────
+/// 禁用只表示「不参与转发」，与「这个账号还剩多少」无关 —— 与单查路径
+/// （`?id=`）的既有口径一致。按启用状态把批量 / 定时这一轮挡掉，界面上那些
+/// 行就永远是「未查询」，用户只能逐个手点「余额」按钮才看得到读数：定时查询
+/// 等于白跑（真实反馈：账号大多处于禁用状态时，余额列看起来像从没查过）。
+///
 /// 从 `api::accounts` 下沉（原 `resolve_batch_targets`）：它是纯粹的数据判定，
 /// 不含任何 HTTP 语义，而「定时查询积分」必须与手动查询用**同一份口径**
 /// —— 两条路径各写一份，「跳过了几个账号」这种算法迟早会漂。
 ///
-/// 返回 `(targets, skipped)`：`skipped` 是「可用账号里被禁用掉的数量」。
+/// 返回 `(targets, skipped)`：`skipped` 是「范围内**不可用**
+/// （`available: false`）的数量」—— 那些账号连凭证都不完整，查询只会稳定
+/// 失败，所以不进目标集合（与「已知必然失败就别发请求」同一取舍）。
 pub fn resolve_batch_targets(
     store: &AccountStore,
     provider: Option<&str>,
@@ -68,9 +101,6 @@ pub fn resolve_batch_targets(
     let is_available = |account: &Value| {
         account.get("available").and_then(Value::as_bool).unwrap_or(true)
     };
-    let is_enabled = |account: &Value| {
-        account.get("enabled").and_then(Value::as_bool).unwrap_or(true)
-    };
     if let Some(id) = id.filter(|value| !value.is_empty()) {
         let found: Vec<Value> = accounts
             .iter()
@@ -82,14 +112,16 @@ pub fn resolve_batch_targets(
         }
         return Ok((found, 0));
     }
-    let available: Vec<Value> = accounts
-        .into_iter()
-        .filter(in_scope)
-        .filter(is_available)
-        .collect();
-    let skipped = available.len();
-    let targets: Vec<Value> = available.into_iter().filter(is_enabled).collect();
-    let skipped = skipped - targets.len();
+    // 目标集合 = 范围内全部**可用**账号（不看 enabled，见函数头）；
+    // skipped 记的是范围内不可用的数量，供界面说清「为什么少了几行」
+    let (mut targets, mut skipped) = (Vec::new(), 0usize);
+    for account in accounts.into_iter().filter(in_scope) {
+        if is_available(&account) {
+            targets.push(account);
+        } else {
+            skipped += 1;
+        }
+    }
     Ok((targets, skipped))
 }
 
@@ -135,6 +167,10 @@ async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
 /// 的 401 做刷新重试会稳定失败，把一条「凭证过期」变成两条错误（刷新失败的信息
 /// 盖住真正原因，用户反而看不出该做什么）。
 ///
+/// 有刷新能力的家若刷新本身也失败，**两句都报**（原始 401 的原因 + 刷新失败的
+/// 上游说明 + 「重新登录」这条出路），不再让刷新那句盖掉原始原因 —— 只给
+/// `authorization_verify_error` 这种上游术语，用户看不出该做什么。
+///
 /// workbuddy 也走适配器：它的 `query_usage` 转调既有计费服务（结果形状不变）。
 async fn query_usage_inner(
     store: &AccountStore,
@@ -158,7 +194,18 @@ async fn query_usage_inner(
                 return Err(UsageFailure::Request(error.message, error.code));
             }
             if let Err(refresh_error) = adapter.refresh_access_token(store, id).await {
-                return Err(UsageFailure::Request(refresh_error.message, None));
+                // 刷新失败时**原始错误不能丢**：401 的两种含义（token 临期 /
+                // 登录态已被上游作废）在界面上是两件不同的事，只留刷新接口那句
+                // 上游术语（小浣熊是 `authorization_verify_error`）用户既看不懂、
+                // 也不知道该做什么。两句都给出，并明确「重新登录」这条出路
+                // ——这里能走到刷新，说明这家有续期能力，凭证失效的解法就是换一份。
+                return Err(UsageFailure::Request(
+                    format!(
+                        "{}；自动续期也失败：{}（登录态可能已被上游作废，请重新登录或重新导入该账号的凭证）",
+                        error.message, refresh_error.message
+                    ),
+                    error.code,
+                ));
             }
             adapter
                 .query_usage(store, id)
@@ -187,9 +234,12 @@ fn supports_usage(account: &Value) -> bool {
 /// 逐账号并发查询余额 / 积分汇总
 /// （`{ results: [{id,name,usage,error,code?}], skipped }`）。
 ///
-/// 目标集合是**全部启用账号**（`resolve_batch_targets(provider = None)`），逐账号
-/// 按 `provider` 分流到 `ProviderAdapter::query_usage`。改造前这条路径只查
-/// workbuddy —— 三家账号被静默跳过，前端连按钮都不给。
+/// 目标集合是**全部可用账号**（`resolve_batch_targets(provider = None)`，
+/// 不看启用状态，见那里的说明），逐账号按 `provider` 分流到
+/// `ProviderAdapter::query_usage`。手动批量与手动单查走这里，自动查询的
+/// 心跳循环复用同一套单账号编排（`query_usage_for`）—— 三条入口的结果
+/// 都**落记录表**（见模块头），余额不足的跳过 / 禁用判定因此拿到的一直是
+/// 最新读数，手动查询也天然顺延该账号的下一轮自动排期。
 ///
 /// **并发**是关键：Node 版用 `Promise.all`，20 个账号串行会让前端转圈 20 次
 /// 往返。这里用 `join_all` 在同一个任务里并发轮询（每个 future 都是网络等待，
@@ -197,106 +247,230 @@ fn supports_usage(account: &Value) -> bool {
 /// **超时由各适配器自己设**（15~20 秒）；这里不叠加第二层超时 —— 那会让
 /// 「上游慢」与「网关掐断」在日志里无法区分。
 ///
-/// ── `id`：显式指定时**不看启用状态** ────────────────────────
-/// 批量路径只查启用账号是对的（禁用就是「别用它」，定时那一轮不该为它们发请求），
-/// 但**用户手点某一行账号的「积分」按钮**是另一个语义：那是在问「这个账号现在
-/// 还剩多少」。账号被禁用只说明它不参与转发，与其余额能不能查没有关系 ——
-/// 按启用状态把这次查询挡掉，界面只会得到一句「未返回余额数据」，用户看不出
-/// 是「禁用了」还是「上游挂了」。所以指定 id 时按 `resolve_batch_targets` 的
-/// 既有分支走（那条分支本就不做启用过滤），也不过滤 `supports_usage`：
+/// ── `id`：显式指定时只查这一个 ──────────────────────────────
+/// **用户手点某一行账号的「积分」按钮**问的是「这个账号现在还剩多少」。
+/// 账号被禁用只说明它不参与转发，与其余额能不能查没有关系 —— 按启用状态把
+/// 这次查询挡掉，界面只会得到一句「未返回余额数据」，用户看不出是「禁用了」
+/// 还是「上游挂了」。所以指定 id 时按 `resolve_batch_targets` 的单查分支走
+/// （那条分支只认 id，不做范围与可用性过滤），也不过滤 `supports_usage`：
 /// 能力过滤是给批量路径避免一整片 501 的，单查应当如实报「这家不支持」。
+/// 批量路径现在同样不看启用状态（见 `resolve_batch_targets`），两条路径的
+/// 唯一差别就是「查一个」还是「查全部可用」。
 ///
 /// 未知 id 由 `resolve_batch_targets` 报 404「账号不存在」。
 pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, TargetError> {
     let single = id.filter(|value| !value.is_empty());
     // `provider = None`：跨四家取目标（签到那条仍按 provider 过滤）
     let (targets, skipped) = resolve_batch_targets(store, None, single)?;
-    // 用户手动批量查询也是一次真实的上游轮询：把定时那轮的排期顺延一个间隔，
-    // 免得「刚点完查询、到点或重启后又立刻全量再查一遍」（单账号查询不动它 ——
-    // 那是针对某一行的问题，不代表整批刚查过）。
-    if single.is_none() {
-        note_external_run();
-    }
-    let futures: Vec<_> = targets
+    let queried: Vec<&Value> = targets
         .iter()
         .filter(|account| single.is_some() || supports_usage(account))
+        .collect();
+    let futures: Vec<_> = queried
+        .iter()
         .map(|account| query_usage_for(store, account))
         .collect();
     let results = futures::future::join_all(futures).await;
+    // 每行结论落记录表 + 跑「余额不足自动禁用」钩子：手动与自动两条路径在
+    // 这里汇合（见模块头）。账号对象与结果行按构造顺序一一对齐
+    // （`queried` 与 `results` 同源同序），配置就在手上，不必回读账号列表。
+    for (account, row) in queried.iter().zip(results.iter()) {
+        write_row_record(row);
+        enforce_low_balance_disable(store, account, row);
+    }
     Ok(json!({ "results": results, "skipped": skipped }))
 }
 
-// ─── 定时查询的结果快照 ──────────────────────────────────────
+// ─── 记录表写入与「余额不足自动禁用」钩子 ────────────────────
 
-/// 快照的持久化键（`kv` 的保留键，见 `task_state`）。
-const SNAPSHOT_KEY: &str = "usageQuerySnapshot";
-
-/// 进程内副本：快照是 20 秒一次的前端轮询读点，不必每次都读库。
-/// 未命中时从库里读回（重启后界面仍能看到上次结果与它的查询时刻）。
-static SNAPSHOT: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
-
-fn snapshot_slot() -> &'static Mutex<Option<Value>> {
-    SNAPSHOT.get_or_init(|| Mutex::new(None))
+/// 一行查询结果 → 记录表（`core::usage_records`）。读不出 id 的行看不懂，跳过。
+fn write_row_record(row: &Value) {
+    let Some(id) = row
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let outcome = usage_records::UsageOutcome {
+        usage: row.get("usage").filter(|usage| !usage.is_null()).cloned(),
+        error: row.get("error").and_then(Value::as_str).map(str::to_string),
+        code: row.get("code").and_then(Value::as_str).map(str::to_string),
+    };
+    usage_records::write_result(id, &outcome);
 }
 
-/// 手动那一轮把定时排期顺延一个间隔（口径与「立即执行」一致）。
-fn note_external_run() {
-    let interval = config::scheduled_settings().usage_query.interval * 60_000;
-    if let Err(error) = task_state::note_external_run("usageQuery", interval) {
-        logging::verbose("[Usage]", &format!("余额查询排期顺延失败：{error}"));
+/// 「余额不足自动禁用」钩子：查询**成功**落记录后判定（失败行不动 —— 读数
+/// 还是上次成功的旧值，拿它执行禁用是把旧结论又跑一遍，等下一次成功再说）。
+///
+/// 命中条件（三条全要）：
+///   1. 账号配置了 `lowBalance.mode == "disable"`（`off` / `skip` 两档不归它管）；
+///   2. 本次读数判得出数字且**严格小于**阈值（等于仍可用，与选路跳过同口径）；
+///   3. 账号当前是启用状态（幂等：已禁用的账号不再执行、不再重复打日志）。
+///
+/// 禁用走 `update_account` 既有写路径（与手动禁用同一入口，「已禁用」的变更
+/// 日志照常出现），再补一条说明原因的日志 —— 「为什么被禁」必须可复看。
+/// **不自动恢复**：余额回升后需手动启用；自动查询继续跑（禁用只表示不参与
+/// 转发），余额列保持新鲜，用户看着读数决定何时恢复。
+fn enforce_low_balance_disable(store: &AccountStore, account: &Value, row: &Value) {
+    if matches!(account.get("enabled"), Some(Value::Bool(false))) {
+        return;
+    }
+    let Some(id) = account.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(threshold) = usage_records::low_balance_disable_threshold(account) else {
+        return;
+    };
+    let Some(usage) = row.get("usage").filter(|usage| !usage.is_null()) else {
+        return;
+    };
+    let (remaining, _unlimited) = usage_records::extract_remaining(usage);
+    let Some(remaining) = remaining else { return };
+    if remaining >= threshold {
+        return;
+    }
+    let display = account
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(id);
+    match store.update_account(id, &json!({ "enabled": false })) {
+        Ok(_) => logging::log_with_level(
+            "[Usage]",
+            &format!(
+                "账号「{display}」余额 {remaining} 低于阈值 {threshold}，已自动禁用（余额回升后请手动启用，自动查询继续）"
+            ),
+            "warn",
+        ),
+        Err(error) => logging::verbose(
+            "[Usage]",
+            &format!("账号 {id} 余额不足自动禁用失败：{}", error.message),
+        ),
     }
 }
 
-/// 存下定时那一轮的查询结果，返回 `(成功数, 失败数)`。
-///
-/// **失败的行照样进快照**：定时查询的价值就在于「不点按钮也知道现在是好是坏」，
-/// 把失败悄悄丢掉会让界面永远停在上一轮的旧余额上（那是比显示失败更糟的误导）。
-///
-/// 成功 / 失败的判据是 `usage` 键是否为 null —— 与前端 `cacheEntryOf` 同源
-/// （它也是「有 usage 就是结果，否则是失败行」）。
-///
-/// 快照落盘（`usageQuerySnapshot`）：重启后界面先展示上次结果与查询时刻，
-/// 而不是一片空白 —— 它同时是「重启后不必马上再查一遍」的另一半依据。
-pub fn store_snapshot(report: Value) -> (usize, usize) {
-    let results = report
-        .get("results")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let ok = results
-        .iter()
-        .filter(|row| row.get("usage").is_some_and(|usage| !usage.is_null()))
-        .count();
-    let failed = results.len().saturating_sub(ok);
-    let snapshot = json!({
-        "at": logging::now_ms(),
-        "results": results,
-        "skipped": report.get("skipped").cloned().unwrap_or(Value::from(0)),
+// ─── 每账号自动查询的心跳调度 ────────────────────────────────
+
+/// 心跳判定间隔：10 秒（与 `scheduled_tasks` 的 tick 同一量级）。
+/// 账号间隔下限是 30 秒，这个粒度意味着「到点后最多晚 10 秒查询」——
+/// 用户感知不到，空转代价只是每 10 秒一次读库（到期判定全部在内存与
+/// 记录表的小查询里）。
+pub const SWEEP_TICK_MS: u64 = 10_000;
+
+/// 起动每账号自动查询的心跳循环（`ServerState::bootstrap` 调一次，进程内
+/// 只有这一个循环）。循环体：扫到期账号 → 占位 → 并发查询 → 落记录 → 钩子。
+pub fn spawn_sweeper(store: AccountStore) {
+    crate::spawn_task(async move {
+        loop {
+            sweep_due(&store).await;
+            tokio::time::sleep(Duration::from_millis(SWEEP_TICK_MS)).await;
+        }
     });
-    // 锁中毒时沿用「不写内存」而不是 panic：少一次快照更新远比整个应用退出轻
-    if let Ok(mut slot) = snapshot_slot().lock() {
-        *slot = Some(snapshot.clone());
-    }
-    if let Err(error) = task_state::store_value(SNAPSHOT_KEY, snapshot) {
-        logging::verbose("[Usage]", &format!("余额快照保存失败（下次启动看不到本次结果）：{error}"));
-    }
-    (ok, failed)
 }
 
-/// 最近一次定时查询的快照。从未查过时给 `{at: 0, results: [], skipped: 0}` ——
-/// 界面据此显示「还没有定时查询结果」，而不是把空数组当成「一个账号都没有」。
-pub fn snapshot() -> Value {
-    if let Ok(slot) = snapshot_slot().lock() {
-        if let Some(value) = slot.as_ref() {
-            return value.clone();
+/// 一轮清扫：查一遍「配置了自动查询且到期」的账号。
+///
+/// 到期判定（`usage_records::query_interval_of` + 记录的 `last_attempt_at`）
+/// 是「记录 + 配置」的纯函数，见模块头 —— 这里没有任何内存排期可丢。
+/// 批量查询排除 `supports_usage == false` 的家（避免一整片 501，与手动批量
+/// 同口径）；没凭证的账号**不排除**：那是本地就能给出的失败结论，写进记录
+/// 让界面如实显示「没有可用凭证」，与手动批量同一行为。
+async fn sweep_due(store: &AccountStore) {
+    usage_records::prune_orphans();
+    let now = logging::now_ms();
+    let due: Vec<(Value, i64)> = match resolve_batch_targets(store, None, None) {
+        Ok((targets, _skipped)) => targets,
+        Err(_) => return, // 目标集合解析失败（库不可用等）：这一轮什么都不做
+    }
+    .into_iter()
+    .filter(supports_usage)
+    .filter_map(|account| {
+        let interval = usage_records::query_interval_of(&account)?;
+        let id = account.get("id").and_then(Value::as_str)?;
+        let due_at = usage_records::load(id).last_attempt_at + interval * 1000;
+        (due_at <= now).then_some((account, interval))
+    })
+    .collect();
+    if due.is_empty() {
+        return;
+    }
+    // 先占位再发请求（`usage_records` 模块头的硬约束：被杀不留「没跑过」状态）
+    for (account, _) in &due {
+        if let Some(id) = account.get("id").and_then(Value::as_str) {
+            usage_records::mark_attempt(id);
         }
     }
-    let restored = task_state::read(SNAPSHOT_KEY)
-        .ok()
-        .and_then(|state| state.value)
-        .unwrap_or_else(|| json!({ "at": 0, "results": [], "skipped": 0 }));
-    if let Ok(mut slot) = snapshot_slot().lock() {
-        *slot = Some(restored.clone());
+    let futures: Vec<_> = due
+        .iter()
+        .map(|(account, _)| query_usage_for(store, account))
+        .collect();
+    let results = futures::future::join_all(futures).await;
+    for ((account, _), row) in due.iter().zip(results.into_iter()) {
+        write_row_record(&row);
+        enforce_low_balance_disable(store, account, &row);
     }
-    restored
 }
+
+// ─── 快照（前端 20 秒轮询的读点）─────────────────────────────
+
+/// 各账号最近一次的查询结论（**出口已做两类过滤**）。从未查过时给
+/// `{at: 0, results: [], skipped: 0}` —— 界面据此显示「还没有查询结果」，
+/// 而不是把空数组当成「一个账号都没有」。
+///
+/// 形状与手动查询响应兼容（前端 `applyBalances` 同一份解析），每行多带自己的
+/// `at`（这一行的结论时刻）：按账号到期的写法下各行时刻天然不同，失败行的
+/// 时效判定必须按行算，不能再拿一个整轮的 `at` 盖所有人（前端 `applyBalances`
+/// 因此优先取行级 `at`）。
+///
+/// 出口过滤的两条（与旧 kv 快照的 `prune_stale_failures` 同语义）：
+///   - 账号已删除的行不端出（界面上没有那一行，留着只会对不上）；
+///   - 失败行只在「这次尝试不早于账号记录的最后改动」时端出 —— 重新登录 /
+///     重导入 / 刷过 token 之后，「当时查不到」那条断言就不再成立。成功读数
+///     不受影响：「可用 5147 积分」是一次读数的事实，凭证换了也不会变假话。
+pub fn snapshot(store: &AccountStore) -> Value {
+    let records = usage_records::load_all();
+    let accounts = store.list_accounts();
+    let list = accounts.get("accounts").and_then(Value::as_array);
+    let mut rows = Vec::new();
+    let mut at = 0i64;
+    for (id, record) in &records {
+        let account = list.and_then(|list| {
+            list.iter().find(|account| {
+                account.get("id").and_then(Value::as_str) == Some(id.as_str())
+            })
+        });
+        let Some(account) = account else { continue };
+        at = at.max(record.last_attempt_at);
+        let name = account.get("name").cloned().unwrap_or(Value::Null);
+        match record.usage.as_ref() {
+            Some(usage) => rows.push(json!({
+                "id": id,
+                "name": name,
+                "usage": usage,
+                "error": Value::Null,
+                "at": record.last_attempt_at,
+            })),
+            None => {
+                let Some(error) = record.error.as_deref() else { continue };
+                let changed = account
+                    .get("updatedAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    .max(account.get("addedAt").and_then(Value::as_i64).unwrap_or(0));
+                if record.last_attempt_at >= changed {
+                    rows.push(json!({
+                        "id": id,
+                        "name": name,
+                        "usage": Value::Null,
+                        "error": error,
+                        "code": record.code,
+                        "at": record.last_attempt_at,
+                    }));
+                }
+            }
+        }
+    }
+    json!({ "at": at, "results": rows, "skipped": 0 })
+}
+

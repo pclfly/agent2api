@@ -41,12 +41,29 @@
 //! 构造件（条目字段映射、响应信封、相近提示纯函数）——
 //! 于是「单家清单」与「聚合清单」永远不会在字段映射上分叉。
 //!
+//! ── 国内版 / 国际版拆家后：**一家两份清单**（2026-10）─────────
+//! WorkBuddy 的国际版是独立 provider（`workbuddy-intl`，见
+//! `providers::workbuddy::region`），它有**自己的** `/v3/config` 清单与自己的
+//! 持久化缓存槽。两个地区的清单在结构上是两份独立数据（上游按站点下发各自
+//! 的模型表），因此本模块的目录句柄从「一个单例」变成「按地区各一个」：
+//! `global_catalog(region)` 返回对应地区那一份，`ModelCatalog` 自己也记住
+//! 「我是谁的清单」（provider id / 缓存 scope / 版本），于是 `owned_by`、
+//! 缓存读写、默认规则种子的 provider 键都从实例上取，而不是写死常量。
+//!
+//! 拆家前这两份清单挤在同一个 `OnceLock` 里：用国内账号拉一次、再用国际账号
+//! 拉一次会**互相覆盖**（issue #74 的根因）。现在各刷各的、各自恢复各自的缓存。
+//!
+//! 内置兜底清单（`builtin_models_intl` / `builtin_models_cn`）**按地区各一份**：
+//! 上游两个站点下发的清单与倍率都不同（见 `builtin_models_for` 的说明），
+//! 共用一份会让其中一个地区的兜底清单有一半是错的。两份表是实测快照，
+//! 远程可用时以远程清单为准。
+//!
 //! 词法上本模块是个目录（`models/mod.rs` + `models/shape.rs`）：拆分的唯一
 //! 理由是单文件行数约定（≤800 行），职责边界与拆分前完全一致。
 //!
 //! ── 进程级句柄 ──────────────────────────────────────────────
-//! `global_catalog()` 是聚合层的读取口（`OnceLock` 单例，与
-//! `config::init` 同一模式）：`ServerState::bootstrap` 与聚合层
+//! `global_catalog(region)` 是聚合层的读取口（每个地区一个 `OnceLock` 单例，
+//! 与 `config::init` 同一模式）：`ServerState::bootstrap` 与聚合层
 //! 拿到的是同一实例，刷新对两边同时可见。
 
 mod shape;
@@ -57,7 +74,8 @@ use serde_json::{json, Value};
 
 use crate::server::core::auth_http::send_raw;
 use crate::server::core::endpoints::{normalize_endpoint, user_agent_for_edition};
-use crate::server::core::providers::{catalog_cache, kind_id, ProviderKind};
+use crate::server::core::providers::workbuddy::region::Region;
+use crate::server::core::providers::catalog_cache;
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::logging;
 
@@ -377,12 +395,16 @@ pub fn normalize_edition(value: Option<&str>) -> &'static str {
     }
 }
 
-/// 该版本的**内置**清单（远程拉不到时的兜底）。
-fn builtin_models_of(edition: &str) -> Vec<Value> {
-    if edition == EDITION_INTL {
-        builtin_models_intl()
-    } else {
-        builtin_models_cn()
+/// 该地区对应的**内置**清单（远程拉不到时的兜底）。
+///
+/// 两份表是 2026-10-04 用两个地区的账号各拉一次 `/v3/config` 的实测快照：
+/// 上游按站点下发两套清单，交集里的同名模型**倍率也不同**（`fast-model`：
+/// 国际版 x0.34 / 国内版 x0.21；`deep-model`：x3.33 / x1.20），只有一份表时
+/// 兜底清单必然有一半是错的（「管理页显示 A 版本的名字配 B 版本的倍率」）。
+fn builtin_models_for(region: Region) -> Vec<Value> {
+    match region {
+        Region::Intl => builtin_models_intl(),
+        Region::Cn => builtin_models_cn(),
     }
 }
 
@@ -432,18 +454,19 @@ pub fn edition_label(edition: &str) -> &'static str {
     }
 }
 
-/// 该版本的缓存 scope（写入用；读取另有老库迁移，见 [`initial_state`]）。
-fn cache_scope_of(edition: &str) -> &'static str {
-    if edition == EDITION_INTL {
-        catalog_cache::SCOPE_WORKBUDDY_INTL
-    } else {
-        catalog_cache::SCOPE_WORKBUDDY_CN
-    }
+/// 该地区的缓存 scope。
+///
+/// 键名与 `providers::workbuddy::region::Region::catalog_scope` 同源（那里是
+/// 唯一映射）：这里按地区取，写入与读取（[`initial_state`]）用同一个。
+/// 国内版的键就是改造前那条不分版本的老键（`"workbuddy"`），老库升级因此
+/// 天然把那份清单留在国内版槽里 —— 无需额外迁移读取。
+fn cache_scope_of(region: Region) -> &'static str {
+    region.catalog_scope()
 }
 
 /// 白名单模型必须有可用定义：远程/传入清单缺失时回退内置定义
-fn allowlist_fallback(edition: &str) -> Vec<Value> {
-    builtin_models_of(edition)
+fn allowlist_fallback(region: Region) -> Vec<Value> {
+    builtin_models_for(region)
         .into_iter()
         .filter(|model| {
             MODEL_ALLOWLIST.contains(&model.get("id").map(value_text).unwrap_or_default().as_str())
@@ -460,104 +483,67 @@ fn allowlist_fallback(edition: &str) -> Vec<Value> {
 /// 上游下发的清单，只是可能旧一些。管理页的「来源」列与 `/v1/models` 的
 /// `meta.source` 因此显示「远程」而不是「内置」——那是事实，且时间戳
 /// （`last_refreshed_at`）会如实给出它是什么时候拉的。
-fn initial_state(edition: &str) -> CatalogState {
-    let cached = catalog_cache::load(cache_scope_of(edition)).or_else(|| {
-        // 老库升级：改造前只有一条**不分版本**的清单（是国内版账号拉的），
-        // 装到国内版槽语义正确；国际版槽没有可继承的东西，直接走内置兜底。
-        if edition == EDITION_CN {
-            catalog_cache::load(catalog_cache::SCOPE_WORKBUDDY_LEGACY)
-        } else {
-            None
-        }
-    });
-    if let Some(cached) = cached {
+///
+/// 缓存槽与内置兜底按**地区**分（见模块头的拆家说明）：两个地区各读各的
+/// scope、各用各的内置兜底表（两地的模型与倍率都不同，见 [`builtin_models_for`]）。
+///
+/// 老库升级：国内版的 scope 就是改造前那条**不分版本**的键（`"workbuddy"`），
+/// 那份清单是国内版账号拉的、留在国内版语义正确，因此不需要额外的迁移读取。
+fn initial_state(region: Region) -> CatalogState {
+    if let Some(cached) = catalog_cache::load(region.catalog_scope()) {
         return CatalogState {
             models: cached.models,
             last_refreshed_at: cached.fetched_at,
             remote_refreshed: true,
         };
     }
-    let allowed = apply_filters(builtin_models_of(edition));
-    let models = if allowed.is_empty() { allowlist_fallback(edition) } else { allowed };
+    let allowed = apply_filters(builtin_models_for(region));
+    let models = if allowed.is_empty() { allowlist_fallback(region) } else { allowed };
     CatalogState { models, last_refreshed_at: 0, remote_refreshed: false }
 }
 
-/// 按版本的两份快照（上游两套清单差异见 `builtin_models_intl` 的说明）。
-#[derive(Clone, Debug)]
-struct CatalogInner {
-    cn: CatalogState,
-    intl: CatalogState,
-}
-
-impl CatalogInner {
-    fn slot(&self, edition: &str) -> &CatalogState {
-        if edition == EDITION_INTL { &self.intl } else { &self.cn }
-    }
-
-    fn slot_mut(&mut self, edition: &str) -> &mut CatalogState {
-        if edition == EDITION_INTL { &mut self.intl } else { &mut self.cn }
-    }
-}
-
-/// 两份清单合并去重（**国内版优先**，保持改造前「默认国内版」的视角）。
+/// 模型目录句柄：内部一把 `RwLock`，克隆共享同一份状态。
 ///
-/// 同名模型的倍率两版不同（`fast-model` cn x0.21 / intl x0.34），合并视图只能
-/// 取一份 —— 版本维度的展示交给管理视图按版本分组（见
-/// `providers::catalog::view::manage_view`）。
-fn merge_editions(inner: &CatalogInner) -> Vec<Value> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for model in inner.cn.models.iter().chain(inner.intl.models.iter()) {
-        let id = model.get("id").map(value_text).unwrap_or_default().to_lowercase();
-        if id.is_empty() || !seen.insert(id) {
-            continue;
-        }
-        out.push(model.clone());
-    }
-    out
-}
-
-/// 模型目录句柄：内部一把 `RwLock` 持有**按版本的两份**状态，克隆共享。
+/// `region` 是**这一份清单属于谁**（拆家后一个地区一个实例）：
+/// provider id 进 `owned_by`、缓存 scope 定位读写、版本决定 UA 与端点兜底 ——
+/// 三处都从实例取，而不是像拆家前那样写死常量（那正是「两份清单挤在一个
+/// 句柄里」的形态）。
 #[derive(Clone)]
 pub struct ModelCatalog {
-    inner: Arc<RwLock<CatalogInner>>,
+    region: Region,
+    inner: Arc<RwLock<CatalogState>>,
 }
 
 impl Default for ModelCatalog {
     fn default() -> Self {
-        Self::new()
+        Self::new(Region::Cn)
     }
 }
 
 impl ModelCatalog {
-    /// 构造目录（不刷新；刷新由启动流程与 /v1/models 触发）。
-    /// 两个版本各自从自己的缓存/内置清单初始化。
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(CatalogInner {
-                cn: initial_state(EDITION_CN),
-                intl: initial_state(EDITION_INTL),
-            })),
-        }
+    /// 构造目录（不刷新；刷新由启动流程与 /v1/models 触发）
+    pub fn new(region: Region) -> Self {
+        Self { region, inner: Arc::new(RwLock::new(initial_state(region))) }
+    }
+
+    /// 这一份清单属于哪个地区
+    pub fn region(&self) -> Region {
+        self.region
     }
 
     /// 读取状态快照；锁中毒（持锁 panic）时接管内部数据继续用，
     /// 与账号存储同一策略：宁可容忍一次中毒，也不要让网关永久不可用。
-    fn read(&self, edition: &str) -> CatalogState {
-        self.read_inner().slot(edition).clone()
-    }
-
-    fn read_inner(&self) -> CatalogInner {
+    fn read(&self) -> CatalogState {
         match self.inner.read() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
-    fn write(&self, edition: &str, next: CatalogState) {
+    fn write(&self, next: CatalogState) {
         match self.inner.write() {
-            Ok(mut guard) => *guard.slot_mut(edition) = next,
-            Err(poisoned) => *poisoned.into_inner().slot_mut(edition) = next,
+            Ok(mut guard) => *guard = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
         }
     }
 
@@ -567,25 +553,21 @@ impl ModelCatalog {
     pub fn get(&self, id: Option<&str>) -> Option<Value> {
         let id = id.map(str::trim).filter(|value| !value.is_empty())?;
         let lower = id.to_lowercase();
-        let find = |models: &[Value]| -> Option<Value> {
-            models
-                .iter()
-                .find(|model| value_text(&model["id"]).to_lowercase() == lower)
-                .or_else(|| {
-                    models.iter().find(|model| {
-                        model
-                            .get("name")
-                            .map(value_text)
-                            .unwrap_or_default()
-                            .to_lowercase()
-                            == lower
-                    })
+        let models = self.read().models;
+        models
+            .iter()
+            .find(|model| value_text(&model["id"]).to_lowercase() == lower)
+            .or_else(|| {
+                models.iter().find(|model| {
+                    model
+                        .get("name")
+                        .map(value_text)
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        == lower
                 })
-                .cloned()
-        };
-        // 跨两个版本查：国内版优先（与合并视图同一口径）
-        let inner = self.read_inner();
-        find(&inner.cn.models).or_else(|| find(&inner.intl.models))
+            })
+            .cloned()
     }
 
     /// 目录里是否有该模型。
@@ -634,77 +616,28 @@ impl ModelCatalog {
         suggest_from(ids, id, limit)
     }
 
-    /// 两个版本**合并去重**后的目录（克隆；调用方不会看到后续刷新）。
+    /// 当前目录（克隆；调用方不会看到后续刷新）。
+    ///
+    /// 拆家后本实例只承载**一个地区**，因此这里就是那个地区的清单 ——
+    /// 两个地区的合并去重由聚合层（`providers::catalog`）负责：它按
+    /// provider id 分别取两份，再对外按先到先得去重。
     pub fn list(&self) -> Vec<Value> {
-        merge_editions(&self.read_inner())
+        self.read().models
     }
 
-    /// 指定版本的目录（管理视图按版本分组、聚合层按版本展开用）。
-    pub fn list_of(&self, edition: &str) -> Vec<Value> {
-        self.read(edition).models
-    }
-
-    /// 这个模型**只**属于哪个版本（两版都有 / 都不认识 → `None`）。
-    ///
-    /// ── 它回答的是「下游拉到的模型怎么落到账号上」──────────────
-    /// 模型 id 本身不带版本（对外列表里 `fast-model` 只有一条），实际打哪个站点
-    /// 由**选中的账号**决定。这对两版都有的模型没问题（同一个上游名字，谁都能跑），
-    /// 但对**版本独有**的模型是硬伤：`hy3-b` 只有国内版有、`gpt-5.6-sol` 只有
-    /// 国际版有，而选账号是按优先级取队首 —— 本机队首是国际版账号，于是请求
-    /// `hy3-b` 会打到 `www.workbuddy.ai`，上游直接报「模型不存在」。
-    ///
-    /// 转发选路据此收窄候选账号（见 `upstream::rotate::restrict_workbuddy_edition`）。
-    /// 判据是**当前清单**（远程优先），所以上游新增的独有模型自动生效。
-    pub fn edition_exclusive_of(&self, model: &str) -> Option<&'static str> {
-        // 带版本后缀的请求名先剥掉：后缀是「指定版本」的手段（见
-        // `split_edition_suffix`），剥完才是清单里的真名
-        let (model, _) = split_edition_suffix(model);
-        let target = model.trim().to_lowercase();
-        if target.is_empty() {
-            return None;
-        }
-        let has = |models: &[Value]| {
-            models.iter().any(|item| {
-                item.get("id")
-                    .map(value_text)
-                    .unwrap_or_default()
-                    .eq_ignore_ascii_case(&target)
-            })
-        };
-        let inner = self.read_inner();
-        match (has(&inner.cn.models), has(&inner.intl.models)) {
-            (true, false) => Some(EDITION_CN),
-            (false, true) => Some(EDITION_INTL),
-            // 两版都有（同一个上游名字）或两版都没有（不认识）→ 不收窄
-            _ => None,
-        }
-    }
-
-    /// 是否曾成功采用远程清单（挂进响应 meta 用；聚合层据此算「来源」）
+    /// 本实例的地区是否曾成功采用远程清单（挂进响应 meta 用；聚合层据此算「来源」）
     pub fn remote_refreshed(&self) -> bool {
-        let inner = self.read_inner();
-        inner.cn.remote_refreshed || inner.intl.remote_refreshed
+        self.read().remote_refreshed
     }
 
-    /// 指定版本是否来自远程
-    pub fn remote_refreshed_of(&self, edition: &str) -> bool {
-        self.read(edition).remote_refreshed
-    }
-
-    /// 最后一次成功远程刷新的时间（毫秒，未刷新过为 0）—— 取两个版本里更近的一次
+    /// 最后一次成功远程刷新的时间（毫秒，未刷新过为 0）
     pub fn last_refreshed_at(&self) -> i64 {
-        let inner = self.read_inner();
-        inner.cn.last_refreshed_at.max(inner.intl.last_refreshed_at)
+        self.read().last_refreshed_at
     }
 
-    /// 指定版本的最后刷新时间
-    pub fn last_refreshed_at_of(&self, edition: &str) -> i64 {
-        self.read(edition).last_refreshed_at
-    }
-
-    /// 目录条数（/health 的 models 字段）—— 合并去重后的条数
+    /// 目录条数（/health 的 models 字段）
     pub fn count(&self) -> usize {
-        self.list().len()
+        self.read().models.len()
     }
 
     /// GET /v1/models 的 OpenAI 风格响应：`{object, data: [...], meta: {...}}`
@@ -718,12 +651,15 @@ impl ModelCatalog {
     /// 的视图，排障时与聚合输出对比即可立刻分辨「是 workbuddy 清单不对」
     /// 还是「聚合/过滤逻辑不对」。对只有 workbuddy 一家的用户，
     /// 它与聚合输出逐字段相同（聚合层复用同一个 list_item / 信封）。
+    ///
+    /// `owned_by` 取本实例的地区（拆家后 `workbuddy` / `workbuddy-intl`）：
+    /// 写死国内版会让国际版的排障视图指错家。
     #[allow(dead_code)]
     pub fn list_response(&self) -> Value {
         let data: Vec<Value> = self
             .list()
             .iter()
-            .map(|model| list_item(model, kind_id(ProviderKind::WorkBuddy)))
+            .map(|model| list_item(model, self.region.provider_id()))
             .collect();
         list_response_from(
             data,
@@ -771,7 +707,7 @@ impl ModelCatalog {
                         let raw = picker_models(&payload);
                         let allowed = apply_filters(raw.clone());
                         if !allowed.is_empty() {
-                            self.apply_remote(allowed, "auto", false, params.edition);
+                            self.apply_remote(allowed, "auto", false);
                             return RefreshOutcome::refreshed(
                                 self.count(),
                                 "v3/config",
@@ -818,7 +754,7 @@ impl ModelCatalog {
                         if allowed.is_empty() {
                             RefreshOutcome::not_refreshed("企业模型列表为空")
                         } else {
-                            self.apply_remote(allowed, "custom:", true, params.edition);
+                            self.apply_remote(allowed, "custom:", true);
                             RefreshOutcome::refreshed(self.count(), "enterprise")
                         }
                     }
@@ -844,7 +780,6 @@ impl ModelCatalog {
         models: Vec<Value>,
         custom_prefix: &str,
         enterprise: bool,
-        edition: &str,
     ) {
         let mapped: Vec<Value> = models
             .into_iter()
@@ -877,28 +812,39 @@ impl ModelCatalog {
             last_refreshed_at: logging::now_ms(),
             remote_refreshed: true,
         };
-        self.write(edition, state.clone());
+        self.write(state.clone());
         // 落持久化缓存（进程重启后由 `initial_state` 读回，见 `catalog_cache`
         // 的模块头）。必须在写锁**之外**：缓存写入要拿库连接锁，而本目录的
-        // 硬约束是「持锁期间不做 IO」。**按版本分键**：两个版本的清单不同，
-        // 写进同一个键就是「谁后刷谁覆盖」。
+        // 硬约束是「持锁期间不做 IO」。槽位按地区取 —— 两个地区的清单互不
+        // 覆盖（这正是拆家要修的那件事，见模块头）。
         catalog_cache::save(
-            cache_scope_of(edition),
+            cache_scope_of(self.region),
             &state.models,
             state.last_refreshed_at,
         );
         // 远程清单首次落地时补一次 WorkBuddy 默认规则种子（默认只启用白名单内的
-        // 模型，见 model_rules::seed_workbuddy_defaults）。必须放在写锁之外：种子
+        // 模型，见 `model_rules::seed_workbuddy_defaults`）。必须放在写锁之外：种子
         // 要写 config.json，而「持锁期间不做任何 IO」是本目录的硬约束。
-        if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(&ids) {
+        // provider 键取本实例的地区：种子按 `(provider, id)` 记账，国际版的
+        // 模型名与国内版可能同名，记错家会让两家的开关互相污染。
+        if let Some(summary) =
+            crate::server::core::model_rules::seed_workbuddy_defaults(
+                self.region.provider_id(),
+                &ids,
+            )
+        {
             logging::log("[Models]", &summary);
         }
     }
 
     /// 按当前账号的凭证/端点/UA/出口刷新一次（路由层与启动流程的入口）。
     ///
-    /// 「当前账号 = 队首的可用账号」（由 store 派生，与转发默认使用的账号一致），
-    /// 这里直接用它的凭证与出口，保证模型目录与转发看到的是同一个账号。
+    /// ── 「当前账号」是**本地区**的队首（拆家后的口径）──────────────
+    /// 本实例只承载一个地区，因此这里的「当前账号」必须收窄到本家的 provider
+    /// （`current_entry_for_provider`）—— 两个地区的账号混在一个队列里取队首，
+    /// 会让国内版的清单用国际版账号去拉（拆家前正是这个形态，症状是「拉一次
+    /// 换一个地区」，见 issue #74）。
+    ///
     /// `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条：按 id 直取，
     /// **取不到就明确失败、不回落到队首**（否则清单会变成「选了 A、用的是 B」）。
     ///
@@ -915,12 +861,12 @@ impl ModelCatalog {
     ) -> RefreshOutcome {
         // 账号选取三档：
         //   · 点名了（`account_id` 非空）→ 按 id 直取那一条，取不到即失败（见上）；
-        //   · 没点名 → 队首账号优先（多账号时与转发一致）；
-        //   · 一条账号都没有 → 回落到默认登录态（环境变量 WORKBUDDY_TOKEN
-        //     或单账号 auth.json）。
+        //   · 没点名 → 本地区的队首账号优先（多账号时与转发一致）；
+        //   · 本地区一条账号都没有 → 回落到本地区的默认登录态（环境变量
+        //     `WORKBUDDY[_INTL]_TOKEN` 或单账号 auth.json）。
         let requested = account_id.trim();
         let (session, proxy) = if requested.is_empty() {
-            match store.get_current_entry() {
+            match store.current_entry_for_provider(self.region.provider_id()) {
                 Some(entry) => {
                     let proxy = crate::server::core::proxies::session_proxy(&entry.session);
                     (Some(entry.session), proxy)
@@ -953,11 +899,42 @@ impl ModelCatalog {
             return RefreshOutcome::not_refreshed(REASON_NO_SESSION);
         };
 
-        // 这份清单属于哪个版本：按账号记录里的 `edition` 分槽（缺省国内版）。
-        // 上游两个站点下发的清单不同（见 `builtin_models_intl` 的说明），
-        // 分槽之后国际版与国内版账号不再互相覆盖。
-        let edition = normalize_edition(session.get("edition").and_then(Value::as_str));
-        let outcome = self.refresh_session(&session, proxy.as_ref(), auth, edition).await;
+        // 端点兜底按**本地区**取（账号记录里的 endpoint 仍是最高优先的覆盖项：
+        // 它带着账号自己的站点，也正是 staging / 反向代理用户的落点）。
+        //
+        // 「另一个地区也补刷一次」在拆家后不再需要：两个地区是两家独立
+        // provider，各自在刷新循环里有自己的排期（见 `adapter::implemented_kinds`
+        // 的 `WorkBuddyIntl` 条目），谁有账号谁被刷。
+        let fallback_endpoint = self
+            .region
+            .env_endpoint_override()
+            .unwrap_or_else(|| self.region.default_endpoint().to_string());
+        let endpoint = session
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(normalize_endpoint)
+            .unwrap_or_else(|| normalize_endpoint(fallback_endpoint.as_str()));
+        let enterprise_id = session
+            .get("account")
+            .and_then(|account| account.get("enterpriseId"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let headers = crate::server::core::auth::AuthService::build_auth_headers(&session);
+        // UA 按本地区的客户端身份（国际版是 `WorkBuddy AI/5.5.2`，国内版
+        // `WorkBuddy/5.5.4`；服务端按 UA 识别通道，给错会拿到另一套清单）
+        let user_agent = user_agent_for_edition(Some(self.region.id()));
+
+        let outcome = self
+            .refresh(RefreshParams {
+                endpoint: &endpoint,
+                enterprise_id: Some(&enterprise_id),
+                headers: &headers,
+                user_agent: &user_agent,
+                proxy: proxy.as_ref(),
+            })
+            .await;
         if outcome.refreshed {
             logging::log(
                 "[Models]",
@@ -966,105 +943,8 @@ impl ModelCatalog {
         } else {
             logging::verbose("[Models]", &format!("模型目录未更新: {}", outcome.reason));
         }
-        // 另一个版本也补刷一次（只在那个版本确实有账号时）：上游两个站点下发
-        // 两套清单，只刷一边会让管理页的另一行一直停在内置兜底 —— 用户看到的
-        // 就是「一行是远程清单、另一行是内置清单」。
-        self.refresh_other_edition(store, auth, edition).await;
         outcome
     }
-
-    /// 按给定会话刷新一次：端点 / 企业 id / 鉴权头 / UA 全部从会话派生。
-    async fn refresh_session(
-        &self,
-        session: &Value,
-        proxy: Option<&ResolvedProxy>,
-        auth: &crate::server::core::auth::AuthService,
-        edition: &str,
-    ) -> RefreshOutcome {
-        let endpoint = session
-            .get("endpoint")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(normalize_endpoint)
-            .unwrap_or_else(|| normalize_endpoint(auth.default_context().base_url.as_str()));
-        let enterprise_id = session
-            .get("account")
-            .and_then(|account| account.get("enterpriseId"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let headers = crate::server::core::auth::AuthService::build_auth_headers(session);
-        let user_agent = user_agent_for_edition(session.get("edition").and_then(Value::as_str));
-        self.refresh(RefreshParams {
-            endpoint: &endpoint,
-            enterprise_id: Some(&enterprise_id),
-            headers: &headers,
-            user_agent: &user_agent,
-            proxy,
-            edition,
-        })
-        .await
-    }
-
-    /// 补刷「另一个版本」的清单（该版本没有可用账号时什么也不做）。
-    ///
-    /// 失败只记 verbose：主版本的刷新结果才是这次调用的返回值，补刷是**尽力**
-    /// 动作 —— 把它升级成错误会让「国际版刷成功、国内版网络抖动」变成一次整体失败。
-    async fn refresh_other_edition(
-        &self,
-        store: &crate::server::core::account_store::AccountStore,
-        auth: &crate::server::core::auth::AuthService,
-        edition: &str,
-    ) {
-        let other = if edition == EDITION_INTL { EDITION_CN } else { EDITION_INTL };
-        let Some(account_id) = workbuddy_account_of_edition(store, other) else {
-            return;
-        };
-        let Some(entry) = store.session_for_account(&account_id) else {
-            return;
-        };
-        let proxy = crate::server::core::proxies::session_proxy(&entry.session);
-        let outcome = self
-            .refresh_session(&entry.session, proxy.as_ref(), auth, other)
-            .await;
-        if outcome.refreshed {
-            logging::log(
-                "[Models]",
-                &format!("✅ 模型目录（{}）已更新（{} 个）", other, outcome.count),
-            );
-        } else {
-            logging::verbose(
-                "[Models]",
-                &format!("模型目录（{}）未更新: {}", other, outcome.reason),
-            );
-        }
-    }
-}
-
-/// 取某个版本（`cn` / `intl`）的第一个可用 WorkBuddy 账号 id。
-///
-/// 给 [`ModelCatalog::refresh_other_edition`] 用：账号公开形态带 `edition`
-/// （`account_store` 把版本写进了公开字段），按它筛即可。
-fn workbuddy_account_of_edition(
-    store: &crate::server::core::account_store::AccountStore,
-    edition: &str,
-) -> Option<String> {
-    store
-        .accounts_for_provider(kind_id(ProviderKind::WorkBuddy))
-        .into_iter()
-        .find(|account| {
-            account
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
-                && normalize_edition(account.get("edition").and_then(Value::as_str)) == edition
-        })
-        .and_then(|account| {
-            account
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
 }
 
 /// 刷新入参（对应 Node 版 refresh 的 options 对象）
@@ -1074,9 +954,6 @@ pub struct RefreshParams<'a> {
     pub headers: &'a [(String, String)],
     pub user_agent: &'a str,
     pub proxy: Option<&'a ResolvedProxy>,
-    /// 这份清单属于哪个版本（`cn` / `intl`）—— 上游按站点下发两套清单，
-    /// 落地与缓存都按它分槽，见 `EDITION_CN` 的说明。
-    pub edition: &'a str,
 }
 
 /// 刷新结果：成功 `{refreshed:true, count, source}`，
@@ -1137,7 +1014,7 @@ pub fn builtin_models_snapshot() -> Value {
 
 // ─── 进程级目录句柄（聚合目录的读取口）──────────────────────
 
-/// 进程级 workbuddy 目录句柄。**为什么要全局**：聚合目录
+/// 进程级 workbuddy 目录句柄，**按地区各一个**。**为什么要全局**：聚合目录
 /// （`core::providers::catalog`）的公开 API 只收 `&AccountStore`（handler 手边
 /// 就有），不该再要求调用方层层传一个 ModelCatalog —— 那会把 `list_models` 与
 /// 将来 chat_completions 的签名都改一遍。全局句柄与 `config::current()` /
@@ -1146,14 +1023,19 @@ pub fn builtin_models_snapshot() -> Value {
 /// 取用方式是 `get_or_init`：`ServerState::bootstrap` 与聚合层拿到的是**同一个
 /// 实例**（共享同一把 RwLock），即使 bootstrap 被调用多次（重启路径）也不会
 /// 出现「ServerState 里刷新了、聚合层读的是另一份旧目录」这种分叉。
-static GLOBAL: OnceLock<ModelCatalog> = OnceLock::new();
+static WORKBUDDY_CATALOG: OnceLock<ModelCatalog> = OnceLock::new();
+/// 国际版的目录句柄（拆家后与国内版各自独立，见模块头）
+static WORKBUDDY_INTL_CATALOG: OnceLock<ModelCatalog> = OnceLock::new();
 
-/// 取进程级目录句柄；首次调用即构造（内置清单，不读盘、不刷新）。
+/// 取某个地区的进程级目录句柄；首次调用即构造（内置清单，不读盘、不刷新）。
 ///
 /// 构造顺序无关：任何模块在启动流程的任何阶段调它都能拿到一个可用的目录
 /// （最坏情况是「还没被 `/v3/config` 刷新过」的内置清单，与改造前的初始态一致）。
-pub fn global_catalog() -> ModelCatalog {
-    GLOBAL.get_or_init(ModelCatalog::new).clone()
+pub fn global_catalog(region: Region) -> ModelCatalog {
+    match region {
+        Region::Cn => WORKBUDDY_CATALOG.get_or_init(|| ModelCatalog::new(region)).clone(),
+        Region::Intl => WORKBUDDY_INTL_CATALOG.get_or_init(|| ModelCatalog::new(region)).clone(),
+    }
 }
 
 
@@ -1292,16 +1174,25 @@ mod tests {
     }
 
     /// 版本归属判定：只在一份清单里出现的模型才收窄，两版都有 / 都不认识一律不收窄。
+    ///
+    /// 拆家后两个地区是两家独立 provider，各自的清单**天然**只含自己那版的模型
+    /// ——「版本独有模型打错站」在结构上不再可能（请求按 provider 分流）。
+    /// 这里守的是判据本身：两份内置表确实是两套，独有模型各在一边。
     #[test]
     fn edition_exclusive_of_splits_version_only_models() {
-        let catalog = ModelCatalog::new();
-        assert_eq!(catalog.edition_exclusive_of("gpt-5.6-sol"), Some(EDITION_INTL));
-        assert_eq!(catalog.edition_exclusive_of("hy3-b"), Some(EDITION_CN));
-        // 两版都有（同一个上游名字）→ 不强制版本
-        assert_eq!(catalog.edition_exclusive_of("fast-model"), None);
-        // 不认识 → 不收窄（宁可让上游如实报错，也不凭空猜一个版本）
-        assert_eq!(catalog.edition_exclusive_of("no-such-model"), None);
-        assert_eq!(catalog.edition_exclusive_of("   "), None);
+        let cn = builtin_models_for(Region::Cn);
+        let intl = builtin_models_for(Region::Intl);
+        let has = |models: &[Value], id: &str| {
+            models
+                .iter()
+                .any(|item| item.get("id").map(value_text).as_deref() == Some(id))
+        };
+        assert!(has(&intl, "gpt-5.6-sol"), "国际版独有模型应在国际版表里");
+        assert!(!has(&cn, "gpt-5.6-sol"), "国内版表不该有国际版独有模型");
+        assert!(has(&cn, "hy3-b"), "国内版独有模型应在国内版表里");
+        assert!(!has(&intl, "hy3-b"), "国际版表不该有国内版独有模型");
+        // 两版都有（同一个上游名字）
+        assert!(has(&cn, "fast-model") && has(&intl, "fast-model"));
     }
 
     /// 版本后缀的解析：下游用 `xxx-intl` / `xxx-cn` 指定版本。
@@ -1325,11 +1216,5 @@ mod tests {
         assert_eq!(split_edition_suffix("  "), (String::new(), None));
         // 后缀本身不构成有效名字时**不剥**（`-cn` 结尾的真名不该被误伤）
         assert_eq!(split_edition_suffix("-intl"), ("-intl".to_string(), None));
-        // 带后缀的名字仍然能判出版本归属（先剥再查清单）
-        let catalog = ModelCatalog::new();
-        assert_eq!(
-            catalog.edition_exclusive_of("gpt-5.6-sol-intl"),
-            Some(EDITION_INTL)
-        );
     }
 }

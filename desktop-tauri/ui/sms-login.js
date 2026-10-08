@@ -1,4 +1,4 @@
-/* Agent2API · 「手机验证码登录」交互引擎（AutoClaw 国内版 / Loomy 共用）
+/* Agent2API · 「手机验证码登录」交互引擎（AutoClaw 国内版 / Loomy / KukuAI）
 
    与小浣熊 / Qoder 的网页登录（web-login.js）是**两套东西**，不要合并：
 
@@ -7,14 +7,14 @@
 
    上游形态决定了这个差别 —— AutoClaw 国内版没有授权页、没有授权码回调
    （理由见 src-tauri/src/server/core/providers/autoclaw/login.rs 的模块头），
-   Loomy 同样没有网页登录（短信是官方主路径），硬塞进网页登录引擎只会让
-   那边多出一堆「这条路没有窗口也没有 state」的分支。
+   硬塞进网页登录引擎只会让那边多出一堆「这条路没有窗口也没有 state」的分支。
+   Loomy 同理（见 providers/loomy/login.rs 的模块头）。
+   KukuAI 是**第三条形态**：发码必须发生在官方页面里（风控签名只有页面能生成），
+   于是由壳开登录窗口自动填号发码、收码后自动登录（见 src-tauri/src/login.rs
+   的 kuku_sms_script）—— 本弹窗只负责收手机号、收验证码，窗口在幕后配合。
    国际版的手机验证码入口已从添加账号弹窗移除（它只有 Zai / Google 网页登录），
-   因此这个引擎只服务大陆手机号：手机号规则只有那一种，没有地区分叉。
-
-   两家在「发码 → 登录」之间要带回的中间态不同（AutoClaw 是 deviceId、
-   Loomy 是 msgid），引擎把两个字段都留着、登录时都带上 —— 后端按 provider
-   读各自需要的那个。
+   因此这个引擎服务的几家都在大陆号段内：规则仍按家给（Loomy 只收 `1[3-9]`，
+   见 create 里的 SMS_PROFILES），没有地区分叉。
 
    依赖 app.js 的顶层全局（经典 script 的顶层声明在全局可见）：$ / toast /
    __TAURI_INTERNALS__ 的 api_request。脚本顺序见 index.html：与 web-login.js
@@ -42,17 +42,93 @@
     const codeInput = () => $(`${prefix}-sms-code`);
     const nameInput = () => $(`${prefix}-sms-name`);
 
-    /** 最近一次发码的 deviceId（AutoClaw；发码成功后才写入） */
-    let deviceId = '';
-    /** 最近一次发码的 msgid（Loomy；发码成功后才写入） */
-    let msgid = '';
+    /**
+     * 按 provider 分的短信链路档案。
+     *
+     * ── 为什么要有这张表（两家形态不同，别合并）─────────────────
+     * 两条链路都是「发码 → 用码换登录态」，但换登录态时**要带回去的那个
+     * 中间态**不同、端点也不同：
+     *   - AutoClaw：上游把码绑在 device_id 上 → 请求字段 `deviceId`；
+     *   - Loomy：上游把码绑在发码响应的 msgid 上 → 请求字段 `msgid`
+     *     （`providers/loomy/login.rs` 的模块头有完整说明）。
+     * 手机号规则也略有差别：Loomy 只收 `1[3-9]` 开头（与它客户端同口径）。
+     *
+     * 落到未知 provider 时按 AutoClaw 走（历史行为），但界面上不会出现这种
+     * 组合 —— 只有配了 `smsLogin` 的家才会渲染这个块的按钮。
+     */
+    const SMS_PROFILES = {
+      autoclaw: {
+        send: '/api/session/login/sms/send',
+        verify: '/api/session/login/sms/verify',
+        ticketKey: 'deviceId',
+        phoneRe: /^1[2-9]\d{9}$/,
+        sentHint: '验证码已发送。收到后填入下方并点「登录并添加」',
+      },
+      loomy: {
+        send: '/api/session/login/loomy/sms/send',
+        verify: '/api/session/login/loomy/sms/verify',
+        ticketKey: 'msgid',
+        phoneRe: /^1[3-9]\d{9}$/,
+        sentHint: '验证码已发送。收到后填入下方并点「登录并添加」',
+      },
+      // KukuAI：百度通行证的发码要在官方页面里点（风控签名只有页面能生成），
+      // 因此发码/登录都由**壳开的登录窗口**代做 —— send/verify 两个路径只是
+      // 为了触发桥接层（endsWith('/send') / '/verify' 判定），桥里按 provider
+      // 分派到壳命令 login_kuku_sms_send / login_kuku_sms_verify（见 bridge.rs
+      // 的 kuku 分支）。`ticketKey: 'state'` 让发码返回的 state 留在闭包里，
+      // 提交时带上（壳命令只取 code，多余字段忽略 —— 无中间态要回传）。
+      kuku: {
+        send: '/api/session/login/kuku/sms/send',
+        verify: '/api/session/login/kuku/sms/verify',
+        ticketKey: 'state',
+        phoneRe: /^1[2-9]\d{9}$/,
+        sentHint: '验证码已发送，请查看手机短信。填入下方并点「登录并添加」即完成登录',
+      },
+    };
+    const profile = SMS_PROFILES[prefix] || SMS_PROFILES.autoclaw;
+    const PHONE_RE = profile.phoneRe;
+
+    /** 最近一次发码的中间态（deviceId / msgid，发码成功后才写入，见下） */
+    let ticket = '';
     /** 发码与登录共用一把锁：两个按钮都打上游，不能并点 */
     let busy = false;
 
-    const setHint = text => {
+    /**
+     * 写提示行。
+     *
+     * isError 决定这一行标不标红（样式是 css 的 .sms-hint.err）—— 失败提示此前
+     * 与成功提示长得一模一样，只差文案，扫一眼分不出来。真正的报错同时还会弹
+     * toast，这一笔只是让原地那条也读得出来，不改任何链路行为。
+     */
+    const setHint = (text, isError = false) => {
       const node = hint();
-      if (node) node.textContent = text;
+      if (!node) return;
+      node.textContent = text;
+      node.classList.toggle('err', isError && Boolean(text));
     };
+
+    // KukuAI：壳侧把隐藏登录窗口的进度推过来（`login:kuku-status` 事件），
+    // 面板提示行实时显示 —— 用户能看出「正在发码 / 已发出 / 需要图形验证码」，
+    // 而不是点完干等（壳侧监视任务每 1 秒读窗口标题上报，见
+    // src-tauri/src/login.rs 的 start_kuku_sms）。
+    if (prefix === 'kuku' && typeof window.workbuddyDesktop?.onKukuSmsStatus === 'function') {
+      window.workbuddyDesktop.onKukuSmsStatus(payload => {
+        const status = payload && payload.status;
+        const textByStatus = {
+          opening: '正在打开百度登录页…',
+          filling: '已填写手机号，正在发送验证码…',
+          sending: '已点发送，等待短信…',
+          sent: '验证码已发送，请查看手机短信',
+          captcha: '需要图形验证码：登录窗口已弹出，请填写后继续',
+          timeout: '发送未确认：登录窗口已弹出，请在弹出的窗口中手动完成登录',
+        };
+        const text = textByStatus[status];
+        if (!text) return;
+        setHint(text);
+        if (status === 'sent') window.wbApp.toast('验证码已发送，请查看手机短信');
+        if (status === 'captcha' || status === 'timeout') window.wbApp.toast(text, 'err');
+      });
+    }
 
     /**
      * 取可读的错误文案。
@@ -112,7 +188,11 @@
      * 曾经这里按 provider 分叉出 6-15 位的国际规则，随入口一起删掉了 ——
      * 留着一条永远走不到的分支，只会让「手机号格式不对时该看哪段代码」变模糊。
      */
-    const PHONE_RE = /^1[2-9]\d{9}$/;
+    /**
+     * 验证码规则（两家同一条）。
+     *
+     * 手机号规则在 SMS_PROFILES 里按家给（Loomy 只收 `1[3-9]`，与它客户端同口径）。
+     */
     const CODE_RE = /^\d{6}$/;
 
     /**
@@ -183,23 +263,22 @@
       if (button) { button.disabled = true; button.textContent = '发送中…'; }
       setHint('');
       try {
-        // provider 照带：这条链路只服务国内版，但把值显式传上去之后，后端能对
-        // 「传了国际版」的请求给出明确拒绝，而不是静默发到国内版站点去
-        const data = await request('/api/session/login/sms/send', { phone, provider: prefix });
-        // ── 中间态为什么要留住 ─────────────────────────────────
-        // AutoClaw：上游把「刚发的这个码」绑在发码时的 device_id 上，登录必须带同一个。
-        // Loomy：上游回一个 msgid，校验时必须原样带回。
-        // 存在这个闭包里而不是每次现取，也不放进模块级状态 —— 它只在这两次
-        // 点击之间有意义，放进模块级会在用户切换提供商后串味。
-        deviceId = data?.deviceId || '';
-        msgid = data?.msgid || '';
+        // provider 照带：后端按它分派（AutoClaw 两地区 / Loomy 各一条链路），
+        // 未知值会得到明确拒绝而不是静默发到别的站点去
+        const data = await request(profile.send, { phone, provider: prefix });
+        // ── 中间态为什么要留住 ─────────────────────────────────────
+        // 上游把「刚发的这个码」绑在发码时的 device_id（AutoClaw）/ msgid
+        // （Loomy）上，登录必须带同一个。存在这个闭包里而不是每次现取，也不
+        // 放进模块级状态 —— 它只在这两次点击之间有意义，放进模块级会在用户
+        // 切换提供商后串味。
+        ticket = data?.[profile.ticketKey] || '';
         window.wbApp.toast('验证码已发送，请查看短信');
-        setHint('验证码已发送。收到后填入下方并点「登录并添加」');
+        setHint(profile.sentHint);
         // 成功也进冷却：官方口径（见 RESEND_COOLDOWN_SECONDS 的说明）
         startCooldown();
       } catch (error) {
         const reason = describeError(error);
-        setHint(`发送失败：${reason}`);
+        setHint(`发送失败：${reason}`, true);
         window.wbApp.toast(`发送失败：${reason}`, 'err');
         // ── 为什么失败也要倒计时 ───────────────────────────────────
         // 「过于频繁」（上游码 630101）正是最该冷却的一种失败：不打冷却的话
@@ -225,22 +304,20 @@
       setHint('');
       try {
         const payload = { phone, code, provider: prefix };
-        // 缺省时不传：后端会现生成一个（AutoClaw 接受「新设备直接登录」），
-        // 传空串反而会覆盖掉那个兜底；Loomy 的 msgid 缺失时后端会明确拒绝。
-        if (deviceId) payload.deviceId = deviceId;
-        if (msgid) payload.msgid = msgid;
+        // 中间态缺省时不传：后端会给出明确提示（Loomy 缺 msgid 时要求先发码），
+        // 传空串反而会覆盖掉那层判定的语义
+        if (ticket) payload[profile.ticketKey] = ticket;
         const name = nameInput()?.value.trim() || '';
         if (name) payload.name = name;
-        const data = await request('/api/session/login/sms/verify', payload);
+        const data = await request(profile.verify, payload);
         // 成功后清掉验证码（手机号留着：连加第二个账号时省一次输入）
         const codeNode = codeInput();
         if (codeNode) codeNode.value = '';
-        deviceId = '';
-        msgid = '';
+        ticket = '';
         await config.onSuccess?.(data);
       } catch (error) {
         const reason = describeError(error);
-        setHint(`登录失败：${reason}`);
+        setHint(`登录失败：${reason}`, true);
         window.wbApp.toast(`登录失败：${reason}`, 'err');
       } finally {
         busy = false;
