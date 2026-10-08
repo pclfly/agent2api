@@ -708,11 +708,17 @@ impl AccountStore {
         }
 
         if let Some(value) = patch.get("product") {
-            // 出站身份（WB / VSC / CLI）是 **workbuddy 专属**的账号属性：
+            // 出站身份（WB / VSC / CLI）是 **WorkBuddy 专属**的账号属性：
             // 其他家的适配器不读这个字段，允许设置只会让用户以为改了有用。
-            if record.provider()
-                != crate::server::core::providers::DEFAULT_PROVIDER_ID
-            {
+            //
+            // 判据用 `is_workbuddy_family`（**两个地区都算**）：拆家后国际版是
+            // 独立 provider（`workbuddy-intl`），写死 `DEFAULT_PROVIDER_ID` 会
+            // 把国际版账号一并拒掉 —— 而身份与地区是正交的两维（同一个账号 =
+            // 一个地区 × 一个身份，见 `workbuddy::identity` 的模块头），
+            // 国际版三种身份同样各自一条配额线。
+            if !crate::server::core::providers::workbuddy::is_workbuddy_family(
+                &record.provider(),
+            ) {
                 return Err(AccountStoreError::bad_request(
                     "出站身份（WB / VSC / CLI）只适用于 WorkBuddy 账号",
                 ));
@@ -1011,5 +1017,44 @@ mod tests {
         let patch = json!({ "priority": 5 }).as_object().unwrap().clone();
         AccountStore::apply_patch(&mut record, &patch, no_holder).unwrap();
         assert_eq!(record.get("nameCustom"), None);
+    }
+
+    /// 出站身份（`product`）是 **WorkBuddy 系两家共有**的账号属性。
+    ///
+    /// 拆家后国际版是独立 provider（`workbuddy-intl`）—— 判据写死
+    /// `DEFAULT_PROVIDER_ID` 会把国际版账号一并拒掉（真实回归：界面上国际版
+    /// 账号的出站身份按钮消失，后端即使被直调也会 400）。身份与地区正交，
+    /// 两地账号都必须可设；其余家仍必须被拒。
+    #[test]
+    fn product_patch_accepts_both_workbuddy_regions_only() {
+        let no_holder = |_| Ok(None);
+        let patch = json!({ "product": "vsc" }).as_object().unwrap().clone();
+
+        for provider in ["workbuddy", "workbuddy-intl"] {
+            let mut record = StoredAccount::from_map(
+                json!({ "id": "a1", "provider": provider })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            let changes = AccountStore::apply_patch(&mut record, &patch, no_holder)
+                .unwrap_or_else(|error| panic!("{provider} 应当可以设出站身份：{}", error.message));
+            assert_eq!(record.get("product"), Some(&json!("vsc")), "{provider}");
+            assert_eq!(changes, vec!["出站身份 → VSCode 插件"], "{provider}");
+        }
+
+        // 别家：明确拒绝（它们的适配器不读这个字段）
+        for provider in ["raccoon", "loomy", "lobsterai", "minimax", "kuku"] {
+            let mut record = StoredAccount::from_map(
+                json!({ "id": "a1", "provider": provider })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            let error = AccountStore::apply_patch(&mut record, &patch, no_holder)
+                .expect_err(&format!("{provider} 不该可以设出站身份"));
+            assert_eq!(error.status_code, 400, "{provider}");
+            assert_eq!(record.get("product"), None, "{provider}");
+        }
     }
 }

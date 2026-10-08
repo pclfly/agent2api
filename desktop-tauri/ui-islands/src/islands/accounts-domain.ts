@@ -175,6 +175,21 @@ export function providerOf(account: AccountRecord | null | undefined): string {
   return typeof id === 'string' && id ? id : DEFAULT_PROVIDER_ID
 }
 
+/**
+ * 这个 provider 是不是 WorkBuddy 系（国内版 / 国际版两家都算）。
+ *
+ * 拆家后两个地区是**两家独立 provider**（`workbuddy` / `workbuddy-intl`，见后端
+ * `providers::workbuddy::region`），而「出站身份」这类能力是**两家共有**的
+ * —— 写 `provider === 'workbuddy'` 会把国际版账号一并挡掉。
+ * 与后端 `workbuddy::is_workbuddy_family` 同款（那边是唯一判据来源）。
+ *
+ * ⚠️ 只用在「两家共有」的判定上；需要区分地区的地方（目录、账号队列、
+ * 模型规则）用 provider id 本身，别在这里问「是不是一家」。
+ */
+export function isWorkbuddyFamily(providerId: string | undefined): boolean {
+  return providerId === 'workbuddy' || providerId === 'workbuddy-intl'
+}
+
 /** provider id → 能力表（未登记的家走 GENERIC_FEATURES） */
 export function providerFeatures(providerId: string | undefined): ProviderFeatures {
   return (providerId && PROVIDER_FEATURES[providerId]) || GENERIC_FEATURES

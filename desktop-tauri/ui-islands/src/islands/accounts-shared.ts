@@ -87,7 +87,7 @@ export type AccountRecord = {
   /** 自定义账号：是否声明了「该上游无需鉴权」（与 `hasApiKey` 互斥，见后端 `state::no_auth`） */
   noAuth?: boolean
   maxConcurrent?: number
-  /** 出站身份（workbuddy 专属，缺省 `wb`）：`wb` / `vsc` / `cli` —— 见 identity-dialog.tsx */
+  /** 出站身份（WorkBuddy 系两家共有，缺省 `wb`）：`wb` / `vsc` / `cli` —— 见 identity-dialog.tsx */
   product?: string
   productLabel?: string
   checkinAt?: number
