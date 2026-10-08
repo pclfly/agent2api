@@ -166,8 +166,8 @@ impl AuthService {
     /// 而不是全局队首 —— 否则「只有 raccoon 账号」的机器上，
     /// workbuddy 的默认登录态会借到 raccoon 账号的凭证（发出去必然 401）。
     ///
-    /// 环境变量旁路（`WORKBUDDY_TOKEN`）是 **workbuddy 专属**：只有 scope 是
-    /// workbuddy 时才认它（see `env_session`）。
+    /// 环境变量旁路（`WORKBUDDY_TOKEN` / `WORKBUDDY_INTL_TOKEN`）是
+    /// **WorkBuddy 系专属**：只有 scope 落在这一系时才认它（see `env_session`）。
     pub async fn get_current_session_for(
         &self,
         provider: &str,
@@ -180,9 +180,16 @@ impl AuthService {
         &self,
         scope: Option<&str>,
     ) -> Result<Option<Value>, WorkBuddyAuthError> {
-        // 环境变量凭证只属于 workbuddy（WORKBUDDY_TOKEN）
+        // 环境变量凭证只属于 WorkBuddy 系（国内版 `WORKBUDDY_TOKEN`、
+        // 国际版 `WORKBUDDY_INTL_TOKEN`，见 `workbuddy::Region::env_token`）。
+        //
+        // 判据用 `is_workbuddy_family`（**两个地区都算**）：拆家后国际版是独立
+        // provider（`workbuddy-intl`），写死 `DEFAULT_PROVIDER_ID` 会让
+        // 「只配了 `WORKBUDDY_INTL_TOKEN`、账号库里一条记录都没有」的脚本 / CI
+        // 用户在这一层直接 401（适配器自己那条 `Region::env_token` 路径虽然认，
+        // 但 `rotate::session_for` 走的是这里）。
         let env_applies = scope
-            .map(|provider| provider == crate::server::core::providers::DEFAULT_PROVIDER_ID)
+            .map(crate::server::core::providers::workbuddy::is_workbuddy_family)
             .unwrap_or(true);
         if env_applies {
             if let Some(session) = Self::env_session() {
