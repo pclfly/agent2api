@@ -275,6 +275,48 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task_state, "authUrl": auth_url,
             "edition": task_edition, "provider": "trae" }));
     }
+    // LobsterAI：**网页登录 + 本机回调监听**（授权地址由本进程现造：先绑
+    // 回调端口，再拼 portal URL，见 `core::login::lobsterai`）。响应形状与
+    // 另外几条登录链一致（`{state, authUrl, edition, provider}`）。
+    //
+    // 授权地址是**纯本地拼接**（不依赖上游网络），因此等待上限用通用值即可。
+    if kind == crate::server::core::providers::ProviderKind::LobsterAi {
+        let handle = match state.login().start_lobsterai_login() {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let (task_state, auth_url, task_edition) = match state
+            .login()
+            .wait_for_auth_url(&handle, Duration::from_millis(AUTH_URL_WAIT_MS))
+            .await
+        {
+            Ok(values) => values,
+            Err(error) => {
+                logging::log("[Login]", &format!("❌ 发起 LobsterAI 登录失败: {error}"));
+                return management_error(502, error);
+            }
+        };
+        return ok_json(json!({ "state": task_state, "authUrl": auth_url,
+            "edition": task_edition, "provider": "lobsterai" }));
+    }
+    // MiniMax：**设备授权登录**（OAuth 设备码 + PKCE，与 Qoder / Cline 同形）。
+    // 同步问上游要 user_code 与授权页地址（一次 POST），把地址交给界面打开；
+    // 用户确认后由后台任务轮询换令牌。响应形状与另外几条登录链一致
+    // （`{state, authUrl, edition, provider}`），前端不需要新分支。
+    if kind == crate::server::core::providers::ProviderKind::Minimax {
+        let name = payload
+            .as_ref()
+            .and_then(|payload| payload.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
+        let handle = match state.login().start_minimax_device_login(name).await {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
+            "edition": task.edition, "provider": "minimax" }));
+    }
     // Cline：**设备授权登录**（WorkOS RFC 8628）。形态上介于「网页登录」与
     // 「Qoder 设备授权」之间：同步问上游要 user_code 与授权页地址（一次 POST），
     // 把地址交给界面打开；用户确认后由后台任务轮询换令牌。
@@ -636,32 +678,38 @@ fn autoclaw_region_of(payload: &Value) -> crate::server::core::providers::autocl
         .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn)
 }
 
-/// 发送短信验证码（**AutoClaw 国内版专用**，手机号验证码登录的第一步）。
+/// 发送短信验证码（**AutoClaw 国内版 / Loomy 共用入口**，手机号验证码登录第一步）。
 ///
 /// ── 为什么这不是「网页登录」──────────────────────────────────
 /// 另外两家的网页登录形态是「开登录窗口 → 用户登录 → 回调带授权码 → 换凭证」。
 /// AutoClaw 国内版没有这条路（详见 `providers::autoclaw::login` 的模块头：
 /// 桌面端没有公网 Web 应用、账号体系里没有授权码，它的唯一入口是手机号 +
-/// 验证码；国际版反过来，只有 OAuth 网页登录）。因此这里既不开窗口也不起任务，
+/// 验证码；国际版反过来，只有 OAuth 网页登录）。Loomy 同样没有网页登录
+/// （短信验证码是官方主路径）。因此这里既不开窗口也不起任务，
 /// 就是**一次同步的上游调用**。
 ///
-/// body `{phone, provider?}` → `{deviceId}`。
+/// body `{phone, provider?}` → AutoClaw 回 `{deviceId}`；Loomy 回 `{msgid}`。
 ///
-/// ── 为什么把 deviceId 回给前端 ──────────────────────────────
-/// 上游把「发的这个码」绑在发码时的 device_id 上，登录必须带同一个 ——
-/// 但网关不替用户保存这个中间态（一次登录可以跨多次 HTTP 请求、也可以被用户
-/// 放弃，存在服务端只会多一份要清理的状态）。回给前端让它随下一次请求带回，
-/// 是这里最省事又不丢正确性的做法。
-///
-/// ── 地区从哪来（`provider` 字段）────────────────────────────
-/// 两个地区的接口是**同一个路径、两个站点**，因此「发给哪一家」由请求带上来
-/// （前端把它要添加的那一家的 provider id 原样放进 `provider`，与
-/// `POST /api/accounts` 的字段同名同语义；缺省与未知值落国内版）。
-/// 但**只有国内版能走通**：国际版的手机验证码入口已从界面移除，带国际版进来
-/// 会在核心层被明确拒绝（理由见 `ensure_sms_region`）。
+/// ── 按 provider 分派 ────────────────────────────────────────
+/// `provider` 字段（与 `POST /api/accounts` 同名同语义）决定发到哪一家：
+///   - `loomy` → 讯飞 CAccount（HMAC-SHA1 签名，回 `msgid`）；
+///   - 缺省 / 其它 → AutoClaw（两个地区是同一路径两个站点，地区从
+///     `provider` 反查；缺省与未知值落国内版 —— 老客户端不带这个字段，
+///     而那些用户本来就在用国内版）。
 pub async fn login_sms_send(body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
     let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    let provider = payload.get("provider").and_then(Value::as_str).unwrap_or("");
+    // Loomy：讯飞短信登录（发码返回 msgid，登录时原样带回）
+    if provider == crate::server::core::providers::loomy::PROVIDER_ID {
+        return match crate::server::core::providers::loomy::oauth::send_sms_code(phone).await {
+            Ok(msgid) => ok_json(json!({ "msgid": msgid })),
+            Err(error) => {
+                logging::log("[Login]", &format!("❌ Loomy 发送验证码失败: {}", error.message));
+                management_error(i32::from(error.http_status().as_u16()), error.message)
+            }
+        };
+    }
     let region = autoclaw_region_of(&payload);
     match crate::server::core::providers::autoclaw::login::send_code(region, phone).await {
         Ok(result) => ok_json(result),
@@ -669,19 +717,60 @@ pub async fn login_sms_send(body: Bytes) -> Response {
     }
 }
 
-/// 用手机号 + 验证码登录并**直接落成账号**（**AutoClaw 国内版专用**）。
+/// 用手机号 + 验证码登录并**直接落成账号**（**AutoClaw 国内版 / Loomy 共用入口**）。
 ///
-/// body `{phone, code, deviceId?, name?, provider?}` → `{account, list}` ——
-/// 响应形状与 `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的方式，
-/// 落盘、命名、去重、优先级分配全部复用既有的添加路径
-/// （`add_autoclaw_account`），前端因此可以直接把结果交给同一个
-/// 「已添加账号」收尾逻辑。`provider` 的语义见 `login_sms_send`。
+/// body `{phone, code, deviceId?, msgid?, name?, provider?}` → `{account, list}`
+/// —— 响应形状与 `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的
+/// 方式，落盘、命名、去重、优先级分配全部复用既有的添加路径
+/// （`add_autoclaw_account` / `add_loomy_account`），前端因此可以直接把结果
+/// 交给同一个「已添加账号」收尾逻辑。
+///
+/// 按 `provider` 分派：`loomy` → 讯飞（校验 `msgid`）；其余 → AutoClaw
+/// （校验 `deviceId`；地区从 `provider` 反查，缺省落国内版）。
 pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
     let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
     let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
-    let device_id = payload.get("deviceId").and_then(Value::as_str);
+    let provider = payload.get("provider").and_then(Value::as_str).unwrap_or("");
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let store = state.store();
+    // Loomy：讯飞短信校验 → 落账号（与 AutoClaw 同一条落盘收尾）
+    if provider == crate::server::core::providers::loomy::PROVIDER_ID {
+        let msgid = payload.get("msgid").and_then(Value::as_str).unwrap_or("");
+        let credential = match crate::server::core::providers::loomy::oauth::login_with_code(
+            phone,
+            code,
+            msgid,
+            logging::now_ms(),
+        )
+        .await
+        {
+            Ok(credential) => credential,
+            Err(error) => {
+                logging::log("[Login]", &format!("❌ Loomy 短信登录失败: {}", error.message));
+                return management_error(i32::from(error.http_status().as_u16()), error.message);
+            }
+        };
+        // 备注名：用户显式填的优先；没填则用脱敏手机号（落盘时兜底）
+        return match store.add_loomy_account(&credential, name.as_deref(), "web") {
+            Ok(account) => {
+                let label = account
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Loomy 账号");
+                logging::log("[Login]", &format!("✅ Loomy 登录成功: {label}"));
+                ok_json(json!({ "account": account, "list": store.list_accounts() }))
+            }
+            Err(error) => super::accounts::store_error(error),
+        };
+    }
     let region = autoclaw_region_of(&payload);
+    let device_id = payload.get("deviceId").and_then(Value::as_str);
     let credentials = match crate::server::core::providers::autoclaw::login::login_with_code(
         region, phone, code, device_id,
     )
@@ -692,19 +781,12 @@ pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> 
         };
     // 备注名：用户显式填的优先；没填则用脱敏手机号（`130****4229`）——
     // 比默认的「账号 830290」更像用户自己认得出来的标识
-    let name = payload
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            credentials
-                .get("phoneTail")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    let store = state.store();
+    let name = name.or_else(|| {
+        credentials
+            .get("phoneTail")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     match store.add_autoclaw_account(region, &credentials, name.as_deref()) {
         Ok(account) => {
             let label = account

@@ -1,4 +1,4 @@
-/* Agent2API · 「手机验证码登录」交互引擎（当前只有 AutoClaw 国内版用）
+/* Agent2API · 「手机验证码登录」交互引擎（AutoClaw 国内版 / Loomy 共用）
 
    与小浣熊 / Qoder 的网页登录（web-login.js）是**两套东西**，不要合并：
 
@@ -7,9 +7,14 @@
 
    上游形态决定了这个差别 —— AutoClaw 国内版没有授权页、没有授权码回调
    （理由见 src-tauri/src/server/core/providers/autoclaw/login.rs 的模块头），
-   硬塞进网页登录引擎只会让那边多出一堆「这条路没有窗口也没有 state」的分支。
+   Loomy 同样没有网页登录（短信是官方主路径），硬塞进网页登录引擎只会让
+   那边多出一堆「这条路没有窗口也没有 state」的分支。
    国际版的手机验证码入口已从添加账号弹窗移除（它只有 Zai / Google 网页登录），
-   因此这个引擎现在只服务国内版：手机号规则只有大陆那一种，没有地区分叉。
+   因此这个引擎只服务大陆手机号：手机号规则只有那一种，没有地区分叉。
+
+   两家在「发码 → 登录」之间要带回的中间态不同（AutoClaw 是 deviceId、
+   Loomy 是 msgid），引擎把两个字段都留着、登录时都带上 —— 后端按 provider
+   读各自需要的那个。
 
    依赖 app.js 的顶层全局（经典 script 的顶层声明在全局可见）：$ / toast /
    __TAURI_INTERNALS__ 的 api_request。脚本顺序见 index.html：与 web-login.js
@@ -37,8 +42,10 @@
     const codeInput = () => $(`${prefix}-sms-code`);
     const nameInput = () => $(`${prefix}-sms-name`);
 
-    /** 最近一次发码的 deviceId（发码成功后才写入，见下） */
+    /** 最近一次发码的 deviceId（AutoClaw；发码成功后才写入） */
     let deviceId = '';
+    /** 最近一次发码的 msgid（Loomy；发码成功后才写入） */
+    let msgid = '';
     /** 发码与登录共用一把锁：两个按钮都打上游，不能并点 */
     let busy = false;
 
@@ -179,11 +186,13 @@
         // provider 照带：这条链路只服务国内版，但把值显式传上去之后，后端能对
         // 「传了国际版」的请求给出明确拒绝，而不是静默发到国内版站点去
         const data = await request('/api/session/login/sms/send', { phone, provider: prefix });
-        // ── deviceId 为什么要留住 ─────────────────────────────────
-        // 上游把「刚发的这个码」绑在发码时的 device_id 上，登录必须带同一个。
+        // ── 中间态为什么要留住 ─────────────────────────────────
+        // AutoClaw：上游把「刚发的这个码」绑在发码时的 device_id 上，登录必须带同一个。
+        // Loomy：上游回一个 msgid，校验时必须原样带回。
         // 存在这个闭包里而不是每次现取，也不放进模块级状态 —— 它只在这两次
         // 点击之间有意义，放进模块级会在用户切换提供商后串味。
         deviceId = data?.deviceId || '';
+        msgid = data?.msgid || '';
         window.wbApp.toast('验证码已发送，请查看短信');
         setHint('验证码已发送。收到后填入下方并点「登录并添加」');
         // 成功也进冷却：官方口径（见 RESEND_COOLDOWN_SECONDS 的说明）
@@ -216,9 +225,10 @@
       setHint('');
       try {
         const payload = { phone, code, provider: prefix };
-        // deviceId 缺省时不传：后端会现生成一个（上游接受「新设备直接登录」），
-        // 传空串反而会覆盖掉那个兜底
+        // 缺省时不传：后端会现生成一个（AutoClaw 接受「新设备直接登录」），
+        // 传空串反而会覆盖掉那个兜底；Loomy 的 msgid 缺失时后端会明确拒绝。
         if (deviceId) payload.deviceId = deviceId;
+        if (msgid) payload.msgid = msgid;
         const name = nameInput()?.value.trim() || '';
         if (name) payload.name = name;
         const data = await request('/api/session/login/sms/verify', payload);
@@ -226,6 +236,7 @@
         const codeNode = codeInput();
         if (codeNode) codeNode.value = '';
         deviceId = '';
+        msgid = '';
         await config.onSuccess?.(data);
       } catch (error) {
         const reason = describeError(error);

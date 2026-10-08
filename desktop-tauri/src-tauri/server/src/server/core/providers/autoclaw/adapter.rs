@@ -475,6 +475,20 @@ impl ProviderAdapter for AutoClawAdapter {
         }
     }
 
+    /// 凭证里的 `expiresAt`（毫秒；没有 → None）。
+    ///
+    /// 给凭证自动维护算「维护窗口」用（见 trait 的说明）：转发窗口是 5 分钟，
+    /// 维护间隔默认 10 分钟 —— 没有这一项时，两次维护之间到期的凭证会漏刷。
+    /// 每小时的强制刷新（`hourly_forced_refresh_due`）仍由
+    /// `credentials_expiring` 单独负责，两者是**叠加**关系（维护模块取并集）。
+    fn credentials_expires_at_ms(&self, store: &AccountStore, account_id: &str) -> Option<i64> {
+        if account_id.is_empty() {
+            return None;
+        }
+        let credentials = resolve_credentials(self.region, store, account_id).ok()?;
+        credentials.expires_at.map(|value| value as i64)
+    }
+
     /// AutoClaw 有积分 / 订阅概念：资产钱包 + `subscribe-info`（`autoclaw/balance.rs`）。
     fn supports_usage(&self) -> bool {
         true

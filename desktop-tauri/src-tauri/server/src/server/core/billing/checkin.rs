@@ -61,12 +61,22 @@ impl std::fmt::Display for CheckinError {
     }
 }
 
-/// 国际版没有签到活动，签到相关操作一律排除该版本账号
-/// （Node: `account.edition !== 'intl'`）。
+/// 签到 / 打卡范围：这一家在这条链路上有没有可做的动作。
 ///
-/// **Qoder 也吃这条判据**：它的公开账号形态带 `edition`（`account_store` 把
-/// `Region::edition()` 写进公开字段，global → `intl`），而签到活动只有中国版有
-/// （国际版的 legacy 签到路径 404、活动列表里只有促销），于是「非 intl」这一条
+/// ── 国际版 WorkBuddy 现在也**在范围内**（2026-10）─────────────
+/// 国际版没有国内站那种每日签到接口，但官方另有一条「每日活跃」奖励，
+/// 认的是**跑完的网页端 agent 会话**（实测：桌面身份发 `chat/completions`
+/// 不计数、只建会话不接沙箱也不计数）—— 实现见
+/// `providers::workbuddy::web_daily`。因此国际版 WorkBuddy 账号照常参与
+/// 「签到」这个动作，只是走的是活跃打卡那条链路。
+///
+/// **其它家的国际版仍然排除**：Qoder 国际版这个地区根本没有签到计划
+/// （legacy 路径 404、活动列表里只有促销）；Accio 系两个地区都没有活动
+/// （见下）。
+///
+/// ── Qoder 也吃这条判据 ──────────────────────────────────────
+/// 它的公开账号形态带 `edition`（`account_store` 把 `Region::edition()` 写进
+/// 公开字段，global → `intl`），而签到活动只有中国版有，于是「非 intl」这一条
 /// 刚好把国际版 Qoder 排除、放行中国版 —— 不需要为它再加一条 provider 特判。
 ///
 /// Accio 系（两个地区）**整家**也没有签到活动：上游客户端全包检索不到
@@ -78,7 +88,8 @@ impl std::fmt::Display for CheckinError {
 /// 令牌去打错的签到接口只会稳定报错（见那里的最后两条分支）。
 pub fn supports_checkin(account: &Value) -> bool {
     if account.get("edition").and_then(Value::as_str) == Some("intl") {
-        return false;
+        // 国际版里只有 WorkBuddy 有可做的动作（活跃打卡），其余整家排除
+        return crate::server::core::providers::workbuddy::web_daily::supports_daily_chat(account);
     }
     let provider = account
         .get("provider")
@@ -135,10 +146,11 @@ fn accounts_of(store: &AccountStore) -> Vec<Value> {
 
 /// 签到目标集合。
 ///
-/// 批量（`id` 为空）：可用账号 ∩ **提供商在 `providers` 范围内** ∩ 非国际版，
-/// `skipped` = 可用总数 − 可签到数。范围由配置给出（WorkBuddy / 小浣熊 / AutoClaw
-/// 可勾选），定时签到与账号页批量签到共用同一份口径。**禁用账号照常参与** ——
-/// 签到与转发是两件事（见模块头「签到不看 enabled」）。
+/// 批量（`id` 为空）：可用账号 ∩ **提供商在 `providers` 范围内** ∩ 该家/该版本
+/// 有可做的动作（[`supports_checkin`]），`skipped` = 可用总数 − 可签到数。
+/// 范围由配置给出（WorkBuddy / 小浣熊 / AutoClaw 可勾选），定时签到与账号页
+/// 批量签到共用同一份口径。**禁用账号照常参与** —— 签到与转发是两件事
+/// （见模块头「签到不看 enabled」）。
 ///
 /// 指定 id：命中即用（**不过滤 available，也不过滤 provider**），
 /// 国际版直接报 400 —— 用户点的是谁就签谁，与「显式指定就执行」的既有语义一致；
@@ -188,8 +200,11 @@ pub fn resolve_checkin_targets(
 /// 单个账号签到。已签到（上游非 0 code）不算错误，原样返回结果 ——
 /// 前端把「今天已签到」显示成一条 warn 提示。
 ///
-/// ── 按提供商分派（四家的接口互不相通）────────────────────────
-///   - **WorkBuddy**：计费服务的每日签到（`billing.claim_daily_checkin`）；
+/// ── 按提供商分派（各家的接口互不相通）───────────────────────
+///   - **WorkBuddy 国内版**：计费服务的每日签到（`billing.claim_daily_checkin`）；
+///   - **WorkBuddy 国际版**：每日活跃打卡 —— 桌面端轻量对话 + 网页通道 agent
+///     会话跑到 `completed`（`providers::workbuddy::web_daily`）。它**不是**签到：
+///     国际站没有那个接口，官方只认「跑完的网页端会话」；
 ///   - **小浣熊**：桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）；
 ///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin::claim_daily_signin`）；
@@ -242,11 +257,63 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "lobsterai" => {
+            // 三步链路（slot → context → check_in），客户端幂等键；
+            // 「已签到」「无活动」与「真失败」在实现内部分开（见 `lobsterai::checkin`）。
+            let claim =
+                crate::server::core::providers::lobsterai::checkin::claim_daily_checkin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "loomy" => {
+            // `POST /points/first-login`（触发每日额度初始化，消耗后不回补）；
+            // 幂等判据是响应体的 `alreadyProcessed`。
+            let claim =
+                crate::server::core::providers::loomy::checkin::claim_daily_quota(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "minimax" => {
+            // `signin/status` + `signin/claim`（必须带 timezone_id）；
+            // 幂等判据是响应体的 `claim_result`（1 = 真领取，2 = 已领过）。
+            let claim =
+                crate::server::core::providers::minimax::checkin::claim_daily_checkin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
         // 现在落到这里的未知家明确报「未接入」，新增一家时忘了加分支会立刻暴露。
         _ if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID => {
+            // 国际版：没有每日签到接口，官方奖励认的是「跑完的网页端 agent 会话」
+            // —— 走每日活跃打卡（桌面端轻量对话 + 网页通道，见 `web_daily`）
+            if crate::server::core::providers::workbuddy::web_daily::supports_daily_chat(account) {
+                // 今天已经打过卡就如实回一条中性结果：网页通道每跑一次都会**新建
+                // 一个 agent 会话**（真花额度），不像国内版签到那样由上游幂等挡掉
+                // —— 这里必须自己挡，否则用户多点两下就白烧几轮会话。
+                if checked_in_today(account) {
+                    return claim_result(
+                        id,
+                        name,
+                        &display,
+                        false,
+                        Ok(json!({
+                            "success": false,
+                            "alreadyCompleted": true,
+                            "msg": "今日已完成每日活跃打卡",
+                        })),
+                    );
+                }
+                let claim =
+                    crate::server::core::providers::workbuddy::web_daily::run_daily_chat(store, account)
+                        .await
+                        .map_err(|error| error.message);
+                return claim_result(id, name, &display, true, claim);
+            }
             let Some(entry) = store.get_session_by_id(&id) else {
                 return json!({
                     "id": id,
@@ -268,6 +335,28 @@ pub async fn checkin_for(
             "error": format!("{other} 的签到链路尚未接入"),
         }),
     }
+}
+
+/// 该账号今天是否已经签过 / 打过卡（`checkinAt` 落在**本地**今天）。
+///
+/// 只给「每跑一次都要花真额度」的动作用 —— 当前是国际版每日活跃打卡：
+/// 它每次都会新建一个网页端 agent 会话。国内版签到不需要这道闸：上游自己
+/// 幂等，重复调用只会返回「今日已签到」。
+///
+/// 判据与前端 `checkedInToday`（账号页把按钮置灰的那条）同源：都读后端落盘的
+/// `checkinAt`、都按本地自然日比较 —— 两处不一致会出现「按钮灰着但接口还能
+/// 再跑一遍」的缝。
+fn checked_in_today(account: &Value) -> bool {
+    let at = account.get("checkinAt").and_then(Value::as_i64).unwrap_or(0);
+    if at <= 0 {
+        return false;
+    }
+    let Some(moment) = chrono::DateTime::from_timestamp_millis(at) else {
+        return false;
+    };
+    let moment = moment.with_timezone(&chrono::Local);
+    crate::server::core::auto_checkin::local_date_key(moment)
+        == crate::server::core::auto_checkin::local_date_key(chrono::Local::now())
 }
 
 /// 把一次签到调用翻成统一的结果行（`{id, name, claim, error}`）。
@@ -384,7 +473,7 @@ pub async fn run_checkin(
     if skipped > 0 {
         logging::log(
             "[Accounts]",
-            &format!("已跳过 {skipped} 个账号（国际版无签到活动或不在签到范围内）"),
+            &format!("已跳过 {skipped} 个账号（该版本/该家没有可做的活动，或不在签到范围内）"),
         );
     }
     logging::log(
@@ -397,4 +486,25 @@ pub async fn run_checkin(
         "total": results.len(),
         "skipped": skipped,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 「今天已签过」按**本地自然日**判定 —— 国际版每日活跃打卡靠它挡掉重复的
+    /// agent 会话（每跑一次都是真额度）。
+    #[test]
+    fn checked_in_today_follows_the_local_calendar() {
+        let now = crate::server::logging::now_ms();
+        assert!(checked_in_today(&json!({ "checkinAt": now })));
+        // 25 小时前必然不在今天（避开跨日边界）
+        assert!(!checked_in_today(&json!({ "checkinAt": now - 25 * 60 * 60 * 1000 })));
+        // 没签过 / 非法值一律 false（不拦）
+        assert!(!checked_in_today(&json!({})));
+        assert!(!checked_in_today(&json!({ "checkinAt": 0 })));
+        assert!(!checked_in_today(&json!({ "checkinAt": -1 })));
+        assert!(!checked_in_today(&json!({ "checkinAt": "昨天" })));
+    }
 }

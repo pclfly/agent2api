@@ -569,6 +569,79 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             }
             store.add_trae_account(&credential, import_name, "manual")
         }
+        // LobsterAI（有道龙虾）：粘贴凭证 → 手动添加。
+        //
+        // 凭据形态兼容两种：本仓的 camelCase（accessToken / refreshToken /
+        // uid / uuid / firstKeyfrom / latestKeyfrom）与参考实现 `lobsterai2api`
+        // 落盘的 snake_case（access_token / refresh_token / …）—— 后者是用户
+        // 从既有工具迁移过来时手上最可能拿到的形状。
+        //
+        // `importDesktop` 不提供：本家没有可读的桌面端登录态文件（与 Accio /
+        // ZCode 同一处境），给了入口只会稳定失败。
+        Some(crate::server::core::providers::ProviderKind::LobsterAi) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "LobsterAI 不支持导入桌面端登录态，请用「网页登录」或粘贴凭证添加账号",
+                );
+            }
+            let credential = crate::server::core::providers::lobsterai::credentials::Credential::from_value(&payload);
+            if !credential.valid() && !credential.can_refresh() {
+                return management_error(
+                    400,
+                    "请填写 accessToken（转发用）；refreshToken 可选，填了到期可自动续期",
+                );
+            }
+            store.add_lobsterai_account(&credential, import_name, "manual")
+        }
+        // Loomy（讯飞）：粘贴 session → 手动添加；短信登录是另一条链路
+        // （`api::session` 的 sms 分派 → `loomy::oauth` → 同一个落账号入口
+        // `add_loomy_account`）。
+        //
+        // `importDesktop` 不提供：本家没有可读的桌面端登录态文件。
+        Some(crate::server::core::providers::ProviderKind::Loomy) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "Loomy 不支持导入桌面端登录态，请用「短信登录」或粘贴凭证添加账号",
+                );
+            }
+            let credential = crate::server::core::providers::loomy::credentials::Credential::from_value(&payload);
+            if !credential.valid() {
+                return management_error(
+                    400,
+                    "请填写 accessToken（讯飞 session，32 位小写 hex）",
+                );
+            }
+            store.add_loomy_account(&credential, import_name, "manual")
+        }
+        // MiniMax（中国版）：粘贴令牌 → 手动添加；设备码登录是另一条链路
+        // （`core::login` 的设备码分派 → 同一个落账号入口 `add_minimax_account`）；
+        // `importDesktop: true` → 导入客户端登录态
+        // （`~/.minimax/local-runtime.auth.json` 优先，只读、不代刷新）。
+        // 两条路径都会顺手查一次手机号当展示名（见 `providers::minimax::profile`）。
+        Some(crate::server::core::providers::ProviderKind::Minimax) => {
+            if import_desktop {
+                store.import_minimax_desktop_account(import_name).await
+            } else {
+                let mut credential = crate::server::core::providers::minimax::credentials::Credential::from_value(&payload);
+                if !credential.valid() && !credential.can_refresh() {
+                    return management_error(
+                        400,
+                        "请填写 accessToken（或 refreshToken）；两者都没有时请用「设备码登录」或「导入客户端登录态」",
+                    );
+                }
+                // 手机号（展示名用）：查不到不影响添加
+                if credential.phone.trim().is_empty() {
+                    if let Some(phone) =
+                        crate::server::core::providers::minimax::profile::try_query_phone(&credential).await
+                    {
+                        credential.phone = phone;
+                    }
+                }
+                store.add_minimax_account(&credential, import_name, "manual")
+            }
+        }
         Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
             store.add_account(&payload, None)
         }

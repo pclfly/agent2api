@@ -38,6 +38,7 @@ use serde_json::{json, Value};
 
 use crate::server::core::account_store::priority::{by_priority_order, normalize_priority};
 use crate::server::core::account_store::store_util::js_truthy;
+use crate::server::core::upstream::session_affinity;
 
 /// 「请求名 → 各家上游真名」的解析缓存：限额冷却键的解析器。
 ///
@@ -235,6 +236,22 @@ pub fn pick_account_by_priority(
     exclude_ids: &[String],
     now: i64,
 ) -> Option<Value> {
+    usable_candidates(accounts, keys, counts, exclude_ids, now)
+        .into_iter()
+        .next()
+}
+
+/// 本次可用的候选账号（过滤 + 按优先级排序）。
+///
+/// 过滤三道（顺序即语义）：未尝试过（`exclude_ids`）→ 可用（启用 + 未限流）
+/// → 未达并发上限。排序按全局优先级（唯一，写入侧保证）。
+fn usable_candidates(
+    accounts: &[Value],
+    keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
+    exclude_ids: &[String],
+    now: i64,
+) -> Vec<Value> {
     let mut candidates: Vec<Value> = accounts
         .iter()
         .filter(|account| {
@@ -251,11 +268,74 @@ pub fn pick_account_by_priority(
         })
         .cloned()
         .collect();
+    candidates.sort_by(compare_by_priority);
+    candidates
+}
+
+/// 按「**会话粘性 + 轮询**」挑选本次请求使用的账号（2026-10 新增；转发路径用）。
+///
+/// 与 [`pick_account_by_priority`]（严格优先级）的差别：
+///   1. **粘性命中**：`session_key` 有绑定且绑定账号仍可用（未排除 / 未冷却 /
+///      未达并发上限）→ 直接返回它。同一对话固定同一账号，prompt cache 才能
+///      命中（上游缓存是账号级的，实测见 `session_affinity` 模块头）；
+///      绑定失效（被排除 / 冷却 / 并发满 / 账号消失）→ 解绑，回落轮询。
+///   2. **轮询**：无粘性时，在按优先级排序后的候选列表上从「上次选中的账号」
+///      的**下一个**开始取（到尾部循环回头部）。优先级仍是顺序（谁排前面谁
+///      先被轮到），轮询负责把请求分摊到多个账号 —— 与 hub 的
+///      `AccountPool.pick`（纯轮询）同一意图，只是叠加在优先级序上。
+///   3. 选中后**绑定**会话键 + 记录轮询位置（下次接着往后轮）。
+///
+/// 无 `session_key`（没有 messages 的请求）时退化为纯轮询 —— 不再每次都用
+/// 队首账号。
+pub fn pick_account_for_session(
+    accounts: &[Value],
+    keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
+    exclude_ids: &[String],
+    now: i64,
+    session_key: Option<&str>,
+) -> Option<Value> {
+    let session_key = session_key.filter(|key| !key.is_empty());
+    // ── 1. 粘性命中 ──
+    if let Some(key) = session_key {
+        if let Some(bound_id) = session_affinity::affinity_get(key) {
+            let bound = accounts.iter().find(|account| {
+                account_id(account) == Some(bound_id.as_str())
+            });
+            let usable = bound.filter(|account| {
+                !exclude_ids.iter().any(|excluded| excluded == &bound_id)
+                    && account_usability(account, keys, now).usable
+                    && !at_concurrency_limit(account, &bound_id, counts)
+            });
+            if let Some(account) = usable {
+                return Some(account.clone());
+            }
+            // 绑定失效：解绑后走轮询（避免每轮都白查一次失效绑定）
+            session_affinity::affinity_unbind(key);
+        }
+    }
+    // ── 2. 轮询选择 ──
+    let candidates = usable_candidates(accounts, keys, counts, exclude_ids, now);
     if candidates.is_empty() {
         return None;
     }
-    candidates.sort_by(compare_by_priority);
-    candidates.into_iter().next()
+    let length = candidates.len();
+    let start = session_affinity::last_picked()
+        .and_then(|last| {
+            candidates
+                .iter()
+                .position(|account| account_id(account) == Some(last.as_str()))
+        })
+        .map(|index| (index + 1) % length)
+        .unwrap_or(0);
+    let picked = candidates[start].clone();
+    if let Some(id) = account_id(&picked).map(str::to_string) {
+        session_affinity::note_picked(&id);
+        if let Some(key) = session_key {
+            session_affinity::affinity_bind(key, &id);
+        }
+    }
+    Some(picked)
 }
 
 /// 该账号的在途请求数是否已达并发上限（`maxConcurrent == 0` = 不限，恒 false）。

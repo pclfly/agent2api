@@ -262,8 +262,19 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // Trae 必须显式列在这里：落进默认分支会拿到 WorkBuddy 的白名单，
         // 那张表**既没有** `trae.cn`（授权页）**也没有** `127.0.0.1`（回调），
         // 症状正是本文件上面警告的那种 —— 窗口一片空白，日志什么也看不出。
+        //
+        // LobsterAI 同理：授权页在 `lobsterai.youdao.com`，而回调落在本机
+        // 随机端口（`http://127.0.0.1:<port>/auth/callback`，见
+        // `providers::lobsterai::oauth`）—— 白名单拦下回调的后果与 Trae 一样：
+        // 用户在官方页面明明登录成功，网关却永远等不到码。
+        //
+        // MiniMax 同样不设限：授权页在 `account.minimax.cn`，它会按用户选择的
+        // 登录方式（MiniMax 账号 / 手机号 / 第三方）继续跳到不可穷举的身份
+        // 提供方 —— 与 Qoder / AutoClaw 同一情形。**必须显式列出** ——
+        // 落进默认分支会拿到 WorkBuddy 的白名单，症状是窗口白屏。
         "catpaw" | "qoder" | "cline-free" | "cline-pass" | "autoclaw" | "autoclaw-intl"
-        | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae" => None,
+        | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae" | "lobsterai"
+        | "minimax" => None,
         _ => Some(WORKBUDDY_ALLOWED_HOSTS),
     }
 }
@@ -434,6 +445,15 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 上游把这个地址按正则逐字校验），所以窗口**必须允许**导航到本机端口，
         // 否则用户点完授权、回调请求根本发不出去（见下面 allowed_hosts 的同一条）。
         "trae" => Ok("trae"),
+        // LobsterAI：授权地址由**后端**现拼（本地回调监听器的随机端口 + state，
+        // 见 `providers::lobsterai::oauth`），壳侧只负责开窗口与轮询 —— 与 Trae
+        // 同一条路。它的回调落在 `http://127.0.0.1:<随机端口>/auth/callback`，
+        // 所以窗口同样必须放行本机端口（见 allowed_hosts）。
+        "lobsterai" => Ok("lobsterai"),
+        // MiniMax：授权地址由**后端**问上游拿（OAuth 设备码，见
+        // `providers::minimax::oauth`），壳侧只负责开窗口与轮询 —— 与 Qoder /
+        // Cline 的设备授权同一条路。
+        "minimax" => Ok("minimax"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -725,6 +745,10 @@ pub async fn start(
         // Trae 只有一家（国内 SOLO 通道；国际版是另一套协议、另立 provider id），
         // 品牌名里不需要地区
         "trae" => "Trae",
+        // LobsterAI 只有一家（没有地区分叉）
+        "lobsterai" => "LobsterAI",
+        // MiniMax 只有一家（当前只接中国版；国际版将来另立 provider id）
+        "minimax" => "MiniMax",
         _ => "WorkBuddy",
     };
     // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae 的单一家
@@ -732,7 +756,8 @@ pub async fn start(
     // 账号」「登录 ZCode 国内版 国内版账号」这种说不通的标题）
     let title = if matches!(
         provider,
-        "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae"
+        "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "lobsterai"
+            | "minimax"
     ) {
         format!("登录 {provider_label} 账号")
     } else {

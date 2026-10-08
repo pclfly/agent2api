@@ -15,6 +15,20 @@
 //! 现在这条判断收进 `ProviderAdapter::credentials_expiring`，加一家 provider
 //! 不必再改本模块，也不会再出现「字段名对不上」的静默失效。
 //!
+//! ── 维护窗口为什么是「间隔 + 余量」而不是各家那个 5 分钟 ──────
+//! 各家那 5 分钟是**转发**语义（「快过期了才刷」），而本模块是**周期性**动作。
+//! 窗口小于间隔时会留出一段空窗：凭证在第 6 分钟进入窗口、第 11 分钟过期，维护
+//! 却在第 5 分钟（还没临期 → 跳过）与第 15 分钟（已过期 4 分钟）各跑一次 ——
+//! 转发不受影响（请求链路的懒刷新兜底），但账号页会白白显示一段「已过期」，
+//! 正是本模块要消掉的那类问题。
+//!
+//! 因此维护目标由**两个判据取并集**决定：
+//!   1. `ProviderAdapter::credentials_expiring`（各家的转发窗口 + 低频兜底）；
+//!   2. `ProviderAdapter::credentials_expires_at_ms` 落在**维护窗口**内
+//!      （= 维护间隔 + 5 分钟余量，见 [`maintenance_window_ms`]）。
+//! 判据 2 让「只要维护任务在跑，账号页就不会出现已过期」成立；判据 1 保留各家
+//! 的特殊兜底（Cline 的 25 分钟、AutoClaw 的每小时强制刷新）。
+//!
 //! ── 为什么先过滤再刷新（重要）────────────────────────────────
 //! 先过 `supports_refresh()` 与 `credentials_expiring()` 两道闸，再动手调
 //! `refresh_access_token`。理由：那个方法对「没有续期手段」的家会返回 Err
@@ -102,6 +116,8 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
     // 界面上逐条对照时，顺序一致省掉一次按 id 重排。
     let mut slots: Vec<Option<Value>> = vec![None; accounts.len()];
     let mut pending: Vec<(usize, String, ProviderKind)> = Vec::new();
+    // 维护窗口在循环外算一次：它只取决于配置（间隔），与具体账号无关
+    let window_ms = maintenance_window_ms();
     for (index, account) in accounts.iter().enumerate() {
         let id = account
             .get("id")
@@ -134,8 +150,18 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
             continue;
         }
         // 临期判定的详细理由见 trait 的 `credentials_expiring`：
-        // 判不出来（没有过期信息 / 账号不存在 / 没有 refreshToken）一律 false
-        if !adapter.credentials_expiring(store, &id) {
+        // 判不出来（没有过期信息 / 账号不存在 / 没有 refreshToken）一律 false。
+        //
+        // 两条判据取**并集**（见模块头的「维护窗口」一节）：
+        //   1. 各家自己的临期判定（含 Cline 25 分钟、AutoClaw 每小时这类低频兜底）；
+        //   2. 过期时间落在维护窗口内 —— 这条保证「下一轮维护之前会过期」的凭证
+        //      这一轮就被刷掉，不会出现「维护跑完没多久就显示已过期」。
+        let expiring = adapter.credentials_expiring(store, &id)
+            || adapter
+                .credentials_expires_at_ms(store, &id)
+                .map(|expires_at| expires_at - crate::server::logging::now_ms() <= window_ms)
+                .unwrap_or(false);
+        if !expiring {
             slots[index] = Some(skipped(&id, provider, "凭证未过期或临期"));
             continue;
         }
@@ -247,6 +273,37 @@ fn skipped(id: &str, provider: &str, reason: &str) -> Value {
     })
 }
 
+/// 维护窗口（毫秒）：**维护间隔 + 5 分钟余量**，取自 config 的
+/// `scheduledTasks.credentialMaintenance.interval`。
+///
+/// ── 为什么必须大于间隔（充要条件）───────────────────────────
+/// 维护是周期性动作，间隔默认 10 分钟；而各家的转发窗口只有 5 分钟。窗口
+/// 小于间隔时，两次维护之间存在一段「没人看」的空窗 —— 凭证在第 6 分钟进入
+/// 窗口、第 11 分钟过期，维护却在第 5 分钟（还没临期 → 跳过）与第 15 分钟
+/// （已过期 4 分钟）各跑一次。窗口取「间隔 + 余量」后，**每一轮维护都能看到
+/// 下一轮之前会过期的凭证**，于是「只要维护任务在跑，账号页就不会显示已过期」。
+///
+/// ── 余量 5 分钟覆盖什么 ─────────────────────────────────────
+///   1. 调度判定粒度：`scheduled_tasks::TICK_MS` = 10 秒，即「到点后最多晚 10 秒」；
+///   2. 单轮维护自身的耗时：串行刷新 N 个账号，每个一次上游往返（几秒到几十秒）。
+///
+/// ── 窗口变长会不会让刷新变频繁 ──────────────────────────────
+/// 不会。刷新成功后过期时间整体后移，同一个凭证在一轮里只会被刷一次；
+/// 窗口只决定「提前多久刷」，不改变「每 M 分钟刷一次」这个频率（M = 凭证寿命）。
+/// 唯一的例外是凭证寿命本身小于窗口的家（那种家本来就必须每轮都刷）。
+pub fn maintenance_window_ms() -> i64 {
+    window_from_interval_minutes(
+        crate::server::config::scheduled_settings()
+            .credential_maintenance
+            .interval,
+    )
+}
+
+/// [`maintenance_window_ms`] 的纯函数形态（可单测）：`max(间隔, 1 分钟) + 5 分钟`。
+fn window_from_interval_minutes(interval_minutes: i64) -> i64 {
+    interval_minutes.max(1) * 60_000 + 5 * 60_000
+}
+
 /// 手动维护跑完后的排期顺延（`POST /api/accounts/refresh-expiring` 调用）。
 ///
 /// 与余额查询同一口径：手动动作已经真打了一轮上游，把定时那轮往后推一个间隔，
@@ -262,5 +319,45 @@ pub fn note_manual_run() {
         interval,
     ) {
         logging::verbose("[Accounts]", &format!("凭证维护排期顺延失败：{error}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 维护窗口必须**恒大于**间隔 —— 这是「不漏刷」的充要条件
+    /// （窗口 ≤ 间隔时，两次维护之间总有凭证悄悄过期）。
+    #[test]
+    fn window_always_exceeds_the_interval() {
+        for interval in [1, 5, 10, 15, 30, 60, 120, 24 * 60] {
+            let window = window_from_interval_minutes(interval);
+            assert!(
+                window > interval * 60_000,
+                "间隔 {interval} 分钟时窗口只有 {window} ms，会漏刷"
+            );
+        }
+    }
+
+    #[test]
+    fn window_is_interval_plus_five_minutes() {
+        // 默认配置：间隔 10 分钟 → 15 分钟窗口
+        assert_eq!(window_from_interval_minutes(10), 15 * 60_000);
+        // 用户把间隔调到 30 分钟 → 窗口跟着变 35 分钟（不会「改了间隔又漏」）
+        assert_eq!(window_from_interval_minutes(30), 35 * 60_000);
+        // 非法 / 0 值按 1 分钟兜底（与 `scheduled_tasks::interval_ms` 的 max(1) 同口径）
+        assert_eq!(window_from_interval_minutes(0), 6 * 60_000);
+        assert_eq!(window_from_interval_minutes(-5), 6 * 60_000);
+    }
+
+    /// 运行期取的是配置值：默认（10 分钟）下窗口应落在 15 分钟附近。
+    #[test]
+    fn runtime_window_uses_configured_interval() {
+        let window = maintenance_window_ms();
+        assert!(window >= 6 * 60_000, "窗口不应小于 6 分钟，实际 {window}");
+        assert!(
+            window <= 24 * 60 * 60_000 + 5 * 60_000,
+            "窗口不应超过间隔上限 + 余量，实际 {window}"
+        );
     }
 }

@@ -7,6 +7,7 @@
 //!
 //! 只访问 127.0.0.1 上的明文 HTTP，不需要 TLS。
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -99,6 +100,41 @@ fn configured_port() -> Option<u16> {
 /// 改了设置也不会生效，只会让用户白忙一场）
 pub fn port_from_env() -> Option<u16> {
     env_port("AGENT2API_PROXY_PORT").or_else(|| env_port("WORKBUDDY_PROXY_PORT"))
+}
+
+/// 监听地址：`AGENT2API_HOST` 显式覆盖，默认只监听本机回环。
+///
+/// ── 为什么默认值仍是 127.0.0.1（不跟随 headless 的 0.0.0.0）────
+/// 桌面形态的管理 API 是**免鉴权**的：一把启用的 Key 都没有时，`/api/*` 与
+/// `/v1/*` 全部放行（见 `server::http::require_api_key` 的分支）。这条语义
+/// 成立的前提正是「只监听回环」。默认放开等于把账号、日志、转发额度交给同
+/// 网段所有人 —— 而 headless 形态的宿主是容器 / 服务器，绑回环会让端口映射
+/// 直接失效，两者的取舍相反，所以这里刻意不同（对照 `agent2api-server` 的
+/// 模块头「监听地址」一条）。
+///
+/// ── 要让别的机器访问 ────────────────────────────────────────
+/// 设 `AGENT2API_HOST=0.0.0.0`（或指定某张网卡的 IP），**并先在「网关 Key」
+/// 页建一把 API Key**：配了 Key 之后 `/api/*` 与 `/v1/*` 都要认证，桌面壳
+/// 自己会自动带上（见本模块 `read_api_key`），局域网里其他客户端则必须显式
+/// 提供。没配 Key 就绑非回环时，`backend::ensure_ready` 会往日志里打一条
+/// 警告。
+///
+/// 非法值不静默回落：用户把 `0.0.0.0` 拼错（写成 `0.0.0.0/0`、`*` 之类）时，
+/// 静默听回环会让「别的机器连不上」变成一个完全没有线索的故障。
+pub fn bind_host() -> IpAddr {
+    match std::env::var("AGENT2API_HOST") {
+        Ok(value) if !value.trim().is_empty() => match value.trim().parse() {
+            Ok(host) => host,
+            Err(_) => {
+                crate::server::logging::log(
+                    "[Server]",
+                    &format!("⚠️  AGENT2API_HOST 不是合法 IP（{value}），已回落 127.0.0.1"),
+                );
+                IpAddr::from([127, 0, 0, 1])
+            }
+        },
+        _ => IpAddr::from([127, 0, 0, 1]),
+    }
 }
 
 /// 读环境变量里的端口：未设置 / 非数字 / 0 一律当未设置（回落到下一级）

@@ -46,6 +46,13 @@ export type ManageModel = {
   refreshedAt?: unknown
   credits?: unknown
   /**
+   * 版本（`cn` / `intl`）—— 只有 WorkBuddy 会给：它一家有**两条**清单
+   * （上游两个站点下发的模型与倍率都不同，见后端 `models::EDITION_CN`）。
+   * 表格按 `(provider, edition)` 分组，否则两个版本的模型会被并成一组、
+   * 只显示先出现的那个版本的名字与倍率。其余家为空串。
+   */
+  edition?: string
+  /**
    * 对下游声明的能力位（生效值：清单原值 + 用户覆盖）。内置家由后端给
    * 「五键齐全、null = 未声明」的形状；自定义家由本模块适配成**稀疏表**
    * （没填的键不出现）—— 读侧统一走 `model-capability` 的归一/判定，

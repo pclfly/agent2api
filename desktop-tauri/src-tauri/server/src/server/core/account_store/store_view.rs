@@ -127,6 +127,25 @@ impl AccountStore {
             "maxConcurrent".to_string(),
             Value::from(max_concurrent_public(fields.get("maxConcurrent"))),
         );
+        // 出站身份（workbuddy 专属，2026-10）：缺省 `wb`（老账号没有这个字段）。
+        // 其他家不读它，但统一透出（形状一致，前端不必按 provider 分判）
+        let product = crate::server::core::providers::workbuddy::identity::resolve_product(
+            fields.get("product").and_then(Value::as_str),
+        );
+        public.insert(
+            "product".to_string(),
+            Value::String(
+                crate::server::core::providers::workbuddy::identity::product_id(product)
+                    .to_string(),
+            ),
+        );
+        public.insert(
+            "productLabel".to_string(),
+            Value::String(
+                crate::server::core::providers::workbuddy::identity::product_label(product)
+                    .to_string(),
+            ),
+        );
         Value::Object(public)
     }
 
@@ -242,6 +261,15 @@ impl AccountStore {
             // 所以这里没有 `is_trae_family` —— 将来接国际版时另立 kind、
             // 另开一个分支，不要往本家的记录上挂 `region` 字段。
             self.to_trae_public_account(record)
+        } else if record.provider() == super::LOBSTERAI_PROVIDER_ID {
+            // LobsterAI（有道龙虾）：公开形态见 `lobsterai_accounts.rs`
+            self.to_lobsterai_public_account(record)
+        } else if record.provider() == super::LOOMY_PROVIDER_ID {
+            // Loomy（讯飞）：公开形态见 `loomy_accounts.rs`
+            self.to_loomy_public_account(record)
+        } else if record.provider() == super::MINIMAX_PROVIDER_ID {
+            // MiniMax Code（中国版）：公开形态见 `minimax_accounts.rs`
+            self.to_minimax_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

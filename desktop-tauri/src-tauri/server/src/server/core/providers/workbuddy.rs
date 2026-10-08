@@ -56,6 +56,14 @@ use super::ProviderKind;
 /// 前缀缓存键），从参考项目 workbuddy2api 移植。见该模块头的完整说明。
 mod normalize;
 
+/// 出站身份（WB / VSC / CLI）：三种客户端指纹与配额通道。
+/// 见 `identity` 模块头的对照表。
+pub mod identity;
+
+/// 国际版的「每日活跃打卡」（桌面端轻量对话 + 网页通道 agent 会话）。
+/// 见 `web_daily` 模块头的上游事实与成败口径。
+pub mod web_daily;
+
 /// 上游错误码 11128（历史文案：Illegal API invocation from an unapproved channel）。
 ///
 /// 实测语义：多为提示词命中上游敏感词审核而被拦截（并非单纯的频率风控）。
@@ -472,6 +480,25 @@ impl ProviderAdapter for WorkBuddyAdapter {
         is_token_expiring(expires_at)
     }
 
+    /// 会话里的 `auth.expiresAt`（毫秒；没有 / 非正数 → None）。
+    ///
+    /// 给凭证自动维护算「维护窗口」用（见 trait 的说明）：维护间隔默认 10 分钟，
+    /// 而转发窗口只有 5 分钟 —— 没有这一项时，两次维护之间到期的凭证会漏刷，
+    /// 账号页白显示一段「已过期」。
+    fn credentials_expires_at_ms(&self, store: &AccountStore, account_id: &str) -> Option<i64> {
+        if account_id.is_empty() {
+            return None;
+        }
+        let entry = store.get_session_by_id(account_id)?;
+        let expires_at = entry
+            .session
+            .get("auth")
+            .and_then(|auth| auth.get("expiresAt"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        (expires_at > 0.0).then_some(expires_at as i64)
+    }
+
     /// workbuddy 有积分概念（腾讯计费接口，改造前唯一有的一家）。
     fn supports_usage(&self) -> bool {
         true
@@ -566,50 +593,65 @@ fn env_access_token() -> Option<String> {
 /// `request_id` 同时充当 X-Request-ID / X-Conversation-Request-ID /
 /// X-Conversation-ID / X-Session-ID —— Node 在没有 conversationId 时就是
 /// 这四者取同一个值（追踪一轮对话用）。
+///
+/// ── 出站身份（2026-10）─────────────────────────────────────
+/// 身份头由 `identity::identity_headers` 按账号的 `product` 字段构造
+/// （WB 默认 / VSC / CLI，见 `identity` 模块头）；鉴权头仍然来自
+/// `AuthService::build_auth_headers`，**合并时同名去重**：
+///   - VSC / CLI 的身份头自带 `X-Domain`，而鉴权头在账号带 `auth.domain` 时
+///     也会给一个 —— 两个同名头会让上游按不确定的值解释，保留身份侧的那个
+///     （它就是按身份算出来的正确值）；
+///   - WB 身份头里没有 `X-Domain`，去重不影响既有行为。
 fn chat_headers(session: &Value, request_id: &str, accept: Option<&str>) -> Vec<(String, String)> {
     let edition: &'static crate::server::core::endpoints::EditionInfo =
         crate::server::core::endpoints::resolve_edition(
             session.get("edition").and_then(Value::as_str),
         );
-    let mut headers: Vec<(String, String)> = vec![
-        ("Content-Type".to_string(), "application/json".to_string()),
-        // 完整三段 UA（含 CLI 扩展段）：与桌面客户端一致，服务端按此识别通道
-        (
-            "User-Agent".to_string(),
-            crate::server::core::endpoints::user_agent_for_edition(Some(edition.id)),
-        ),
-        // 客户端身份头：服务端按此做客户端识别与白名单校验
-        ("X-IDE-Type".to_string(), edition.ua_platform.to_string()),
-        ("X-IDE-Name".to_string(), edition.product_name.to_string()),
-        ("X-IDE-Version".to_string(), edition.client_version.to_string()),
-        ("X-Product".to_string(), edition.product_name.to_string()),
-        ("X-Agent-Intent".to_string(), "craft".to_string()),
-        // 会话追踪
-        ("X-Request-ID".to_string(), request_id.to_string()),
-        ("X-Conversation-Request-ID".to_string(), request_id.to_string()),
-        ("X-Conversation-ID".to_string(), request_id.to_string()),
-        ("X-Session-ID".to_string(), request_id.to_string()),
-    ];
-    headers.extend(AuthService::build_auth_headers(session));
+    let product = identity::product_of(session);
+    let mut headers = identity::identity_headers(product, edition, request_id);
+    for (key, value) in AuthService::build_auth_headers(session) {
+        if headers
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(&key))
+        {
+            continue;
+        }
+        headers.push((key, value));
+    }
     if let Some(accept) = accept {
         headers.push(("Accept".to_string(), accept.to_string()));
     }
     headers
 }
 
-/// 对话接口 URL：`{session.endpoint || 默认端点}/v2/chat/completions`。
+/// 对话接口 URL：`{session.endpoint || 版本默认}/v2/chat/completions`。
 ///
 /// 兜底端点取自 `endpoints::default_context()` —— 与 `AuthService` 构造时
 /// 用的那个上下文同源（改造前由 `forward` 从 `auth.default_context()` 传入），
 /// 因此「账号记录里没有 endpoint」时的回落值与改造前逐字相同。
+///
+/// ── 身份端点覆盖（2026-10）─────────────────────────────────
+/// `product` 非 WB 且身份表给了覆盖值时**优先用覆盖值**（hub 的
+/// `endpoint_for(realm, product)` 同款）：当前唯一与版本默认不同的是
+/// 「国内版 + VSCode 插件 → www.workbuddy.cn」。其余组合返回 None，走既有
+/// 回落链（账号 endpoint → 版本默认）—— WB 身份因此完全不受影响。
 fn chat_completions_url(session: &Value) -> String {
-    let fallback = crate::server::core::endpoints::default_context().base_url;
-    let endpoint = session
-        .get("endpoint")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(crate::server::core::endpoints::normalize_endpoint)
-        .unwrap_or_else(|| crate::server::core::endpoints::normalize_endpoint(&fallback));
+    let edition: &'static crate::server::core::endpoints::EditionInfo =
+        crate::server::core::endpoints::resolve_edition(
+            session.get("edition").and_then(Value::as_str),
+        );
+    let product = identity::product_of(session);
+    let endpoint = if let Some(overridden) = identity::identity_endpoint(edition, product) {
+        overridden.to_string()
+    } else {
+        let fallback = crate::server::core::endpoints::default_context().base_url;
+        session
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(crate::server::core::endpoints::normalize_endpoint)
+            .unwrap_or_else(|| crate::server::core::endpoints::normalize_endpoint(&fallback))
+    };
     format!("{endpoint}/v2/chat/completions")
 }
 

@@ -92,8 +92,8 @@ use super::request::{read_upstream_error, send_chat_request, TransportRequest};
 use super::usage::LogPhase;
 use super::{
     account_display, account_label, cancellation, connections::ConnectionGuard, describe_proxy,
-    reset_hint, rotate, ForwardOutcome, InFlightGuard, RouteTarget, UpstreamService,
-    MAX_ROUTE_ATTEMPTS,
+    reset_hint, rotate, session_affinity, ForwardOutcome, InFlightGuard, RouteTarget,
+    UpstreamService, MAX_ROUTE_ATTEMPTS,
 };
 
 /// 上游一次请求的失败（已分类 + 已构好给客户端的错误）。
@@ -398,6 +398,10 @@ async fn attempt_queue(
 ) -> Result<ForwardOutcome, GatewayError> {
     let model = model_of(ctx.body);
     let model_label = if model.is_empty() { "(默认)".to_string() } else { model.clone() };
+    // 会话粘性键（2026-10）：从消息前缀派生（前两条 = system + 首条 user，
+    // 整段对话不变）——同一对话固定同一账号（prompt cache 命中），不同对话
+    // 之间轮询分摊。没有 messages 的请求为 None（纯轮询）。
+    let session_key = session_affinity::derive_affinity_key(ctx.body);
     // 限额冷却键的解析器：把请求名解析成**各家上游真名**（见 `routing::CooldownKeys`）。
     // 建一次、整条请求共用 —— 选路、429 记账、成功清理三处读的必须是同一个键，
     // 否则冷却会写在一个名字上、查在另一个名字上。
@@ -460,7 +464,15 @@ async fn attempt_queue(
             return Err(cancellation::cancelled_error());
         }
         let target =
-            rotate::select_target_account(service, provider_ids, &cooldown_keys, &tried_ids).await?;
+            rotate::select_target_account(
+                service,
+                provider_ids,
+                &cooldown_keys,
+                &tried_ids,
+                session_key.as_deref(),
+                &model,
+            )
+            .await?;
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
         // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
         // （429 降级、401 刷新后换号、会话式失败顺延三条路径都经过这里）。
@@ -523,6 +535,7 @@ async fn attempt_queue(
                         provider_ids,
                         &cooldown_keys,
                         &tried_ids,
+                        &model,
                     ) {
                         Some(next) => {
                             // 换号额度用尽 → 队列里即使还有人也不再顺延
@@ -598,6 +611,7 @@ async fn attempt_queue(
                         provider_ids,
                         &cooldown_keys,
                         &tried_ids,
+                        &model,
                     ) {
                         Some(next) => {
                             // 换号额度用尽 → 队列里即使还有人也不再顺延
@@ -988,6 +1002,12 @@ async fn attempt_queue(
                                 ),
                             );
                         }
+                        // 走到这里 = 刷新失败或会话重取失败（成功路径已 continue）：
+                        // 这个账号救不回来，粘性解绑 —— 后续换号/重试不该再粘它
+                        // （hub 在 401 时同样解绑）。
+                        if let Some(key) = session_key.as_deref() {
+                            session_affinity::affinity_unbind(key);
+                        }
                     }
                     // ── 这一轮的结局已定（不会再重发同一个账号）→ 记明细 ────
                     // 位置在动作 1 / 动作 3 之前：那两段会 `continue 'accounts`
@@ -1013,6 +1033,11 @@ async fn attempt_queue(
                     {
                         if !tried_ids.contains(&account_id) {
                             tried_ids.push(account_id.clone());
+                            // 粘性解绑：账号被限额，下一轮重新轮询（hub 在 429 时同款）——
+                            // 不解绑的话，同一对话的下一轮请求会再次粘到已限额账号。
+                            if let Some(key) = session_key.as_deref() {
+                                session_affinity::affinity_unbind(key);
+                            }
                             // 冷却键 = **上游真名**（不是请求名）：上游按它记额度，
                             // 判定侧（`cooldown_keys`）也按它查，两处同源见
                             // `routing::CooldownKeys`。
@@ -1037,6 +1062,7 @@ async fn attempt_queue(
                                 provider_ids,
                                 &cooldown_keys,
                                 &tried_ids,
+                                &model,
                             ) {
                                 Some(next) => {
                                     let next_label = account_display(&next);
@@ -1138,6 +1164,7 @@ async fn attempt_queue(
                         provider_ids,
                         &cooldown_keys,
                         &tried_ids,
+                        &model,
                     ) {
                         Some(next) => {
                             if !take_switch(&mut switches_left, switch_total) {

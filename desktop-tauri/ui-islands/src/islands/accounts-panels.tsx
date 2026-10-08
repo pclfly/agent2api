@@ -726,6 +726,13 @@ export function MoreMenu({ account, atFront }: { account: AccountRecord; atFront
             onClick={() => { setOpen(false); shared().wbAccountConcDialog?.open?.(account) }}>
             并发上限：{maxConcurrent > 0 ? maxConcurrent : '不限'}
           </Button>
+          {providerOf(account) === 'workbuddy' ? (
+            <Button variant='ghost' size='sm' className={itemClass}
+              title='选择该账号以哪种客户端身份出站（WB / VSCode 插件 / CLI，各一条配额线）'
+              onClick={() => { setOpen(false); shared().wbAccountIdentityDialog?.open?.(account) }}>
+              出站身份：{account.productLabel || 'WorkBuddy 桌面端'}
+            </Button>
+          ) : null}
           {account.hasRefreshToken ? (
             <Button variant='ghost' size='sm' className={itemClass}
               onClick={() => { setOpen(false); shared().wbApp?.runAccountAction?.('refresh', account.id) }}>

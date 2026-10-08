@@ -68,6 +68,10 @@ const PROVIDER_ICONS: Record<string, string> = {
   'zcode-intl': 'assets/providers/zcode.png',
   codearts: 'assets/providers/codearts.png',
   trae: 'assets/providers/trae.png',
+  // 三家新反代：MiniMax 复用预置卡的中国版品牌图（同一品牌，反代接的就是
+  // 中国版）；LobsterAI / Loomy 暂无收录图标（回落首字母徽章 —— 它们都是
+  // L 开头，将来拿到官方图标后补上）。
+  minimax: 'assets/providers/minimax-cn.png',
 }
 
 type CardItem = {

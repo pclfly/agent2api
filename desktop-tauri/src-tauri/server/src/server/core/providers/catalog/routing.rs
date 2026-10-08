@@ -19,14 +19,46 @@ pub(super) fn entry_id_in_manifest(manifest: &[Value], requested: &str) -> Optio
     if requested.is_empty() {
         return None;
     }
-    // 保留展示名兼容，但必须先匹配原始 ID；返回清单里的实际大小写。
-    manifest.iter().find(|entry| model_id(entry).eq_ignore_ascii_case(requested))
-        .or_else(|| manifest.iter().find(|entry| {
-            entry.get("name")
-                .map(crate::server::core::models::shape_value_text)
-                .is_some_and(|name| name.eq_ignore_ascii_case(requested))
-        }))
-        .map(model_id)
+    // 三段查找（原始 ID → 展示名 → `upstreamKey`）抽成闭包：带版本后缀的名字
+    // 要能查两遍（先原样、再剥后缀）
+    let lookup = |needle: &str| -> Option<&Value> {
+        manifest
+            .iter()
+            .find(|entry| model_id(entry).eq_ignore_ascii_case(needle))
+            .or_else(|| {
+                manifest.iter().find(|entry| {
+                    entry
+                        .get("name")
+                        .map(crate::server::core::models::shape_value_text)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(needle))
+                })
+            })
+            .or_else(|| {
+                manifest.iter().find(|entry| {
+                    entry
+                        .get("upstreamKey")
+                        .map(crate::server::core::models::shape_value_text)
+                        .is_some_and(|key| key.eq_ignore_ascii_case(needle))
+                })
+            })
+    };
+    let hit = lookup(requested).or_else(|| {
+        // 带**版本后缀**的对外名（`deepseek-v4.1-flash-intl`）：
+        // 清单里通常有同名别名条目（上一步就命中），这条兜底给「清单里只有
+        // 真名」的情形（比如手输后缀、或清单还没重新广告）
+        let (stripped, edition) = crate::server::core::models::split_edition_suffix(requested);
+        if edition.is_some() && !stripped.is_empty() {
+            lookup(&stripped)
+        } else {
+            None
+        }
+    })?;
+    // 命中的若是版本后缀别名条目，**上游真名是 `editionAliasOf`**：
+    // 转发必须用真名（`xxx-intl` 打到上游只会「模型不存在」）
+    if let Some(real) = hit.get("editionAliasOf").and_then(Value::as_str) {
+        return Some(real.to_string());
+    }
+    Some(model_id(hit))
 }
 
 pub(super) fn builtin_target(

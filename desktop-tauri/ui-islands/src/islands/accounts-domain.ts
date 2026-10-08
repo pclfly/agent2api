@@ -133,6 +133,17 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 且它记的「签到钱包」与模型调用真正扣的积分池是两笔钱 —— 不给按钮，免得给一个
   // 点了必然报错（或报出一个对不上官方数字的余额）的入口。
   trae: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // LobsterAI（有道龙虾）：积分可查（profile-summary 的 creditItems）、每日签到（三步链路，
+  // slot → context → check_in），标识取 uid（四级回退保证非空）。
+  // `expiry: 'expiresAt'` 对应凭据里的毫秒时间戳（界面显示到期列）。
+  lobsterai: { usage: true, checkin: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // Loomy（讯飞）：积分可查（两个池分开显示：永久 + 每日赠送），签到是「每日额度初始化」
+  // （`points/first-login`，语义是触发额度重置而不是 +N 积分）。标识取 userId。
+  // 注意本家**没有续期端点**（session 14 天过期后重新短信登录），界面靠 hasRefreshToken=false 提示。
+  loomy: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  // MiniMax Code（中国版）：积分可查（credit/details）、每日签到（signin/status + signin/claim，
+  // 必须带 timezone_id）。标识取账号 id（token 非 JWT、没有稳定用户字段）。
+  minimax: { usage: true, checkin: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
 }
 
 /**
@@ -261,19 +272,24 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
 }
 
 /**
- * 该账号是否参与签到：所属家**有签到活动**，且不是国际版。
+ * 该账号是否参与「签到 / 每日活跃打卡」这个动作。
  *
- * 版本限定对 WorkBuddy 与 Qoder 两家实际生效 —— 它们的签到活动只在国内站
- * （Qoder 国际版这个地区根本没有签到计划）。判断按「非 intl」写而不是逐个
- * provider 特判：另几家没有 edition 字段，accountEdition 会把缺省值归一成 cn，
- * 因此这个条件对它们是恒真的。
+ * ── 国际版：只有 WorkBuddy 在范围内（2026-10）─────────────────
+ * 国际站没有国内站那种每日签到接口，但 WorkBuddy 国际版另有一条「每日活跃」
+ * 奖励：官方认的是**跑完的网页端 agent 会话**（桌面身份发 chat/completions
+ * 不计数、只建会话不接沙箱也不计数）。这条链路在后端是
+ * `providers::workbuddy::web_daily`，按钮与国内版是同一颗。
+ *
+ * 其它家的国际版仍然排除：Qoder 国际版这个地区根本没有签到计划；Accio 系
+ * 两个地区都没有活动（能力位 `checkin` 已是 false）。
  *
  * 与后端同源同口径：`billing::checkin::supports_checkin` 也是这条判据，
  * 两处任一改动都要同时改（批量签到的目标集合由后端算，前端这处只决定按钮）。
  */
 export function supportsCheckin(account: AccountRecord | null | undefined): boolean {
   if (!providerFeatures(providerOf(account)).checkin) return false
-  return accountEdition(account) !== 'intl'
+  if (accountEdition(account) === 'intl') return providerOf(account) === 'workbuddy'
+  return true
 }
 
 /**

@@ -93,6 +93,9 @@ pub mod catpaw_import;
 pub mod cline_accounts;
 pub mod codearts_accounts;
 pub mod custom_accounts;
+pub mod lobsterai_accounts;
+pub mod loomy_accounts;
+pub mod minimax_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
@@ -174,6 +177,24 @@ pub(crate) const CLINE_FREE_PROVIDER_ID: &str = crate::server::core::providers::
 /// Cline **订阅池** provider id（同 [`CLINE_FREE_PROVIDER_ID`] 的口径）
 pub(crate) const CLINE_PASS_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::ClinePass,
+);
+
+/// LobsterAI provider id（账号存储内部多处要用；**从注册表推导**，同
+/// [`RACCOON_PROVIDER_ID`] 的口径）。账号形态见 `lobsterai_accounts.rs`。
+pub(crate) const LOBSTERAI_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::LobsterAi,
+);
+
+/// Loomy provider id（同 [`LOBSTERAI_PROVIDER_ID`] 的口径）。账号形态见
+/// `loomy_accounts.rs`（短信登录得来，**没有 refresh 端点**）。
+pub(crate) const LOOMY_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Loomy,
+);
+
+/// MiniMax provider id（同 [`LOBSTERAI_PROVIDER_ID`] 的口径）。账号形态见
+/// `minimax_accounts.rs`（设备码登录得来，token 非 JWT、`expires_at` 自算）。
+pub(crate) const MINIMAX_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Minimax,
 );
 
 /// 这个 provider 是不是 **Cline 系**（两个额度池之一）。

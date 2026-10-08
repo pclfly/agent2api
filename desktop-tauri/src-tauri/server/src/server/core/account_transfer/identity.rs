@@ -195,6 +195,45 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
         let variant = text("variant");
         return Ok(format!("{}:{uid}", if variant.is_empty() { "solo" } else { &variant }));
     }
+    // LobsterAI：身份是 `uid`（四级回退保证非空，与 `add_lobsterai_account`
+    // 的判重口径一致）。少了这一支会落到 `userId` 兜底 —— 而本家的 `userId`
+    // 是 yid（与 uid 不同的字段），匹配口径就此分叉：导出再导入会判成新增。
+    // uid 意外为空时退到 accessToken（与添加路径「同 token 合并」同口径）。
+    if provider == kind_id(ProviderKind::LobsterAi) {
+        if !uid.is_empty() {
+            return Ok(uid);
+        }
+        let access = text("accessToken");
+        if !access.is_empty() {
+            return Ok(access);
+        }
+        return Err("缺少 uid 与 accessToken（无法标识 LobsterAI 账号）".to_string());
+    }
+    // Loomy：身份是 `userId`（讯飞 userid，与 `add_loomy_account` 判重口径一致）；
+    // 为空时退到 accessToken（session）。
+    if provider == kind_id(ProviderKind::Loomy) {
+        if !user_id.is_empty() {
+            return Ok(user_id);
+        }
+        let access = text("accessToken");
+        if !access.is_empty() {
+            return Ok(access);
+        }
+        return Err("缺少 userId 与 accessToken（无法标识 Loomy 账号）".to_string());
+    }
+    // MiniMax：token 非 JWT、没有稳定用户字段，身份按 `accessToken`
+    // （与添加路径「同 token 合并」同口径）；空 token 时退到账号 id。
+    if provider == kind_id(ProviderKind::Minimax) {
+        let access = text("accessToken");
+        if !access.is_empty() {
+            return Ok(access);
+        }
+        let id = text("id");
+        if !id.is_empty() {
+            return Ok(id);
+        }
+        return Err("缺少 accessToken 与 id（无法标识 MiniMax 账号）".to_string());
+    }
     // 自定义提供商：凭证就是身份 —— apiKey 非空时与添加路径「同 key 合并」
     // 完全同口径（添加路径的账号 id 就是 key 的 SHA-256 前缀）；空 key 没有
     // 稳定标识，退到账号 id（空 key 的记录 id 是随机的，但全局唯一仍然成立）。
@@ -248,6 +287,58 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
             .trim()
             .to_string();
         return Some(format!("{}:{uid}", if variant.is_empty() { "solo" } else { &variant }));
+    }
+    // LobsterAI：`uid` → `accessToken`（与 `identity_of_item` 同口径）
+    if provider == kind_id(ProviderKind::LobsterAi) {
+        let uid = record
+            .get("uid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !uid.is_empty() {
+            return Some(uid);
+        }
+        let access = record
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return (!access.is_empty()).then_some(access);
+    }
+    // Loomy：`userId` → `accessToken`（与 `identity_of_item` 同口径）
+    if provider == kind_id(ProviderKind::Loomy) {
+        let user_id = record
+            .get("userId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !user_id.is_empty() {
+            return Some(user_id);
+        }
+        let access = record
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return (!access.is_empty()).then_some(access);
+    }
+    // MiniMax：`accessToken` → `id`（与 `identity_of_item` 同口径）
+    if provider == kind_id(ProviderKind::Minimax) {
+        let access = record
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !access.is_empty() {
+            return Some(access);
+        }
+        let id = record.id().trim().to_string();
+        return (!id.is_empty()).then_some(id);
     }
     // Cline：身份在 `account` 键上（与 `identity_of_item` 同一口径，两池共用）
     if crate::server::core::account_store::is_cline_family(provider) {
@@ -384,5 +475,44 @@ mod tests {
             identity_of_item("trae", &item(json!({"uid": "777"}))).expect("缺 variant 按 solo"),
         );
         assert!(identity_of_item("trae", &item(json!({"uid": "  ", "userId": "51029416092912"}))).is_err(), "空 uid 不能拿 userId 凑");
+    }
+
+    #[test]
+    fn the_three_new_providers_keep_their_own_identity_keys() {
+        // LobsterAI：身份是 `uid`（不能落到 userId 兜底 —— 那是 yid）
+        assert_eq!(
+            "u-1",
+            identity_of_item("lobsterai", &item(json!({"uid": "u-1", "userId": "yid-1"})))
+                .expect("应识别出身份")
+        );
+        // LobsterAI：uid 为空时退到 accessToken
+        assert_eq!(
+            "at-1",
+            identity_of_item("lobsterai", &item(json!({"uid": "", "accessToken": "at-1"})))
+                .expect("应识别出身份")
+        );
+        // LobsterAI：两者都空 → 报错
+        assert!(identity_of_item("lobsterai", &item(json!({}))).is_err());
+        // Loomy：身份是 `userId`
+        assert_eq!(
+            "123456789012345678",
+            identity_of_item(
+                "loomy",
+                &item(json!({"userId": "123456789012345678", "accessToken": "s-1"}))
+            )
+            .expect("应识别出身份")
+        );
+        // MiniMax：身份按 accessToken（token 非 JWT、没有稳定用户字段）
+        assert_eq!(
+            "mmoat-1",
+            identity_of_item("minimax", &item(json!({"accessToken": "mmoat-1"})))
+                .expect("应识别出身份")
+        );
+        // MiniMax：空 token 时退到 id
+        assert_eq!(
+            "minimax-abc",
+            identity_of_item("minimax", &item(json!({"id": "minimax-abc"})))
+                .expect("应识别出身份")
+        );
     }
 }

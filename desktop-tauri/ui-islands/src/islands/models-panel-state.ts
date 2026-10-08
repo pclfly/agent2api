@@ -388,13 +388,37 @@ function rebuildReasoningIndex(): void {
   reasoningOf = buildReasoningIndex(mappings())
 }
 
+/**
+ * 左栏条目的键：`provider`，或 `provider\u0001edition`（**有版本维度**的家）。
+ *
+ * ── 为什么 WorkBuddy 要带上版本（2026-10）────────────────────
+ * 它一家有**两条**清单：国际版（`www.workbuddy.ai`）与国内版
+ * （`copilot.tencent.com`）下发的模型与倍率都不同（`fast-model` 国际版 x0.34、
+ * 国内版 x0.21；`deepseek-v4.1-flash` 只在国际版且是限免）。只按 provider 聚合
+ * 会让左栏只剩一行「WorkBuddy 国际版」（标签取先出现的那条），国内版整组无处可点。
+ *
+ * 其余家的 `edition` 是空串 → 键与原来**逐字相同**，不会影响
+ * `isCustom` / 映射弹窗等按 provider 比较的地方。
+ */
+export function railKeyOf(model: ManageModel): string {
+  const provider = model.provider || ''
+  const edition = String(model.edition || '')
+  return edition ? `${provider}\u0001${edition}` : provider
+}
+
+/** 左栏键 → `[provider, edition]`（edition 为空串 = 这家没有版本维度）。 */
+export function splitRailKey(key: string): [string, string] {
+  const [provider, edition = ''] = key.split('\u0001')
+  return [provider, edition]
+}
+
 /** 内置各家的 id → {label, n}。从**内置全量**（`data.models`）收集，不能用 models() ——
     后者跟着选中项走，选中某一家的那一刻其余各家的计数会全变 0。 */
 export function builtinRailItems(data: ManageView | null): Map<string, { label: string; n: number }> {
   const counts = new Map<string, { label: string; n: number }>()
   const rows = Array.isArray(data?.models) ? data.models : []
   for (const model of rows) {
-    const key = model.provider || ''
+    const key = railKeyOf(model)
     if (!key) continue
     const entry = counts.get(key) || { label: model.providerLabel || key, n: 0 }
     entry.n++
@@ -406,9 +430,16 @@ export function builtinRailItems(data: ManageView | null): Map<string, { label: 
 /**
  * 左栏当前展示的内置家 id（有清单的家）——「获取模型」弹窗据此组装刷新范围
  * （见 models-fetch-modal.tsx 的 scopeProviders）：模型管理页看不到的家不该出现在刷新结果里。
+ *
+ * 这里**去重成 provider id**：刷新是按家（provider）走的，WorkBuddy 的两条版本线
+ * 不该让它被刷两遍（后端那一次刷新本来就会补刷另一个版本）。
  */
 function builtinProviders(): string[] {
-  return [...builtinRailItems(snapshot.data).keys()]
+  const ids = new Set<string>()
+  for (const key of builtinRailItems(snapshot.data).keys()) {
+    ids.add(splitRailKey(key)[0])
+  }
+  return [...ids]
 }
 
 /**

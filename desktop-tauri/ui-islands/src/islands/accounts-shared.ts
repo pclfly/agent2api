@@ -65,6 +65,9 @@ export type AccountRecord = {
   hasRefreshToken?: boolean
   hasBalanceToken?: boolean
   maxConcurrent?: number
+  /** 出站身份（workbuddy 专属，缺省 `wb`）：`wb` / `vsc` / `cli` —— 见 identity-dialog.tsx */
+  product?: string
+  productLabel?: string
   checkinAt?: number
   addedAt?: number
   updatedAt?: number
@@ -290,6 +293,8 @@ export type SharedWindow = {
   }
   /** 并发上限小对话框（已迁的岛，见 conc-dialog.tsx） */
   wbAccountConcDialog?: { open?: (account: AccountRecord) => void; close?: () => void }
+  /** 出站身份小对话框（已迁的岛，见 identity-dialog.tsx） */
+  wbAccountIdentityDialog?: { open?: (account: AccountRecord) => void; close?: () => void }
   /**
    * ZCode「领套餐」流程（ui/zcode-claim.js，本页把账号对象与「今天领过的套餐 id」
    * 递过去）。第二个参数是**逐份**的领取状态：一个账号可能同时挂着几份可领套餐，

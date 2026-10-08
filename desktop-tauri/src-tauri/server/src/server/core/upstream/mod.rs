@@ -48,6 +48,7 @@ pub mod aggregate;
 pub mod cancellation;
 pub mod connections;
 pub mod request;
+pub mod session_affinity;
 mod payload;
 mod provider_loop;
 mod rotate;

@@ -491,6 +491,110 @@ const TRAE: ProviderConfig = {
   ],
 }
 
+/**
+ * LobsterAI（有道龙虾）。
+ *
+ * ── 网页登录：本地回调服务器 + authCode 换 token ──────────
+ * 授权页在 `lobsterai.youdao.com/portal`，登录完成后跳回**本机**的
+ * `http://127.0.0.1:<随机端口>/auth/callback?code=…&state=…`（网关自己监听的
+ * 临时端口，见 `providers::lobsterai::oauth`）。回调落在本机，与浏览器在哪无关，
+ * 因此内嵌窗口与系统浏览器两条路都走得通（与 Trae / CodeArts 同形）。
+ */
+const LOBSTERAI: ProviderConfig = {
+  provider: 'lobsterai',
+  label: 'LobsterAI',
+  // 本家没有「读本机客户端登录态」这条后端路径（凭据只能靠网页登录或粘贴）
+  desktop: false,
+  webLogin: {
+    noteHtml: '打开 LobsterAI 官方登录页（<code>lobsterai.youdao.com</code>）并用你的账号登录：'
+      + '登录成功后官方页面会跳回<b>本机</b>的回调地址，网关自动用一次性授权码换取凭证并加入账号列表'
+      + '（授权码只在本机传给网关，界面不显示明文 token）。',
+    button: '打开 LobsterAI 授权页',
+    busyText: '等待 LobsterAI 授权完成…',
+    modes: [
+      { value: 'embedded', label: '内嵌窗口（推荐）', hint: '将打开内嵌窗口；授权完成后自动加入账号列表。关掉窗口即取消等待' },
+      { value: 'external', label: '系统浏览器', hint: '将用系统默认浏览器打开授权页（会复用浏览器里已登录的 LobsterAI 账号）；完成后自动加入账号列表' },
+    ],
+  },
+  manualTitle: '填写凭证',
+  manualNoteHtml: 'accessToken 是 LobsterAI 的访问令牌（JWT 形态）；refreshToken 可选，'
+    + '填了到期能自动续期（<b>不填则过期后只能重新登录</b>）。'
+    + '<br>手工粘贴时建议连 <b>uuid / firstKeyfrom / latestKeyfrom</b> 一起填 —— 这三个是续期请求体的必填字段，'
+    + '缺了就只能重新登录（最容易拿到的办法：直接用上方的「网页登录」。）',
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: '粘贴 LobsterAI 的 access token' },
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: '可选，没有则无法自动续期' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空则用昵称（手机号会掩码）或 uid' },
+  ],
+}
+
+/**
+ * Loomy（讯飞办公助手）。
+ *
+ * ── 短信验证码登录（本项目第二家短信登录的反代）──────────────
+ * 与 AutoClaw 国内版共用同一个交互引擎（`sms-login.js`）：
+ * 发码返回 `msgid`，登录时原样带回（见 `providers::loomy::oauth`）。
+ * **没有网页登录**，也没有「桌面端登录态导入」—— 短信是官方主路径。
+ */
+const LOOMY: ProviderConfig = {
+  provider: 'loomy',
+  label: 'Loomy',
+  desktop: false,
+  smsLogin: {
+    noteHtml: '用 Loomy 账号绑定的手机号登录：点击「获取验证码」，收到短信后填入下方并登录。'
+      + '验证码由本机直接提交给官方接口，界面不显示 token。',
+  },
+  manualTitle: '填写凭证',
+  manualNoteHtml: 'accessToken 是 Loomy 的登录凭证（讯飞下发的 32 位小写 hex `session`，不是 JWT）；'
+    + 'userId / phone 可选，用于生成账号 id 与展示名。'
+    + '<br>本家<b>没有续期端点</b>：session 有效期 14 天，过期后请重新短信登录。',
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: '粘贴 Loomy 的 session（32 位小写 hex）' },
+    { key: 'userId', label: 'userId', optional: true, placeholder: '可选；讯飞用户 id（登录时自动带上）' },
+    { key: 'phone', label: 'phone', optional: true, placeholder: '可选；绑定的手机号' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空则用脱敏手机号或 userId' },
+  ],
+}
+
+/**
+ * MiniMax Code（中国版）。
+ *
+ * ── 网页登录：OAuth 设备码 + PKCE ────────────────────────
+ * 与 Qoder / Cline 的设备授权同形：网关同步问上游要 `user_code` 与授权页地址，
+ * 用户在浏览器里确认后由后台轮询换令牌（见 `providers::minimax::oauth`）。
+ * 因此内嵌窗口与系统浏览器两条路都走得通。
+ */
+const MINIMAX: ProviderConfig = {
+  provider: 'minimax',
+  label: 'MiniMax',
+  // 客户端登录态文件是明文 JSON（`~/.minimax/auth/prod/cn/mcode-public/auth.json`），
+  // 可导入（只读、不写回客户端文件、不代刷新 —— 见后端 `minimax::import` 的模块头）
+  desktop: true,
+  webLogin: {
+    noteHtml: '打开 MiniMax 官方授权页完成设备码确认，账号自动加入列表。'
+      + '授权页由网关向官方服务申请（<code>account.minimax.cn</code>），完成后自动加入。',
+    button: '打开 MiniMax 授权页',
+    busyText: '等待 MiniMax 授权完成…',
+    modes: [
+      { value: 'embedded', label: '内嵌窗口（推荐）', hint: '将打开内嵌窗口；授权完成后自动加入账号列表。关掉窗口即取消等待' },
+      { value: 'external', label: '系统浏览器', hint: '将用系统默认浏览器打开授权页（会复用浏览器里已登录的 MiniMax 账号）；完成后自动加入账号列表' },
+    ],
+  },
+  manualTitle: '填写凭证',
+  manualNoteHtml: 'accessToken 是 MiniMax 的访问令牌（<code>mmoat_</code> 开头）；refreshToken 可选，'
+    + '填了到期能自动续期（<b>不填则过期后只能重新登录</b>）。'
+    + '（最容易拿到的办法：直接用上方的「设备码登录」，或在客户端登录后用「导入客户端登录态」。）',
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: '粘贴 MiniMax 的 access token（mmoat_…）' },
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: '可选，没有则无法自动续期' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空自动生成' },
+  ],
+  desktopNote: '读本机 MiniMax 客户端当前登录态（只读、<b>不写回客户端文件</b>）；'
+    + '网关每次使用时会优先重读该文件，客户端刷新后自动同步。'
+    + '本家导入的账号<b>不在网关侧自动续期</b>（避免与客户端互相作废登录态），过期后请在客户端登录后重新导入。',
+  desktopHint: '读取 ~/.minimax/auth/prod/cn/mcode-public/auth.json，需已在 MiniMax 客户端登录',
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -512,6 +616,10 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   CODEARTS,
   // Trae 只有 SOLO 那一家（没有地区分叉，理由见 TRAE 上方那段）
   TRAE,
+  // 三家新反代（与后端注册表 PROVIDERS 的排列一致）
+  LOBSTERAI,
+  LOOMY,
+  MINIMAX,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

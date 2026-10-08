@@ -404,9 +404,19 @@ const BRIDGE_JS: &str = r#"
       call('POST', '/api/session/login/sms/verify', {
         phone: String((payload && payload.phone) || ''),
         code: String((payload && payload.code) || ''),
-        // deviceId / name 可选：空串会被后端当成一个真值带上去，
+        // deviceId / msgid / name 可选：空串会被后端当成一个真值带上去，
         // 因此按「有值才带」整形（与其它命令的省略语义一致）
+        //
+        // ⚠️ `msgid` 必须在这里透传（真实踩过：Loomy 登录恒报
+        // 「手机号 / 验证码 / msgid 不完整」）。界面（ui/sms-login.js）确实把
+        // 发码拿到的 `msgid` 放进了 payload，但整形时漏了这一个键 —— 它在这里
+        // 被静默丢掉，后端 `api::session::login_sms_verify` 读到空串，
+        // 于是在**真正打上游之前**就用那句文案拒绝。现象具有极强的误导性：
+        // 界面提示「请重新获取验证码」，而重新发码完全正常、验证码也是对的，
+        // 用户只会一遍遍重发。deviceId（AutoClaw）与 msgid（Loomy）是同一个
+        // 位置的两个中间态，谁都不能漏。
         ...((payload && payload.deviceId) ? { deviceId: String(payload.deviceId) } : {}),
+        ...((payload && payload.msgid) ? { msgid: String(payload.msgid) } : {}),
         ...((payload && payload.name) ? { name: String(payload.name) } : {}),
         ...((payload && payload.provider) ? { provider: String(payload.provider) } : {}),
       }),
@@ -635,3 +645,48 @@ const BRIDGE_JS: &str = r#"
   };
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::bridge_js;
+
+    /// `verifySmsLogin` 必须把后端要读的每一个键都整形进去。
+    ///
+    /// ── 这条用例钉的是什么（真实缺陷）────────────────────────────
+    /// 桥接层是「界面 → 网关」的唯一入口，它**逐键整形**请求体 —— 于是它
+    /// 天然是一个「白名单」：界面放进 payload 的键，只要这里没写，就会被
+    /// **静默丢掉**（没有报错、没有日志，请求照发）。
+    ///
+    /// 真实事故：界面（`ui/sms-login.js`）已经正确地把发码拿到的 `msgid`
+    /// 放进 payload，桥接整形时漏了这一个键 —— 后端
+    /// `api::session::login_sms_verify` 读到空串，在**打上游之前**就用
+    /// 「手机号 / 验证码 / msgid 不完整，请重新获取验证码」拒绝。
+    /// 那条文案把用户指向「重发验证码」，而重发完全正常、验证码也是对的，
+    /// 于是用户只会一遍遍重发 —— 一个丢键 bug 被伪装成了上游问题。
+    ///
+    /// 因此这里对着**后端真正读的键**逐个断言（见 `api::session::login_sms_verify`
+    /// 的取键）：少一个就红，而不是等用户报「登录失败」。
+    /// 与 `server/src/web_shim.rs` 的同名用例成对存在：两个壳都要守。
+    #[test]
+    fn verify_sms_login_forwards_every_key_the_backend_reads() {
+        let script = bridge_js();
+        let start = script
+            .find("verifySmsLogin")
+            .expect("桥接脚本里必须有 verifySmsLogin");
+        // 切到下一个方法为止：只在 verifySmsLogin 自己的整形体里找键，
+        // 免得别处恰好出现同名字段让断言假通过
+        let end = script[start..]
+            .find("getAutoCheckin")
+            .map(|offset| start + offset)
+            .expect("verifySmsLogin 之后应当还有 getAutoCheckin");
+        let body = &script[start..end];
+
+        for key in ["phone", "code", "deviceId", "msgid", "name", "provider"] {
+            assert!(
+                body.contains(&format!("payload.{key}")),
+                "verifySmsLogin 漏掉了 `{key}` —— 后端会读它，丢键的后果是\
+                 后端在打上游之前就报「参数不完整」，现象指向错误的排查方向"
+            );
+        }
+    }
+}

@@ -22,16 +22,16 @@
 //! 于是 `root.providers` 取不到、清单恒为空，而 HTTP 是 200（走不到错误分支），
 //! 前端只看到「上游目录里没有可见模型」。数组与对象两种形态都接受。
 //!
-//! ── 上游把模型名换成了混淆代号（同一批实测）────────────────────
-//! `modelCode` / `modelName` 现在是 `1Orbit-I9eY7YK8bW1f`（Claude Sonnet 4.6）、
-//! `1Helix-…`（GPT 系）、`1Nexus-…` / `1Drift-…` / `1Nova-…` / `1Chronos-…`
-//! 这类不透明代号，人类可读名只在 `modelDisplayName` 里。**老名字仍然可用**
-//! （实测 `claude-sonnet-4-6` 与代号都能正常出流），所以：
-//!   - `upstreamKey` 存上游代号 —— 发给上游的就是它，转发永远用当前代号；
-//!   - 对外 `id` 走 `STABLE_IDS`：**能沿用老名字就沿用**（用户已配好的名字
-//!     不用改），新模型没有老名字可用，才用代号。
-//! 两条合起来的效果是「清单里看到什么名字，就点什么名字」，而发上游的
-//! 始终是代号 —— 上游再换一次代号，只需要改 `STABLE_IDS` 的匹配，配置不动。
+//! ── 三个名字各归其位（2026-10-05 实测复核）────────────────────
+//! 上游每条模型给三个字段：
+//!   - `modelCode`（`1Orbit-I9eY7YK8bW1f`）—— 不透明代号，**发给上游**用它；
+//!   - `modelName`（`gpt-6-astra` / `claude-sonnet-4-6` / `qwen3.8-max@sg`）——
+//!     模型标识，**官方客户端请求里用的就是它**（实测也能直接发上游）；
+//!   - `modelDisplayName`（`GPT 6 Astra` / `Standard` / `专业` / `极致`）——
+//!     **只给界面看**的营销名，含中文，不是模型 id。
+//! 因此：`upstreamKey` 存 `modelCode`（转发永远用当前代号），对外 `id` 用
+//! `modelName`（见 [`stable_id`]）。**不要**拿 `modelDisplayName` 当 id ——
+//! 那会让本网关的清单与官方客户端对不上，还会把中文营销名广告成模型 id。
 //!
 //! ── 条目的键名口径（与另外几家对齐）──────────────────────────
 //! 聚合层的 `models::list_item` 认 `id` / `name` / `maxInputTokens` /
@@ -77,59 +77,57 @@ const CACHE_TTL_MS: i64 = 60 * 60 * 1000;
 /// 保留它的作用是进程启动即有清单可广告、断网 / 未登录时 `/v1/models` 不为空。
 /// 远程清单拉到之后这份就退居兜底。
 ///
+/// ⚠️ 元组第一列是**对外 id**，必须与远程清单里同一个模型的 `modelName` 一致
+/// （见 [`stable_id`]）—— 兜底与远程两条路给出同一个名字，用户配置才不会因为
+/// 「这次拉到了 / 这次没拉到」而 404。第三列才是 `upstreamKey`。
+///
 /// `EffortPlacement` 一列是思考档位落点（实测口径见 [`EffortPlacement`]）：
 /// 静态表里没有上游的 `protocol` 字段，所以按同一批实测逐条写死 ——
 /// 远程清单走「读 `protocol`」，两条路都不再按模型名猜。
-const FALLBACK: &[(&str, &str, u64, bool, &[&str], bool, EffortPlacement)] = &[
-    // (modelCode, 展示名, contextWindow, multimodal, reasoningEfforts, isDefault, 档位落点)
-    ("gemini-3-flash-preview", "Gemini 3 Flash", 1_000_000, true, &["low", "high"], true, EffortPlacement::Top),
-    ("gemini-3.1-pro-preview", "Gemini 3.1 Pro", 1_000_000, true, &["low", "high"], false, EffortPlacement::Top),
-    ("qwen3.6-plus", "Qwen 3.6 Plus", 991_808, false, &[], false, EffortPlacement::Top),
-    ("qwen3-max-2026-01-23", "Qwen 3 Max", 262_144, false, &[], false, EffortPlacement::Top),
-    ("gpt-5.4", "GPT 5.4", 1_050_000, true, &["low", "high"], false, EffortPlacement::Properties),
-    ("gpt-5.2-1211", "GPT 5.2", 400_000, true, &["low", "high"], false, EffortPlacement::Properties),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6", 1_000_000, true, &["low", "medium", "high", "max"], false, EffortPlacement::Top),
-    ("claude-opus-4-6", "Claude Opus 4.6", 1_000_000, true, &["low", "medium", "high", "max"], false, EffortPlacement::Top),
-    ("glm-5", "GLM-5", 200_000, false, &[], false, EffortPlacement::Top),
-    ("MiniMax-M2.5", "MiniMax M2.5", 204_800, true, &[], false, EffortPlacement::Properties),
+const FALLBACK: &[(&str, &str, &str, u64, bool, &[&str], bool, EffortPlacement)] = &[
+    // (对外 id = 上游 modelName, upstreamKey = 上游 modelCode, 展示名, contextWindow,
+    //  multimodal, reasoningEfforts, isDefault, 档位落点)
+    ("gemini-3-flash-preview", "gemini-3-flash-preview", "Gemini 3 Flash", 1_000_000, true, &["low", "high"], true, EffortPlacement::Top),
+    ("gemini-3.1-pro-preview", "gemini-3.1-pro-preview", "Gemini 3.1 Pro", 1_000_000, true, &["low", "high"], false, EffortPlacement::Top),
+    ("qwen3.6-plus", "qwen3.6-plus", "Qwen 3.6 Plus", 991_808, false, &[], false, EffortPlacement::Top),
+    ("qwen3-max-2026-01-23", "qwen3-max-2026-01-23", "Qwen 3 Max", 262_144, false, &[], false, EffortPlacement::Top),
+    ("gpt-5.4", "gpt-5.4", "GPT 5.4", 1_050_000, true, &["low", "high"], false, EffortPlacement::Properties),
+    ("gpt-5.2-1211", "gpt-5.2-1211", "GPT 5.2", 400_000, true, &["low", "high"], false, EffortPlacement::Properties),
+    ("claude-sonnet-4-6", "claude-sonnet-4-6", "Claude Sonnet 4.6", 1_000_000, true, &["low", "medium", "high", "max"], false, EffortPlacement::Top),
+    ("claude-opus-4-6", "claude-opus-4-6", "Claude Opus 4.6", 1_000_000, true, &["low", "medium", "high", "max"], false, EffortPlacement::Top),
+    ("glm-5", "glm-5", "GLM-5", 200_000, false, &[], false, EffortPlacement::Top),
+    ("MiniMax-M2.5", "MiniMax-M2.5", "MiniMax M2.5", 204_800, true, &[], false, EffortPlacement::Properties),
 ];
 
-/// 老模型名 → 上游**展示名**（`modelDisplayName`）。
+/// 某条目录条目的**对外 id** = 上游的 `modelName`。
 ///
-/// ── 这张表干什么 ────────────────────────────────────────────
-/// 上游把目录里的模型名换成了不透明代号（`1Orbit-I9eY7YK8bW1f`），
-/// 而用户手上的配置写的是代号之前的名字（`claude-sonnet-4-6`）。
-/// 若清单直接广告代号，那些配置会立刻 404。这里把它们接回来：
-/// 目录里只要有「Claude Sonnet 4.6」这一条，它就**沿用老名字当对外 id**
-/// （`upstreamKey` 仍是代号，发上游用代号）。于是：老配置不用改，
-/// 列表里也不会同时出现「老名字 + 代号」两份。
+/// ── 为什么是 `modelName` 而不是展示名（2026-10-05 实测）──────────
+/// 上游每条模型给三个名字，各有分工：
+///   · `modelCode`（`1Helix-G6aS8tR2qN7m`）—— **发给上游**的串（会换）；
+///   · `modelName`（`gpt-6-astra` / `claude-sonnet-4-6`）—— 模型标识，官方
+///     客户端请求里用的就是它，实测也能直接发上游；
+///   · `modelDisplayName`（`GPT 6 Astra` / `Standard` / `极致`）—— **只给界面看**。
 ///
-/// ── 为什么按展示名而不是硬编码代号 ─────────────────────────────
-/// 代号是上游随时会换的不透明串；硬编码进代码等于把「上游换次代号就失效」
-/// 写进实现。展示名才是上游稳定对外的东西，这张表**不需要跟着代号变**。
+/// 本模块原来拿 `modelDisplayName` 当对外 id，于是同一份清单在两边长得不一样：
+/// 官方客户端里是 `gpt-6-astra`，到本网关变成 `GPT 6 Astra`；`@sg` 这类区域变体
+/// 还要靠拼展示名后缀才分得开（`Qwen 3.8 Max @sg`）；更要命的是上游给某些条目
+/// 的展示名是**中文营销词**（`Standard` / `专业` / `极致`），列表里就会冒出
+/// `极致` 这种既不像模型名、也无法从上游文档查到的 id。
 ///
-/// ── 只收「同一个模型」的对应关系 ─────────────────────────────
-/// 版本跃迁不在这里接（`kimi-k2.5` → `Kimi K2.6`、`MiniMax-M2.5` → `MiniMax M3`、
-/// `qwen3.6-plus` → `Qwen 3.8 27B` 等）：用户点名 A 却拿到 B 是静默替换，
-/// 宁可 404 让客户端看到相近候选（入口校验会给 `suggest_advertised` 的提示）。
-/// 上游接口仍认、但目录里已下架的名字（`gpt-5.4` / `gpt-5.2-1211` /
-/// `qwen3-max-2026-01-23`）同样不接 —— 清单以目录为准，只广告上游在卖的东西。
-const STABLE_IDS: &[(&str, &str)] = &[
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
-    ("claude-opus-4-6", "Claude Opus 4.6"),
-    ("gemini-3-flash-preview", "Gemini 3 Flash"),
-    ("gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
-    ("glm-5", "GLM-5"),
-];
-
-/// 某条目录条目的**对外 id**：能用老名字就用老名字（见 [`STABLE_IDS`]），
-/// 否则用上游代号（新模型没有老名字可用）。
-fn stable_id(code: &str, display: &str) -> String {
-    STABLE_IDS
-        .iter()
-        .find(|(_, name)| name.eq_ignore_ascii_case(display))
-        .map(|(alias, _)| (*alias).to_string())
-        .unwrap_or_else(|| code.to_string())
+/// 改用 `modelName` 之后：对外名 = 官方客户端里那个名字 = 能直接发上游的串，
+/// 一处对齐三处（列表、配置、上游），也不再需要「拼后缀消歧」。
+///
+/// `modelName` 缺失时才回退展示名（上游将来少给字段时不至于没名字）。
+fn stable_id(code: &str, display: &str, model_name: &str) -> String {
+    let name = model_name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    let display = display.trim();
+    if !display.is_empty() {
+        return display.to_string();
+    }
+    code.to_string()
 }
 
 /// 一个地区的远程清单 + 拉取时刻
@@ -181,8 +179,11 @@ fn restored_cache(region: Region) -> RegionCache {
 fn fallback_models() -> Vec<Value> {
     FALLBACK
         .iter()
-        .map(|(code, name, window, multimodal, efforts, is_default, placement)| {
+        .map(|(id, code, name, window, multimodal, efforts, is_default, placement)| {
             let mut item = normalize_entry(&json!({
+                // `modelName` 就是对外 id（见 `stable_id`）：兜底与远程两条路
+                // 必须给出同一个名字，用户配置才不会因为「这次没拉到目录」而 404
+                "modelName": id,
                 "modelCode": code,
                 "modelDisplayName": name,
                 "contextWindow": window,
@@ -212,6 +213,12 @@ fn normalize_entry(entry: &Value) -> Value {
         .unwrap_or("")
         .trim()
         .to_string();
+    let model_name = entry
+        .get("modelName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
     let display = entry
         .get("modelDisplayName")
         .and_then(Value::as_str)
@@ -230,8 +237,8 @@ fn normalize_entry(entry: &Value) -> Value {
         .map(|items| items.iter().filter_map(Value::as_str).map(|text| Value::String(text.to_string())).collect())
         .unwrap_or_default();
     json!({
-        // 对外 id 用老名字（能用的话），上游发送名走 `upstreamKey`
-        "id": stable_id(&code, &display),
+        // 对外 id = 上游的 `modelName`（见 `stable_id`）；`name` 才是展示名
+        "id": stable_id(&code, &display, &model_name),
         "name": display,
         "maxInputTokens": context_window,
         // 上游没给输出上限；与 contextWindow 同量级地给一个保守值会让界面误导，
@@ -242,6 +249,10 @@ fn normalize_entry(entry: &Value) -> Value {
         "supportsToolCall": true,
         "isDefault": entry.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
         "kind": "chat",
+        // 区域可用性（上游给的 cnAvailable / enAvailable）：同一展示名的
+        // 多区域变体靠它区分（如 qwen3.8-max 的 cn 版与 @sg 版）
+        "cnAvailable": entry.get("cnAvailable").and_then(Value::as_bool).unwrap_or(false),
+        "enAvailable": entry.get("enAvailable").and_then(Value::as_bool).unwrap_or(false),
         // 自有键（进不了 /v1/models，路由与思考档位要用）
         "upstreamKey": code,
         "reasoningEfforts": Value::Array(efforts),
@@ -312,7 +323,15 @@ fn effort_placement(entry: &Value) -> EffortPlacement {
     }
 }
 
-/// 当前清单：远程（有的话）优先，按 id 去重后拼接兜底。
+/// 当前清单：远程（有的话）优先，**一个地区都没有远程清单时**才用兜底。
+///
+/// ── 为什么不是「这一格空了就用兜底」（2026-10-05 修）──────────
+/// 两格各自回落兜底，会在「只有一边刷到过」时把兜底**混进**并集：实测国内版
+/// 那格没刷过（账号只走 GLOBAL），并集里就多出 5 条上游已经下架 / 已标
+/// `visible: false` 的旧名字（`qwen3.6-plus` / `qwen3-max-2026-01-23` /
+/// `gpt-5.4` / `gpt-5.2-1211` / `MiniMax-M2.5`）—— 用户点了必然失败，而清单
+/// 看着「有」。兜底清单的职责是「进程刚起来 / 断网 / 没账号时列表不为空」，
+/// 一旦拿到过任何一份远程清单，就不该再有它的位置：清单以目录为准。
 fn region_models(region: Region) -> Vec<Value> {
     let cached = {
         let guard = cache_slot(region).read().unwrap_or_else(|error| error.into_inner());
@@ -321,7 +340,15 @@ fn region_models(region: Region) -> Vec<Value> {
     if !cached.is_empty() {
         return cached;
     }
-    fallback_models()
+    let any_remote = Region::ALL.iter().any(|other| {
+        let guard = cache_slot(*other).read().unwrap_or_else(|error| error.into_inner());
+        !guard.models.is_empty()
+    });
+    if any_remote {
+        Vec::new()
+    } else {
+        fallback_models()
+    }
 }
 
 /// 全部地区的并集（GLOBAL 优先；同 id 去重）。聚合目录与 `resolve` 都用它。
@@ -362,10 +389,12 @@ pub fn last_refreshed_at(region: Region) -> i64 {
 /// 与聚合目录同一口径（先 `id` 再 `name`，trim + 忽略大小写），否则会出现
 /// 「目录放行、转发层认不出」的静默失配（与 AutoClaw 那次同一个坑）。
 ///
-/// ── 老名字为什么也认 ────────────────────────────────────────
-/// 远程条目的 `id` 已经是「能沿用就沿用」的老名字（见 [`STABLE_IDS`]），
-/// 所以用户手上的老配置直接命中 `id`；`upstreamKey` 兜住「客户端从桌面端
-/// 抄了代号过来」这一种输入。两条都在这里一次认全。
+/// ── 三个键都要认 ────────────────────────────────────────────
+/// `id`（= 上游 `modelName`，用户与官方客户端用的名字）、`name`（展示名，
+/// 用户在列表里看到的名字）、`upstreamKey`（上游代号，客户端从桌面端
+/// 抓包抄过来的那种输入）—— 三条都命中同一个条目，少认一条就是
+/// 「列表里有、请求时 404」。展示名那一条在 id 改成 `modelName` 之后
+/// 尤其不能省：老配置里可能写的是 `GPT 6 Astra` 这类展示名。
 pub fn resolve(model_name: &str, region: Region) -> Option<Value> {
     let wanted = model_name.trim();
     if wanted.is_empty() {
@@ -569,4 +598,109 @@ fn is_chat_entry(entry: &Value) -> bool {
                         .any(|blocked| operation.eq_ignore_ascii_case(blocked))
                 })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    //! 对外 id 的口径（上游 `modelName`，**不是**展示名）—— 2026-10-05 实测复核。
+    //!
+    //! 守的是「同一份上游清单在本网关与官方客户端长得不一样」这个症状：
+    //! 曾经拿 `modelDisplayName` 当 id，于是官方客户端里的 `gpt-6-astra` 到本网关
+    //! 变成 `GPT 6 Astra`，区域变体要靠拼后缀消歧，上游给中文展示名的条目
+    //! （`Standard` / `专业` / `极致`）还会把中文营销词广告成模型 id。
+    use super::*;
+
+    /// 上游三条真实条目（字段按实测裁剪）：id 必须是 `modelName`，
+    /// 展示名只进 `name`。
+    #[test]
+    fn id_comes_from_model_name_not_the_display_name() {
+        let entry = normalize_entry(&json!({
+            "modelCode": "1Helix-G6aS8tR2qN7m",
+            "modelName": "gpt-6-astra",
+            "modelDisplayName": "GPT 6 Astra",
+            "contextWindow": 1_050_000,
+            "multimodal": true,
+        }));
+        assert_eq!(Some("gpt-6-astra"), entry.get("id").and_then(Value::as_str));
+        assert_eq!(Some("GPT 6 Astra"), entry.get("name").and_then(Value::as_str));
+        assert_eq!(
+            Some("1Helix-G6aS8tR2qN7m"),
+            entry.get("upstreamKey").and_then(Value::as_str),
+            "发给上游的仍是代号"
+        );
+    }
+
+    /// 上游给中文展示名的两条（`Standard` = deepseek-v4-flash、
+    /// `专业` = gemini-3.8-flash）：id 不能是中文营销词。
+    #[test]
+    fn chinese_marketing_display_names_never_become_ids() {
+        let standard = normalize_entry(&json!({
+            "modelCode": "1Nexus-R3wF8qJ5vB6h",
+            "modelName": "deepseek-v4-flash",
+            "modelDisplayName": "Standard",
+            "contextWindow": 1_000_000,
+        }));
+        assert_eq!(Some("deepseek-v4-flash"), standard.get("id").and_then(Value::as_str));
+        assert_eq!(Some("Standard"), standard.get("name").and_then(Value::as_str));
+
+        let pro = normalize_entry(&json!({
+            "modelCode": "1Orbit-I9eY4tK8bW1f",
+            "modelName": "gemini-3.8-flash",
+            "modelDisplayName": "专业",
+            "contextWindow": 1_000_000,
+        }));
+        assert_eq!(Some("gemini-3.8-flash"), pro.get("id").and_then(Value::as_str));
+    }
+
+    /// 区域变体的 `@sg` 本来就在 `modelName` 里，不再靠拼展示名后缀。
+    #[test]
+    fn regional_variant_keeps_the_upstream_suffix() {
+        let entry = normalize_entry(&json!({
+            "modelCode": "1Drift-T3T9WWS9a23w",
+            "modelName": "qwen3.8-max@sg",
+            "modelDisplayName": "Qwen 3.8 Max",
+            "contextWindow": 1_000_000,
+        }));
+        assert_eq!(Some("qwen3.8-max@sg"), entry.get("id").and_then(Value::as_str));
+        // 主版本与 @sg 版是两个不同的 id（上游就是这么给的）
+        let main = normalize_entry(&json!({
+            "modelCode": "1Drift-T3TB6WS9a23w",
+            "modelName": "qwen3.8-max",
+            "modelDisplayName": "Qwen 3.8 Max",
+            "contextWindow": 1_000_000,
+        }));
+        assert_ne!(entry.get("id"), main.get("id"));
+    }
+
+    /// 兜底清单与远程清单必须给出**同一批 id**（否则「这次没拉到目录」会让
+    /// 用户已配好的名字 404）。
+    #[test]
+    fn fallback_ids_match_the_upstream_model_names() {
+        let fallback = fallback_models();
+        let ids: Vec<String> = fallback
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        for wanted in [
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
+            "gpt-5.4",
+            "gpt-5.2-1211",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "glm-5",
+        ] {
+            assert!(ids.iter().any(|id| id == wanted), "兜底清单缺 {wanted}: {ids:?}");
+        }
+        // 展示名不该出现在 id 里（它是中文 / 带空格的营销名）
+        assert!(!ids.iter().any(|id| id.contains(' ')), "兜底 id 里不该有空格: {ids:?}");
+    }
+
+    /// `modelName` 缺失时才回退展示名，两者都缺才用代号。
+    #[test]
+    fn stable_id_falls_back_in_order() {
+        assert_eq!("gpt-6-astra", stable_id("1Helix-x", "GPT 6 Astra", "gpt-6-astra"));
+        assert_eq!("GPT 6 Astra", stable_id("1Helix-x", "GPT 6 Astra", "  "));
+        assert_eq!("1Helix-x", stable_id("1Helix-x", "", ""));
+    }
 }

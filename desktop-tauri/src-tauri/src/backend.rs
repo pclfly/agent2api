@@ -98,10 +98,24 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     // 失败一律原样返回：`bootstrap` 只在「本该执行的目录迁移没有执行」时返回
     // Err（防御性校验，见那边的注释）—— 继续下去会把新配置目录建出来，
     // 让迁移永远无法重试，所以这里必须中断而不是带着错误往下走。
-    // 桌面形态永远只听本机回环：管理 API 不出 127.0.0.1（headless 形态
-    // 由 agent2api-server 二进制按 AGENT2API_HOST 自行决定监听地址）。
-    let state = server::ServerState::bootstrap(port, std::net::IpAddr::from([127, 0, 0, 1]))
-        .map_err(StartupFailure::other)?;
+    // 监听地址：默认只听本机回环（管理 API 免鉴权成立的前提，取舍见
+    // `gateway::bind_host` 的注释）；设了 `AGENT2API_HOST` 才放开，供
+    // 「这台机器给局域网其他设备当网关」这类用法。
+    let host = crate::gateway::bind_host();
+    let state = server::ServerState::bootstrap(port, host).map_err(StartupFailure::other)?;
+
+    // 非回环监听是「我自己要开放」的显式选择，但它把免鉴权语义的代价放大了：
+    // 没配 Key 时同网段任何人都能读写账号、看日志、用掉额度。日志里明确警告
+    // 一次，免得没看文档就把端口暴露出去（headless 形态对应的是
+    // `v1_fail_closed` 闸门，桌面形态不开那道闸，所以至少要留痕）。
+    if !host.is_loopback() && server::config::current().active_api_keys().is_empty() {
+        server::logging::log(
+            "[Security]",
+            &format!(
+                "⚠️  已监听 {host}（非本机回环）且未配置 API Key：/api/* 与 /v1/* 对同网段完全开放，请立即在「网关 Key」页创建一把"
+            ),
+        );
+    }
 
     // 面板访问控制的库句柄注入（桌面不注册管理员 → 该体系不启用，行为不变；
     // 与容器共用数据目录且注册过时，桌面管理 API 需要 Key —— 壳自动携带）
@@ -144,7 +158,7 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
     while std::time::Instant::now() < deadline {
         if is_ready(port).await {
-            server::logging::log("[Server]", &format!("服务已就绪（127.0.0.1:{port}）"));
+            server::logging::log("[Server]", &format!("服务已就绪（{host}:{port}）"));
             // 起来了就清掉上一次的失败记录：那条记录描述的是「之前起不来」，
             // 留着会让界面在网关正常运行时仍显示「端口被占用」——
             // 用户刚结束完进程重启，看到这个只会以为没生效。

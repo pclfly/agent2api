@@ -591,7 +591,13 @@ pub fn shim_js() -> &'static str {
         phone: String(payload.phone || ''),
         code: String(payload.code || ''),
       };
+      // deviceId（AutoClaw）与 msgid（Loomy）是「发码 → 登录」之间的两个中间态，
+      // 都按「有值才带」整形。`msgid` 漏掉过一次（Loomy 登录恒报
+      // 「手机号 / 验证码 / msgid 不完整」）：界面把发码拿到的 msgid 放进了
+      // payload，这里整形时没带上，后端读到空串就先行拒绝，压根没打上游 ——
+      // 与桌面壳 `bridge.rs` 的同名方法必须逐字对齐（只加一边时另一形态坏掉）。
       if (payload.deviceId) body.deviceId = String(payload.deviceId);
+      if (payload.msgid) body.msgid = String(payload.msgid);
       if (payload.name) body.name = String(payload.name);
       if (payload.provider) body.provider = String(payload.provider);
       return call('POST', '/api/session/login/sms/verify', body);
@@ -804,4 +810,48 @@ pub fn shim_js() -> &'static str {
   };
 })();
 "#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shim_js;
+
+    /// `verifySmsLogin` 必须把后端要读的每一个键都整形进去。
+    ///
+    /// ── 这条用例钉的是什么（真实缺陷）────────────────────────────
+    /// 桥接层是「界面 → 网关」的唯一入口，它**逐键整形**请求体 —— 于是它
+    /// 天然是一个「白名单」：界面放进 payload 的键，只要这里没写，就会被
+    /// **静默丢掉**（没有报错、没有日志，请求照发）。
+    ///
+    /// 真实事故：界面（`ui/sms-login.js`）已经正确地把发码拿到的 `msgid`
+    /// 放进 payload，桥接整形时漏了这一个键 —— 后端
+    /// `api::session::login_sms_verify` 读到空串，在**打上游之前**就用
+    /// 「手机号 / 验证码 / msgid 不完整，请重新获取验证码」拒绝。
+    /// 那条文案把用户指向「重发验证码」，而重发完全正常、验证码也是对的，
+    /// 于是用户只会一遍遍重发 —— 一个丢键 bug 被伪装成了上游问题。
+    ///
+    /// 与桌面壳 `src/bridge.rs` 的同名用例成对存在（两个壳都要守：
+    /// 只加一边时，另一形态下的界面照样坏）。
+    #[test]
+    fn verify_sms_login_forwards_every_key_the_backend_reads() {
+        let script = shim_js();
+        let start = script
+            .find("verifySmsLogin")
+            .expect("shim 脚本里必须有 verifySmsLogin");
+        // 切到下一个方法为止：只在 verifySmsLogin 自己的整形体里找键，
+        // 免得别处恰好出现同名字段让断言假通过
+        let end = script[start..]
+            .find("getAutoCheckin")
+            .map(|offset| start + offset)
+            .expect("verifySmsLogin 之后应当还有 getAutoCheckin");
+        let body = &script[start..end];
+
+        for key in ["phone", "code", "deviceId", "msgid", "name", "provider"] {
+            assert!(
+                body.contains(&format!("payload.{key}")),
+                "verifySmsLogin 漏掉了 `{key}` —— 后端会读它，丢键的后果是\
+                 后端在打上游之前就报「参数不完整」，现象指向错误的排查方向"
+            );
+        }
+    }
 }

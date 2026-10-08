@@ -116,6 +116,18 @@ pub mod content_block;
 /// 形态调用它 —— 挂在这里与其它子模块并列，便于对照「内置家走适配器、
 /// 自定义家走独立通道」的两条路径。
 pub mod custom;
+/// LobsterAI（有道龙虾）。适配器 / 凭据 / 登录 / 目录 / 签到 / 积分
+/// 全部在 `lobsterai/` 下（模块头有协议速览与出站指纹说明）。
+/// 参照实现为参考仓库的 `src/lobsterai*.ts`。
+pub mod lobsterai;
+/// Loomy（讯飞办公助手）。适配器 / 签名 / 短信登录 / 目录 / 签到 / 积分
+/// 全部在 `loomy/` 下（模块头有双基址与两套认证头的说明）。
+/// 参照实现为参考仓库的 `src/loomy*.ts`。
+pub mod loomy;
+/// MiniMax Code（中国版）。适配器 / 设备码登录 / Anthropic Messages 转换
+/// / 签到 / 积分全部在 `minimax/` 下（模块头有思考决策表与 SSE 帧型的说明）。
+/// 参照实现为参考仓库的 `src/minimax*.ts`。
+pub mod minimax;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
@@ -283,6 +295,74 @@ pub enum ProviderKind {
     /// `core::auto_checkin` 的提供商清单不含本家。每日签到存在，但要单独授权
     /// 才会接（见 cpa-deploy/notes/agent2api-trae-port-plan.md 的 §8 决策 3）。
     Trae,
+    /// LobsterAI（有道龙虾）。适配实现在 `providers::lobsterai/`。
+    ///
+    /// ── 上游长什么样（参照 `lobsterai2api` / 参考实现，见
+    ///    `providers::lobsterai` 的模块头）────────────────────
+    /// 对话是 **OpenAI 兼容、仅支持 SSE**（`/api/proxy/v1/chat/completions`），
+    /// 因此走**无状态**转发路径（与 raccoon / autoclaw 同构）。
+    /// 登录是**本地回调服务器 + authCode 换 token**（portal 页面把浏览器送回
+    /// `http://127.0.0.1:{临时端口}/auth/callback`），与 Trae 的回调形态同源。
+    /// 出站指纹 = `LobsterAI/0.1.0` UA + `X-LobsterAI-Client-Capabilities`
+    /// + `X-LobsterAI-Client-Version`（**动态版本号**，决定模型列表里有没有
+    /// `kimi-k3`；不带能力头时 `reasoning_effort:"off"` 会被上游 500）。
+    /// 凭据可静默续期（`/api/auth/refresh`，请求体必须带 uuid /
+    /// firstKeyfrom / latestKeyfrom —— 丢了只能重新登录）。
+    ///
+    /// ── 签到与积分都在 ──────────────────────────────────────
+    /// 每日签到是**三步链路**（slot → context → check_in，客户端幂等键），
+    /// 积分读 `/api/user/profile-summary` 的 `creditItems[]`。
+    /// 因此本家**在** `core::auto_checkin` 的提供商清单里。
+    LobsterAi,
+    /// Loomy（讯飞办公助手）。适配实现在 `providers::loomy/`。
+    ///
+    /// ── 上游长什么样（参照参考实现的 `loomy*.ts`）───────────
+    /// 对话是**标准 OpenAI 兼容 + 标准 SSE**（`loomyad.xunfei.cn/api/v1`），
+    /// 因此走**无状态**转发路径。登录是**短信验证码**（讯飞 CAccount，
+    /// HMAC-SHA1 签名 —— 本项目唯一一家短信登录的反代，与 AutoClaw 的
+    /// 短信登录共用 `api/session` 那条链路、按 provider 分派）。
+    ///
+    /// ── 两个必须记住的坑（写死在协议层）────────────────────
+    /// 1. **两套认证头**：`/chat/completions` 只认 `Authorization: Bearer`，
+    ///    而 `/models`、`/points/*` 只认小写 `token` 头 —— 转发时两个都发；
+    /// 2. **没有 refresh 端点**：session 是登录时声明 14 天得来的，
+    ///    过期只能重新短信登录。故 `supports_refresh()` 恒 false ——
+    ///    诚实标记，不是遗漏（与 CatPaw 同一处境、同一处置）。
+    ///
+    /// ── 签到与积分都在 ──────────────────────────────────────
+    /// 签到是 `POST /points/first-login`（幂等判据 `alreadyProcessed`），
+    /// 积分读 `/points/records`（只读，两个池分开显示）。
+    /// 因此本家**在** `core::auto_checkin` 的提供商清单里。
+    Loomy,
+    /// MiniMax Code（**中国版**）。适配实现在 `providers::minimax/`。
+    ///
+    /// ── 上游长什么样（参照参考实现的 `minimax*.ts`）─────────
+    /// 推理是 **Anthropic Messages 协议**
+    /// （`agent.minimax.cn/mavis/api/v1/llm/v1/messages`），流是 Anthropic
+    /// 帧型（`message_start` / `content_block_*` / `message_delta`），
+    /// 必须转换为 OpenAI chunk —— 因此 `is_stateful()` 为 true
+    /// （与 Qoder / CatPaw / CodeArts / Trae 同一条有状态路径）。
+    /// 登录是 **OAuth 设备码 + PKCE S256**（`account.minimax.cn`），
+    /// 与 Qoder / Cline 的设备授权同形；凭据可续期（refresh_token grant）。
+    /// 出站指纹 = OAuth `client_id: mcode-public` / `audience: agent-backend`
+    /// / `scope: agent.default`（令牌响应必须含 scope）；推理头只带
+    /// `Authorization` + `Content-Type` + `Accept: text/event-stream`
+    /// （**实测不需要 `anthropic-version`**，不加）。
+    ///
+    /// ── 凭据不是 JWT ───────────────────────────────────────
+    /// `access_token` 前缀 `mmoat_`、60 字符、0 个点 —— 解不出 `exp`，
+    /// 因此 `expires_at` **必须**由 `expires_in` 自算写入（登录与续期两处）。
+    ///
+    /// ── 签到与积分都在 ──────────────────────────────────────
+    /// 签到是 `signin/status` + `signin/claim`（幂等判据 `claim_result`，
+    /// 必须带 `timezone_id`）；积分读 `credit/details`。
+    /// 因此本家**在** `core::auto_checkin` 的提供商清单里。
+    ///
+    /// ── 为什么只有一家、没有"国际版"伴生 ────────────────────
+    /// 参考实现只做了**中国版**（`region: 'cn'`，主机 `*.minimax.cn`）。
+    /// 国际版将来接入时另立 kind（`minimax-intl`）—— 不要往本家塞 region
+    /// 字段（那是本文件反复拒绝的那个坑）。
+    Minimax,
 }
 
 /// 一个提供商的静态元数据。
@@ -330,6 +410,15 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "zcode-intl", label: "ZCode 国际版" },
     ProviderMeta { id: "codearts", label: "CodeArts" },
     ProviderMeta { id: "trae", label: "Trae" },
+    // 三家新反代（Phase 0 骨架接入）：都是「登录态 + 模型转发 + 签到 + 积分」
+    // 的完整反代形态，排列按产品线的常见程度（LobsterAI 桌面用户最多）。
+    // 顺序也决定模型目录合并时同名模型先归谁家 —— 三家的模型名互不重叠
+    // （LobsterAI 有 MiniMax-M3 这类第三方模型名，但那与 MiniMax 官方的
+    // provider 是两回事：聚合清单先到先得，撞名时后一家整家消失，
+    // 故这里保持各自注册表位置的稳定性）。
+    ProviderMeta { id: "lobsterai", label: "LobsterAI" },
+    ProviderMeta { id: "loomy", label: "Loomy" },
+    ProviderMeta { id: "minimax", label: "MiniMax" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -404,6 +493,9 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "zcode-intl" => Some(ProviderKind::ZcodeIntl),
         "codearts" => Some(ProviderKind::CodeArts),
         "trae" => Some(ProviderKind::Trae),
+        "lobsterai" => Some(ProviderKind::LobsterAi),
+        "loomy" => Some(ProviderKind::Loomy),
+        "minimax" => Some(ProviderKind::Minimax),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -436,6 +528,9 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::ZcodeIntl => "zcode-intl",
         ProviderKind::CodeArts => "codearts",
         ProviderKind::Trae => "trae",
+        ProviderKind::LobsterAi => "lobsterai",
+        ProviderKind::Loomy => "loomy",
+        ProviderKind::Minimax => "minimax",
     }
 }
 

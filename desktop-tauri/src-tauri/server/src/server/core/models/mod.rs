@@ -3,10 +3,16 @@
 //! 模型清单内嵌于 WorkBuddy 内置 CLI 的 product.json（v5.3.14）。这里收录
 //! 主要对话/多模态模型，作为 /v1/models 响应与默认模型回退。
 //!
-//! 运行时权威来源：`GET {endpoint}/v3/config` → `data.models`（企业账号再取
+//! 运行时权威来源：`GET {endpoint}/v3/config` 的**选择器清单**
+//! （`data.agents[].models`，cli agent 优先；企业账号再取
 //! `{endpoint}/console/enterprises/{id}/config/models`，本模块一并实现）。
 //! 注意：服务端按官方客户端 UA 区分来源，缺失 UA 时 /v3/config 的 models
 //! 可能返回 null，因此 refresh 时必须带 User-Agent。
+//!
+//! ⚠️ **不要**改回 `data.models`（那是全量目录，国内版实测 55 条，含虚拟档位
+//! 别名与专线变体）：官方桌面端选择器展示的是 `agents[].models` 那份（17 条），
+//! 读全量目录会让本网关的清单比官方客户端与 workbuddy2api-hub 都宽出一倍，
+//! 详见 [`picker_models`] 的说明。
 //!
 //! ── 远程清单的持久化（与 Node 版的唯一一处有意分叉）──────────
 //! 任务书提到「只在版本变化时写盘 {config_dir}/models.json」；早先按「Node 版
@@ -96,46 +102,99 @@ const CHAT_MODEL_EXCLUDE_PREFIXES: &[&str] = &[
 /// 远程目录刷新失败时保留内置目录的说明（Node 的 reason 文案）
 const REASON_NO_SESSION: &str = "缺少登录态，使用内置模型目录";
 
-/// 内置模型目录（id → 元数据），逐字段照抄 Node 版 BUILTIN_MODELS。
+/// 内置模型目录（id → 元数据）—— **按版本两份**。
 ///
-/// credits 字段为桌面端展示的单价，仅作参考。
-fn builtin_models() -> Vec<Value> {
+/// ── 为什么是两份（2026-10，参考 workbuddy2api-hub）───────────
+/// 上游按站点下发两套清单：国际版（`www.workbuddy.ai`）29 个、国内版
+/// （`copilot.tencent.com`）55 个；交集里的同名模型**倍率也不同**
+/// （`fast-model`：国际版 x0.34 / 国内版 x0.21；`deep-model`：x3.33 / x1.20；
+/// `deepseek-v4.1-flash` 只在国际版、且是 x0.00 限时免费）。
+/// 只有一份内置表时，兜底清单必然有一半是错的 —— 而「管理页显示 A 版本的名字
+/// 配 B 版本的倍率」正是改造前的实际症状。
+///
+/// 数据是 2026-10-04 用两个版本的账号各拉一次 `/v3/config` 的实测快照
+/// （过滤掉非对话模型后：国际版 27 条、国内版 38 条），性质与 hub 的
+/// `STATIC_INTL_MODELS` / `STATIC_CN_MODELS` 相同，只是更新。
+/// `credits` 为 `x0.00` 的就是**限时免费**档：
+///   国际版 → `deepseek-v4.1-flash` / `hy4-preview-f` / `hy3`；
+///   国内版 → `hy3` / `hy3-b` / `hy3-c`。
+///
+/// `credits` 字段为桌面端展示的单价，仅作参考。
+fn builtin_models_intl() -> Vec<Value> {
     json!([
-        { "id": "auto", "name": "Auto", "vendor": "f", "credits": "", "maxOutputTokens": 32000, "maxInputTokens": 168000, "supportsToolCall": true, "supportsImages": true, "isDefault": true, "descriptionZh": "平衡效果与速度" },
-        { "id": "default", "name": "Default", "vendor": "v", "credits": "x2.00 credits", "maxOutputTokens": 24000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": false },
+        {"id": "default-model", "name": "Auto", "maxInputTokens": 176000, "maxOutputTokens": 24000, "maxAllowedSize": 200000, "supportsImages": true, "supportsToolCall": true, "vendor": "e", "descriptionZh": "优秀的编码模型，适合日常使用", "descriptionEn": "Excellent coding model, great for daily use", "temperature": 1, "isDefault": true},
+        {"id": "fast-model", "name": "Fast", "credits": "x0.34 credits", "maxInputTokens": 200000, "maxOutputTokens": 32000, "maxAllowedSize": 200000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "i", "descriptionZh": "响应快，适合简单任务", "descriptionEn": "Fast responses for simple tasks", "temperature": 1},
+        {"id": "balanced-model", "name": "Balanced", "credits": "x0.59 credits", "maxInputTokens": 256000, "maxOutputTokens": 32000, "maxAllowedSize": 256000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "速度与质量兼顾，日常工作首选", "descriptionEn": "Balanced speed and quality for daily working", "temperature": 1},
+        {"id": "primary-model", "name": "Primary", "credits": "x3.31 credits", "maxInputTokens": 272000, "maxOutputTokens": 72000, "maxAllowedSize": 272000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "高质量输出，胜任复杂任务", "descriptionEn": "High-quality output for complex challenges"},
+        {"id": "deep-model", "name": "Deep", "credits": "x3.33 credits", "maxInputTokens": 176000, "maxOutputTokens": 24000, "maxAllowedSize": 200000, "supportsImages": true, "supportsToolCall": true, "vendor": "e", "descriptionZh": "深度推理，适合深度分析与难题", "descriptionEn": "Deep reasoning for analysis and hard problems", "temperature": 1},
+        {"id": "kimi-k2.8-preview", "name": "Kimi-K2.8-Preview", "credits": "x0.77", "maxInputTokens": 1000000, "maxOutputTokens": 32000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "擅长处理复杂的长程自主任务，前端开发能力突出，同时在知识工作与科研推理上表现出色。", "descriptionEn": "Excels at complex, long-horizon autonomous tasks, with standout front-end skills and strong knowledge work and scientific reasoning", "temperature": 1},
+        {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "credits": "x0.00", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "DeepSeek 旗舰模型，支持 1M 上下文窗口，原生多模态", "descriptionEn": "DeepSeek flagship model, supporting 1M context window, native multimodal model", "temperature": 1},
+        {"id": "deepseek-v4.1-flash-sg", "name": "Deepseek-V4.1-Flash", "credits": "x0.03", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "DeepSeek 旗舰模型，支持 1M 上下文窗口，原生多模态", "descriptionEn": "DeepSeek flagship model, supporting 1M context window, native multimodal model", "temperature": 1},
+        {"id": "glm-5.3-flash", "name": "GLM-5.3-Flash", "credits": "x0.06", "maxInputTokens": 1000000, "maxOutputTokens": 32000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "原生多模态模型，擅长视觉理解与专业任务", "descriptionEn": "Native multimodal model, excelling at visual understanding and professional tasks", "temperature": 1},
+        {"id": "gpt-6-astra", "name": "GPT-6-Astra", "credits": "x6.67", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "OpenAI 旗舰模型，擅长复杂推理与长程任务", "descriptionEn": "OpenAI's flagship model for complex reasoning and long-horizon task"},
+        {"id": "hy4-preview-f", "name": "Hy4 preview", "credits": "x0.00", "maxInputTokens": 1000000, "maxOutputTokens": 64000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "hy4-preview", "name": "Hy4 preview", "credits": "x0.29", "maxInputTokens": 1000000, "maxOutputTokens": 64000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "hy3", "name": "Hy3", "credits": "x0.00", "maxInputTokens": 192000, "maxOutputTokens": 64000, "maxAllowedSize": 192000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "credits": "x3.47", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": false, "vendor": "e", "descriptionZh": "OpenAI 旗舰模型，擅长复杂推理与长程任务", "descriptionEn": "OpenAI's flagship model for complex reasoning and long-horizon task"},
+        {"id": "gpt-5.6-terra", "name": "GPT-5.6-Terra", "credits": "x1.39", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": false, "vendor": "e", "descriptionZh": "OpenAI 均衡模型，兼顾能力、速度与成本", "descriptionEn": "OpenAI's balanced model for capability, speed, and cost"},
+        {"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "credits": "x0.14", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": false, "vendor": "e", "descriptionZh": "OpenAI 轻量模型，响应快速，适合日常任务", "descriptionEn": "OpenAI's lightweight model for fast responses and everyday tasks"},
+        {"id": "gpt-5.5", "name": "GPT-5.5", "credits": "x3.31", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "OpenAI 旗舰编码模型，擅长长程任务", "descriptionEn": "OpenAI's flagship model, excelling at long-horizon tasks"},
+        {"id": "gpt-5.4", "name": "GPT-5.4", "credits": "x1.65", "maxInputTokens": 272000, "maxOutputTokens": 72000, "maxAllowedSize": 272000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "OpenAI 旗舰编码模型，擅长长程任务", "descriptionEn": "OpenAI's flagship model, excelling at long-horizon tasks"},
+        {"id": "gemini-3.5-flash", "name": "Gemini-3.5-Flash", "credits": "x0.99", "maxInputTokens": 1000000, "maxOutputTokens": 65536, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "能力均衡，适合日常使用", "descriptionEn": "Well-rounded model for everyday use", "temperature": 1},
+        {"id": "glm-5.3", "name": "GLM-5.3", "credits": "x0.79", "maxInputTokens": 1000000, "maxOutputTokens": 48000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "能力均衡，适合日常使用", "descriptionEn": "Great for daily use", "temperature": 1},
+        {"id": "glm-5.2", "name": "GLM-5.2", "credits": "x0.79", "maxInputTokens": 1000000, "maxOutputTokens": 48000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": false, "vendor": "e", "descriptionZh": "1M 上下文，擅长长程任务", "descriptionEn": "1M context, built for long-horizon tasks.", "temperature": 1},
+        {"id": "kimi-k3", "name": "Kimi-K3", "credits": "x1.62", "maxInputTokens": 1000000, "maxOutputTokens": 32000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "擅长处理复杂的长程自主任务，前端开发能力突出，同时在知识工作与科研推理上表现出色。", "descriptionEn": "Excels at complex, long-horizon autonomous tasks, with standout front-end skills and strong knowledge work and scientific reasoning", "temperature": 1},
+        {"id": "kimi-k2.6", "name": "Kimi-K2.6", "credits": "x0.52", "maxInputTokens": 256000, "maxOutputTokens": 32000, "maxAllowedSize": 256000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "多模态模型，适合日常任务", "descriptionEn": "A multimodal model, good for daily use.", "temperature": 1},
+        {"id": "grok-4.7", "name": "Grok-4.7", "credits": "x1.90", "maxInputTokens": 500000, "maxOutputTokens": 128000, "maxAllowedSize": 500000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "SpaceXAI 打造的前沿模型，专为编程、智能体任务及知识型工作而设计。", "descriptionEn": "SpaceXAI's frontier model built for coding, agentic tasks, and knowledge work.", "temperature": 1},
+        {"id": "gemini-3.8-flash", "name": "Gemini-3.8-Flash", "credits": "x0.95", "maxInputTokens": 1000000, "maxOutputTokens": 65536, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "能力均衡，适合日常使用", "descriptionEn": "Built for long-horizon coding and autonomous agents.", "temperature": 1},
+        {"id": "gpt-6-sol", "name": "GPT-6-Sol", "credits": "x1.33", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "专为复杂编码和智能体工作流构建的模型", "descriptionEn": "Built for complex coding and agentic workflows."},
+        {"id": "gpt-6-luna", "name": "GPT-6-Luna", "credits": "x0.07", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "专为单一聚焦、高吞吐量任务打造的高效模型", "descriptionEn": "Most efficient model for focused, high-volume tasks."},
+    ])
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+}
 
-        { "id": "deepseek-v4-pro", "name": "Deepseek-V4-Pro", "vendor": "f", "credits": "x0.16 credits", "maxOutputTokens": 50000, "maxInputTokens": 1000000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true, "descriptionZh": "DeepSeek 旗舰模型，支持 1M 上下文窗口" },
-        { "id": "deepseek-v4-flash", "name": "Deepseek-V4-Flash", "vendor": "f", "credits": "x0.06 credits", "maxOutputTokens": 50000, "maxInputTokens": 1000000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true, "descriptionZh": "DeepSeek 旗舰模型，支持 1M 上下文窗口" },
-        // deepseek-v4.1-flash 不在 5.3.14 内置清单/旧版 /v3/config 里，但上游实测可路由；
-        // 作为远程清单不可用时的兜底定义（远程正常时以远程元数据为准）。
-        { "id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "vendor": "f", "credits": "x0.03 credits", "maxOutputTokens": 50000, "maxInputTokens": 1000000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true, "descriptionZh": "DeepSeek 快速模型，支持 1M 上下文窗口" },
-        { "id": "deepseek-v3-2-volc", "name": "DeepSeek-V3.2", "vendor": "f", "credits": "", "maxOutputTokens": 32000, "maxInputTokens": 96000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-
-        { "id": "glm-5.1", "name": "GLM-5.1", "vendor": "e", "credits": "", "maxOutputTokens": 48000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "glm-5.0", "name": "GLM-5.0", "vendor": "f", "credits": "", "maxOutputTokens": 48000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "glm-5.0-turbo", "name": "GLM-5.0-Turbo", "vendor": "e", "credits": "", "maxOutputTokens": 48000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "glm-5v-turbo", "name": "GLM-5v-Turbo", "vendor": "e", "credits": "", "maxOutputTokens": 38000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "glm-4.7", "name": "GLM-4.7", "vendor": "f", "credits": "", "maxOutputTokens": 48000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "glm-4.6", "name": "GLM-4.6", "vendor": "f", "credits": "", "maxOutputTokens": 32000, "maxInputTokens": 168000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true },
-        { "id": "glm-4.6v", "name": "GLM-4.6V", "vendor": "f", "credits": "", "maxOutputTokens": 32000, "maxInputTokens": 128000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-
-        { "id": "minimax-m2.5", "name": "MiniMax-M2.5", "vendor": "f", "credits": "", "maxOutputTokens": 48000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "minimax-m2.7", "name": "MiniMax-M2.7", "vendor": "f", "credits": "", "maxOutputTokens": 48000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "minimax-m3-play", "name": "MiniMax-M3", "vendor": "f", "credits": "x0.25 credits", "maxOutputTokens": 48000, "maxInputTokens": 512000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true, "descriptionZh": "原生多模态，擅长代码、智能体任务" },
-
-        { "id": "kimi-k2.6", "name": "Kimi-K2.6", "vendor": "f", "credits": "", "maxOutputTokens": 32000, "maxInputTokens": 256000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "kimi-k2.5", "name": "Kimi-K2.5", "vendor": "f", "credits": "", "maxOutputTokens": 32000, "maxInputTokens": 256000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "kimi-k2-thinking", "name": "Kimi-K2-Thinking", "vendor": "f", "credits": "", "maxOutputTokens": 32000, "maxInputTokens": 256000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "kimi-k2-instruct-taiji", "name": "Kimi-K2", "vendor": "f", "credits": "", "maxOutputTokens": 8192, "maxInputTokens": 31000, "supportsToolCall": true, "supportsImages": true },
-
-        { "id": "hy3-preview", "name": "Hy3 preview", "vendor": "j", "credits": "", "maxOutputTokens": 64000, "maxInputTokens": 192000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "hy3-preview-agent", "name": "Hy3 preview", "vendor": "j", "credits": "x0.04 credits", "maxOutputTokens": 64000, "maxInputTokens": 192000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "hunyuan-chat", "name": "Hunyuan-Turbos", "vendor": "j", "credits": "", "maxOutputTokens": 8192, "maxInputTokens": 128000, "supportsToolCall": true, "supportsImages": true, "descriptionZh": "腾讯自研的轻量、快速的通用模型" },
-        { "id": "hunyuan-2.0-instruct", "name": "Hunyuan-2.0-Instruct", "vendor": "j", "credits": "", "maxOutputTokens": 16000, "maxInputTokens": 128000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "hunyuan-2.0-thinking", "name": "Hunyuan-2.0-Thinking", "vendor": "e", "credits": "", "maxOutputTokens": 24000, "maxInputTokens": 128000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-
-        { "id": "default-1.1", "name": "Claude-3.7-Sonnet", "vendor": "e", "credits": "", "maxOutputTokens": 8192, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "default-1.2", "name": "Claude-4.0-Sonnet", "vendor": "e", "credits": "", "maxOutputTokens": 24000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
+fn builtin_models_cn() -> Vec<Value> {
+    json!([
+        {"id": "auto", "name": "Auto", "maxInputTokens": 256000, "maxOutputTokens": 32000, "maxAllowedSize": 256000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "平衡效果与速度。自动为每个任务匹配最优模型，积分倍率随之浮动", "descriptionEn": "Balances quality and speed. Automatically selects the best model for each task, with a variable credit multiplier.", "temperature": 1, "isDefault": true},
+        {"id": "fast-model", "name": "快速", "credits": "x0.21", "maxInputTokens": 300000, "maxOutputTokens": 48000, "maxAllowedSize": 300000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "优先响应速度，适合简单任务与快速问答", "descriptionEn": "Prioritizes speed for simple tasks and quick answers", "temperature": 1, "isDefault": true},
+        {"id": "balanced-model", "name": "均衡", "credits": "x0.65", "maxInputTokens": 300000, "maxOutputTokens": 48000, "maxAllowedSize": 300000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "兼顾速度与质量，适合大多数日常工作", "descriptionEn": "Balances speed and quality for most everyday tasks", "temperature": 1, "isDefault": false},
+        {"id": "deep-model", "name": "极致", "credits": "x1.20", "maxInputTokens": 300000, "maxOutputTokens": 48000, "maxAllowedSize": 300000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "优先深度与准确性，适合复杂分析和高要求任务", "descriptionEn": "Prioritizes depth and accuracy for complex analysis and high-stakes tasks", "temperature": 1},
+        {"id": "hy3", "name": "Hy3", "credits": "x0.00", "maxInputTokens": 192000, "maxOutputTokens": 64000, "maxAllowedSize": 192000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "hy3-b", "name": "Hy3", "credits": "x0.00", "maxInputTokens": 192000, "maxOutputTokens": 64000, "maxAllowedSize": 192000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "hy3-c", "name": "Hy3", "credits": "x0.00", "maxInputTokens": 192000, "maxOutputTokens": 64000, "maxAllowedSize": 192000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "hy3-x", "name": "Hy3", "credits": "x0.05", "maxInputTokens": 192000, "maxOutputTokens": 64000, "maxAllowedSize": 192000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "hy4-preview", "name": "Hy4 preview", "credits": "x0.29", "maxInputTokens": 960000, "maxOutputTokens": 64000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "hy4-preview-dev", "name": "Hy4 preview", "credits": "x0.29", "maxInputTokens": 960000, "maxOutputTokens": 64000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "hy4-preview-x", "name": "Hy4 preview", "credits": "x0.29", "maxInputTokens": 960000, "maxOutputTokens": 64000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "descriptionZh": "混元思考模型，具有增强的推理能力", "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities", "temperature": 0.9},
+        {"id": "minimax-m2.5", "name": "MiniMax-M2.5", "credits": "x0.18", "maxInputTokens": 200000, "maxOutputTokens": 48000, "maxAllowedSize": 200000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "能力均衡，适合日常使用", "descriptionEn": "Well-rounded model for everyday use", "temperature": 1},
+        {"id": "glm-5v-turbo", "name": "GLM-5v-Turbo", "credits": "x0.71", "maxInputTokens": 200000, "maxOutputTokens": 64000, "maxAllowedSize": 200000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "原生多模态模型", "descriptionEn": "Native Multimodal Model", "temperature": 1},
+        {"id": "glm-5.3", "name": "GLM-5.3", "credits": "x0.79", "maxInputTokens": 1000000, "maxOutputTokens": 64000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "旗舰模型，擅长复杂软件工程与长程 Agent 任务", "descriptionEn": "Flagship model, excelling at complex software engineering and long-horizon agent tasks", "temperature": 1},
+        {"id": "glm-5.3-flash", "name": "GLM-5.3-Flash", "credits": "x0.06", "maxInputTokens": 1000000, "maxOutputTokens": 131072, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "原生多模态模型，擅长视觉理解与专业任务", "descriptionEn": "Native multimodal model, excelling at visual understanding and professional tasks", "temperature": 1},
+        {"id": "glm-5.2", "name": "GLM-5.2", "credits": "x0.79", "maxInputTokens": 1000000, "maxOutputTokens": 64000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "1M 上下文，擅长长程任务", "descriptionEn": "1M context, built for long-horizon tasks.", "temperature": 1},
+        {"id": "glm-5.1", "name": "GLM-5.1", "credits": "x0.79", "maxInputTokens": 200000, "maxOutputTokens": 48000, "maxAllowedSize": 200000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "能力均衡，适合日常使用", "descriptionEn": "Great for daily use", "temperature": 1},
+        {"id": "glm-5.0-turbo", "name": "GLM-5.0-Turbo", "credits": "x0.95", "maxInputTokens": 200000, "maxOutputTokens": 48000, "maxAllowedSize": 200000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "e", "descriptionZh": "面向 Agent 场景进行了深度优化", "descriptionEn": "Deeply optimized for agent scenario", "temperature": 1},
+        {"id": "glm-4.6v", "name": "GLM-4.6V", "credits": "x0.11", "maxInputTokens": 128000, "maxOutputTokens": 32000, "maxAllowedSize": 128000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "GLM-4.6V 多模态模型，支持图片输入", "descriptionEn": "GLM-4.6V multimodal model", "temperature": 1},
+        {"id": "kimi-k3-1", "name": "Kimi-K3", "credits": "x1.62", "maxInputTokens": 1000000, "maxOutputTokens": 32000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "擅长处理复杂的长程自主任务，前端开发能力突出，同时在知识工作与科研推理上表现出色。", "descriptionEn": "Excels at complex, long-horizon autonomous tasks, with standout front-end skills and strong knowledge work and scientific reasoning", "temperature": 1},
+        {"id": "kimi-k2.8-preview", "name": "Kimi-K2.8-Preview", "credits": "x0.77", "maxInputTokens": 1000000, "maxOutputTokens": 64000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "擅长处理复杂的长程自主任务，前端开发能力突出，同时在知识工作与科研推理上表现出色。", "descriptionEn": "Excels at complex, long-horizon autonomous tasks, with standout front-end skills and strong knowledge work and scientific reasoning", "temperature": 1},
+        {"id": "kimi-k2.7", "name": "Kimi-K2.7-Code", "credits": "x0.57", "maxInputTokens": 256000, "maxOutputTokens": 32000, "maxAllowedSize": 256000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "多模态模型，适合日常任务", "descriptionEn": "A multimodal model, good for daily use.", "temperature": 1},
+        {"id": "kimi-k2.6", "name": "Kimi-K2.6", "credits": "x0.52", "maxInputTokens": 256000, "maxOutputTokens": 32000, "maxAllowedSize": 256000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "多模态模型，适合日常任务", "descriptionEn": "A multimodal model, good for daily use.", "temperature": 1},
+        {"id": "kimi-k2.5", "name": "Kimi-K2.5", "credits": "x0.45", "maxInputTokens": 256000, "maxOutputTokens": 32000, "maxAllowedSize": 256000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "多模态模型，适合日常任务", "descriptionEn": "A multimodal model, good for daily use.", "temperature": 1},
+        {"id": "kimi-k2-thinking", "name": "Kimi-K2-Thinking", "credits": "x0.54", "maxInputTokens": 256000, "maxOutputTokens": 32000, "maxAllowedSize": 256000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "适合复杂编码任务", "descriptionEn": "Good for complex coding tasks", "temperature": 1},
+        {"id": "minimax-m3", "name": "MiniMax-M3", "credits": "x0.25", "maxInputTokens": 512000, "maxOutputTokens": 64000, "maxAllowedSize": 512000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "原生多模态，擅长代码、智能体任务", "descriptionEn": "Native multimodal model for coding and agents tasks", "temperature": 1},
+        {"id": "minimax-m2.7", "name": "MiniMax-M2.7", "credits": "x0.26", "maxInputTokens": 200000, "maxOutputTokens": 48000, "maxAllowedSize": 200000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "能力均衡，适合日常使用", "descriptionEn": "Well-rounded model for everyday use", "temperature": 1},
+        {"id": "glm-4.6", "name": "GLM-4.6", "credits": "x0.23", "maxInputTokens": 168000, "maxOutputTokens": 32000, "maxAllowedSize": 168000, "supportsImages": true, "supportsToolCall": true, "vendor": "f", "descriptionZh": "具有强大推理能力的先进语言模型", "descriptionEn": "Advanced language model with strong reasoning capabilities", "temperature": 1},
+        {"id": "deepseek-v4-flash", "name": "Deepseek-V4-Flash", "credits": "x0.17", "maxInputTokens": 1000000, "maxOutputTokens": 50000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": false, "vendor": "f", "descriptionZh": "DeepSeek 旗舰模型，支持 1M 上下文窗口", "descriptionEn": "DeepSeek flagship model, supporting 1M context window", "temperature": 1},
+        {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "credits": "x0.11", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "DeepSeek 旗舰模型，支持 1M 上下文窗口，原生多模态", "descriptionEn": "DeepSeek flagship model, supporting 1M context window, native multimodal model", "temperature": 1},
+        {"id": "deepseek-v4-pro", "name": "Deepseek-V4-Pro", "credits": "x0.51", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": false, "vendor": "f", "descriptionZh": "DeepSeek 旗舰模型，支持 1M 上下文窗口", "descriptionEn": "DeepSeek flagship model, supporting 1M context window", "temperature": 1},
+        {"id": "deepseek-v3-2-volc", "name": "DeepSeek-V3.2", "credits": "x0.29", "maxInputTokens": 96000, "maxOutputTokens": 32000, "maxAllowedSize": 96000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "DeepSeek-V3.2 模型，适合日常使用", "descriptionEn": "DeepSeek-V3.2, good for daily use", "temperature": 1},
+        {"id": "deepseek-v3-1-volc", "name": "DeepSeek-V3-1-Terminus", "credits": "x0.52", "maxInputTokens": 96000, "maxOutputTokens": 32000, "maxAllowedSize": 128000, "supportsImages": true, "supportsToolCall": true, "vendor": "f", "descriptionZh": "DeepSeek 的旗舰模型，适合规划、调试、编码等任务", "descriptionEn": "DeepSeek's flagship model, good for planning, debugging, coding, and more", "temperature": 0.8},
+        {"id": "deepseek-v3-1-lkeap", "name": "DeepSeek-V3-1", "credits": "x0.52", "maxInputTokens": 96000, "maxOutputTokens": 32000, "maxAllowedSize": 128000, "supportsImages": true, "supportsToolCall": true, "vendor": "f", "descriptionZh": "DeepSeek 的旗舰模型，适合规划、调试、编码等任务", "descriptionEn": "DeepSeek's flagship model, good for planning, debugging, coding, and more", "temperature": 0.8},
+        {"id": "deepseek-v3-1", "name": "DeepSeek-V3.1", "credits": "x0.52", "maxInputTokens": 96000, "maxOutputTokens": 32000, "maxAllowedSize": 128000, "supportsImages": true, "supportsToolCall": true, "vendor": "f", "descriptionZh": "DeepSeek 的旗舰模型，适合规划、调试、编码等任务", "descriptionEn": "DeepSeek's flagship model, good for planning, debugging, coding, and more", "temperature": 0.8},
+        {"id": "hunyuan-2.0-instruct", "name": "Hunyuan-2.0-Instruct", "maxInputTokens": 128000, "maxOutputTokens": 16000, "maxAllowedSize": 128000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "j", "temperature": 0.7},
+        {"id": "hunyuan-chat", "name": "Hunyuan-Turbos", "maxInputTokens": 128000, "maxOutputTokens": 8192, "maxAllowedSize": 128000, "supportsImages": true, "supportsToolCall": true, "vendor": "j", "descriptionZh": "腾讯自研的轻量、快速的通用模型", "descriptionEn": "Tencent's lightweight, fast general-purpose model"},
+        {"id": "space-bunny", "name": "Space-Bunny", "credits": "x0.03", "maxInputTokens": 1000000, "maxOutputTokens": 128000, "maxAllowedSize": 1000000, "supportsImages": true, "supportsToolCall": true, "supportsReasoning": true, "onlyReasoning": true, "vendor": "f", "descriptionZh": "推理速度极快，编码能力强劲，并支持原生多模态输入的匿名大模型", "descriptionEn": "Blazing-fast, anonymous model with strong coding skills and native multimodal input.", "temperature": 1},
     ])
     .as_array()
     .cloned()
@@ -173,6 +232,120 @@ struct CatalogState {
     remote_refreshed: bool,
 }
 
+/// 从 `/v3/config` 响应里取**桌面端选择器真正用的那份清单**。
+///
+/// ── 为什么不是 `data.models`（2026-10-05 实测）────────────────
+/// 上游在同一个响应里下发**两份**模型清单：
+///   - `data.models`：全量目录（国内版实测 **55** 条，含 `auto` / `fast-model`
+///     这类虚拟档位、`*-volc` / `*-lkeap` 专线变体、以及官方选择器早已不展示
+///     的旧条目）；
+///   - `data.agents[].models`：**选择器那份**（`cli` agent，国内版实测 **17**
+///     条、国际版 **25** 条）。
+///
+/// 本模块原来读前者，于是同一个账号在本网关看到 37/27 个模型、在
+/// workbuddy2api-hub 看到 15/20 个 —— 用户按其中一份清单配客户端，换一个
+/// 网关就对不上。参考实现（hub 的 `parse_remote_catalog`）读的是后者，这里
+/// 对齐：**cli 命名的 agent 优先，其次取最长的那份 agent 清单**。
+///
+/// 元数据仍从 `data.models` 里按 id 取（`credits` / 上下文窗口 / 能力位都在
+/// 那份条目上）；选择器列了、`data.models` 里没有的 id（实测国际版有
+/// `gemini-3.8-flash` / `gpt-6-sol` / `gpt-6-luna`）**照样保留** —— 上游把它
+/// 放进选择器就是「可用」的证据，缺元数据只影响展示，不该让它消失。
+///
+/// 兜底：响应里没有 agent 清单时（上游改形态 / 旧账号）回落到 `data.models`，
+/// 保持改造前的行为，而不是把目录清空。
+fn picker_models(payload: &Value) -> Vec<Value> {
+    let data = payload.get("data").unwrap_or(payload);
+    let metadata: Vec<Value> = data
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut cli: Vec<String> = Vec::new();
+    let mut longest: Vec<String> = Vec::new();
+    let agents = data.get("agents");
+    let entries: Vec<(String, &Value)> = match agents {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|entry| {
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase();
+                Some((name, entry))
+            })
+            .collect(),
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(name, entry)| (name.trim().to_lowercase(), entry))
+            .collect(),
+        _ => Vec::new(),
+    };
+    for (name, entry) in entries {
+        let ids: Vec<String> = entry
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|item| {
+                        // 实测是裸 id 字符串；对象形态（`{id: ...}`）一并容忍
+                        match item {
+                            Value::String(text) => Some(text.trim().to_string()),
+                            Value::Object(map) => map
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(|text| text.trim().to_string()),
+                            _ => None,
+                        }
+                    })
+                    .filter(|id| !id.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            continue;
+        }
+        if name == "cli" && cli.is_empty() {
+            cli = ids.clone();
+        }
+        if ids.len() > longest.len() {
+            longest = ids;
+        }
+    }
+    let picked = if !cli.is_empty() { cli } else { longest };
+    if picked.is_empty() {
+        return metadata;
+    }
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for id in picked {
+        let key = id.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        match metadata
+            .iter()
+            .find(|item| {
+                item.get("id")
+                    .map(value_text)
+                    .map(|text| text.eq_ignore_ascii_case(&id))
+                    .unwrap_or(false)
+            })
+            .cloned()
+        {
+            Some(item) => out.push(item),
+            // 选择器列了、元数据里没有：只留 id（`name` 由聚合层按 id 兜底）
+            None => out.push(json!({ "id": id, "name": id })),
+        }
+    }
+    out
+}
+
 /// 目录准入过滤：对话模型判定 + 白名单（空白名单全量放行）
 fn apply_filters(models: Vec<Value>) -> Vec<Value> {
     models
@@ -188,9 +361,89 @@ fn apply_filters(models: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
+/// 版本 id 常量：WorkBuddy 的两条目录线（上游按站点下发两套清单）。
+pub const EDITION_CN: &str = "cn";
+/// 国际版（`www.workbuddy.ai`）
+pub const EDITION_INTL: &str = "intl";
+
+/// 宽松归一版本 id：只认国际版那几种写法，其余一律国内版
+/// （与本仓 `endpoints::resolve_edition` 的别名表同口径）。
+pub fn normalize_edition(value: Option<&str>) -> &'static str {
+    match value.map(str::trim).map(str::to_lowercase).as_deref() {
+        Some("intl" | "international" | "global" | "ai" | "workbuddy-ai" | "workbuddyai" | "en") => {
+            EDITION_INTL
+        }
+        _ => EDITION_CN,
+    }
+}
+
+/// 该版本的**内置**清单（远程拉不到时的兜底）。
+fn builtin_models_of(edition: &str) -> Vec<Value> {
+    if edition == EDITION_INTL {
+        builtin_models_intl()
+    } else {
+        builtin_models_cn()
+    }
+}
+
+/// 对外模型名的**版本后缀**（下游想指定版本时用的那个尾巴）。
+///
+/// ── 为什么需要它 ────────────────────────────────────────────
+/// 两版都有的模型（`deepseek-v4.1-flash` 国际版 x0.00 限免 / 国内版 x0.11）
+/// 在 `/v1/models` 里只能占一条 id，下游没法从名字上区分要哪个版本 ——
+/// 于是对外额外广告两条带后缀的名字（见 `providers::catalog` 的
+/// `append_edition_aliases`）：
+///   - `deepseek-v4.1-flash-intl` → 固定走国际版账号；
+///   - `deepseek-v4.1-flash-cn`   → 固定走国内版账号；
+///   - 不带后缀的那条保持原语义（走队首账号所属的版本）。
+pub const EDITION_SUFFIX_INTL: &str = "-intl";
+/// 国内版后缀（见 [`EDITION_SUFFIX_INTL`]）
+pub const EDITION_SUFFIX_CN: &str = "-cn";
+
+/// 把带版本后缀的对外名拆成 `(清单里的真名, 版本)`。
+///
+/// 不带后缀 → `(原样, None)`；后缀不构成有效模型名时也不拆（避免把
+/// `gpt-4-cn` 这种本来就以 `-cn` 结尾的**真名**误剥 —— 判据是「剥完还剩东西」）。
+/// 路由解析（`catalog::routing::entry_id_in_manifest`）与选路
+/// （`upstream::rotate::restrict_workbuddy_edition`）共用这一处。
+pub fn split_edition_suffix(model: &str) -> (String, Option<&'static str>) {
+    let trimmed = model.trim();
+    let lower = trimmed.to_lowercase();
+    for (suffix, edition) in [
+        (EDITION_SUFFIX_INTL, EDITION_INTL),
+        (EDITION_SUFFIX_CN, EDITION_CN),
+    ] {
+        if lower.ends_with(suffix) && trimmed.len() > suffix.len() {
+            return (
+                trimmed[..trimmed.len() - suffix.len()].to_string(),
+                Some(edition),
+            );
+        }
+    }
+    (trimmed.to_string(), None)
+}
+
+/// 版本的展示名（对外条目的 `name` 后缀用）。
+pub fn edition_label(edition: &str) -> &'static str {
+    if edition == EDITION_INTL {
+        "国际版"
+    } else {
+        "国内版"
+    }
+}
+
+/// 该版本的缓存 scope（写入用；读取另有老库迁移，见 [`initial_state`]）。
+fn cache_scope_of(edition: &str) -> &'static str {
+    if edition == EDITION_INTL {
+        catalog_cache::SCOPE_WORKBUDDY_INTL
+    } else {
+        catalog_cache::SCOPE_WORKBUDDY_CN
+    }
+}
+
 /// 白名单模型必须有可用定义：远程/传入清单缺失时回退内置定义
-fn allowlist_fallback() -> Vec<Value> {
-    builtin_models()
+fn allowlist_fallback(edition: &str) -> Vec<Value> {
+    builtin_models_of(edition)
         .into_iter()
         .filter(|model| {
             MODEL_ALLOWLIST.contains(&model.get("id").map(value_text).unwrap_or_default().as_str())
@@ -207,23 +460,67 @@ fn allowlist_fallback() -> Vec<Value> {
 /// 上游下发的清单，只是可能旧一些。管理页的「来源」列与 `/v1/models` 的
 /// `meta.source` 因此显示「远程」而不是「内置」——那是事实，且时间戳
 /// （`last_refreshed_at`）会如实给出它是什么时候拉的。
-fn initial_state() -> CatalogState {
-    if let Some(cached) = catalog_cache::load(catalog_cache::SCOPE_WORKBUDDY) {
+fn initial_state(edition: &str) -> CatalogState {
+    let cached = catalog_cache::load(cache_scope_of(edition)).or_else(|| {
+        // 老库升级：改造前只有一条**不分版本**的清单（是国内版账号拉的），
+        // 装到国内版槽语义正确；国际版槽没有可继承的东西，直接走内置兜底。
+        if edition == EDITION_CN {
+            catalog_cache::load(catalog_cache::SCOPE_WORKBUDDY_LEGACY)
+        } else {
+            None
+        }
+    });
+    if let Some(cached) = cached {
         return CatalogState {
             models: cached.models,
             last_refreshed_at: cached.fetched_at,
             remote_refreshed: true,
         };
     }
-    let allowed = apply_filters(builtin_models());
-    let models = if allowed.is_empty() { allowlist_fallback() } else { allowed };
+    let allowed = apply_filters(builtin_models_of(edition));
+    let models = if allowed.is_empty() { allowlist_fallback(edition) } else { allowed };
     CatalogState { models, last_refreshed_at: 0, remote_refreshed: false }
 }
 
-/// 模型目录句柄：内部一把 `RwLock`，克隆共享同一份状态。
+/// 按版本的两份快照（上游两套清单差异见 `builtin_models_intl` 的说明）。
+#[derive(Clone, Debug)]
+struct CatalogInner {
+    cn: CatalogState,
+    intl: CatalogState,
+}
+
+impl CatalogInner {
+    fn slot(&self, edition: &str) -> &CatalogState {
+        if edition == EDITION_INTL { &self.intl } else { &self.cn }
+    }
+
+    fn slot_mut(&mut self, edition: &str) -> &mut CatalogState {
+        if edition == EDITION_INTL { &mut self.intl } else { &mut self.cn }
+    }
+}
+
+/// 两份清单合并去重（**国内版优先**，保持改造前「默认国内版」的视角）。
+///
+/// 同名模型的倍率两版不同（`fast-model` cn x0.21 / intl x0.34），合并视图只能
+/// 取一份 —— 版本维度的展示交给管理视图按版本分组（见
+/// `providers::catalog::view::manage_view`）。
+fn merge_editions(inner: &CatalogInner) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for model in inner.cn.models.iter().chain(inner.intl.models.iter()) {
+        let id = model.get("id").map(value_text).unwrap_or_default().to_lowercase();
+        if id.is_empty() || !seen.insert(id) {
+            continue;
+        }
+        out.push(model.clone());
+    }
+    out
+}
+
+/// 模型目录句柄：内部一把 `RwLock` 持有**按版本的两份**状态，克隆共享。
 #[derive(Clone)]
 pub struct ModelCatalog {
-    inner: Arc<RwLock<CatalogState>>,
+    inner: Arc<RwLock<CatalogInner>>,
 }
 
 impl Default for ModelCatalog {
@@ -233,24 +530,34 @@ impl Default for ModelCatalog {
 }
 
 impl ModelCatalog {
-    /// 构造目录（不刷新；刷新由启动流程与 /v1/models 触发）
+    /// 构造目录（不刷新；刷新由启动流程与 /v1/models 触发）。
+    /// 两个版本各自从自己的缓存/内置清单初始化。
     pub fn new() -> Self {
-        Self { inner: Arc::new(RwLock::new(initial_state())) }
+        Self {
+            inner: Arc::new(RwLock::new(CatalogInner {
+                cn: initial_state(EDITION_CN),
+                intl: initial_state(EDITION_INTL),
+            })),
+        }
     }
 
     /// 读取状态快照；锁中毒（持锁 panic）时接管内部数据继续用，
     /// 与账号存储同一策略：宁可容忍一次中毒，也不要让网关永久不可用。
-    fn read(&self) -> CatalogState {
+    fn read(&self, edition: &str) -> CatalogState {
+        self.read_inner().slot(edition).clone()
+    }
+
+    fn read_inner(&self) -> CatalogInner {
         match self.inner.read() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
-    fn write(&self, next: CatalogState) {
+    fn write(&self, edition: &str, next: CatalogState) {
         match self.inner.write() {
-            Ok(mut guard) => *guard = next,
-            Err(poisoned) => *poisoned.into_inner() = next,
+            Ok(mut guard) => *guard.slot_mut(edition) = next,
+            Err(poisoned) => *poisoned.into_inner().slot_mut(edition) = next,
         }
     }
 
@@ -260,21 +567,25 @@ impl ModelCatalog {
     pub fn get(&self, id: Option<&str>) -> Option<Value> {
         let id = id.map(str::trim).filter(|value| !value.is_empty())?;
         let lower = id.to_lowercase();
-        let models = self.read().models;
-        models
-            .iter()
-            .find(|model| value_text(&model["id"]).to_lowercase() == lower)
-            .or_else(|| {
-                models.iter().find(|model| {
-                    model
-                        .get("name")
-                        .map(value_text)
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        == lower
+        let find = |models: &[Value]| -> Option<Value> {
+            models
+                .iter()
+                .find(|model| value_text(&model["id"]).to_lowercase() == lower)
+                .or_else(|| {
+                    models.iter().find(|model| {
+                        model
+                            .get("name")
+                            .map(value_text)
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            == lower
+                    })
                 })
-            })
-            .cloned()
+                .cloned()
+        };
+        // 跨两个版本查：国内版优先（与合并视图同一口径）
+        let inner = self.read_inner();
+        find(&inner.cn.models).or_else(|| find(&inner.intl.models))
     }
 
     /// 目录里是否有该模型。
@@ -316,32 +627,84 @@ impl ModelCatalog {
     #[allow(dead_code)]
     pub fn suggest(&self, id: &str, limit: usize) -> Vec<String> {
         let ids: Vec<String> = self
-            .read()
-            .models
+            .list()
             .iter()
             .filter_map(|model| model.get("id").map(value_text))
             .collect();
         suggest_from(ids, id, limit)
     }
 
-    /// 当前目录（克隆；调用方不会看到后续刷新）
+    /// 两个版本**合并去重**后的目录（克隆；调用方不会看到后续刷新）。
     pub fn list(&self) -> Vec<Value> {
-        self.read().models
+        merge_editions(&self.read_inner())
+    }
+
+    /// 指定版本的目录（管理视图按版本分组、聚合层按版本展开用）。
+    pub fn list_of(&self, edition: &str) -> Vec<Value> {
+        self.read(edition).models
+    }
+
+    /// 这个模型**只**属于哪个版本（两版都有 / 都不认识 → `None`）。
+    ///
+    /// ── 它回答的是「下游拉到的模型怎么落到账号上」──────────────
+    /// 模型 id 本身不带版本（对外列表里 `fast-model` 只有一条），实际打哪个站点
+    /// 由**选中的账号**决定。这对两版都有的模型没问题（同一个上游名字，谁都能跑），
+    /// 但对**版本独有**的模型是硬伤：`hy3-b` 只有国内版有、`gpt-5.6-sol` 只有
+    /// 国际版有，而选账号是按优先级取队首 —— 本机队首是国际版账号，于是请求
+    /// `hy3-b` 会打到 `www.workbuddy.ai`，上游直接报「模型不存在」。
+    ///
+    /// 转发选路据此收窄候选账号（见 `upstream::rotate::restrict_workbuddy_edition`）。
+    /// 判据是**当前清单**（远程优先），所以上游新增的独有模型自动生效。
+    pub fn edition_exclusive_of(&self, model: &str) -> Option<&'static str> {
+        // 带版本后缀的请求名先剥掉：后缀是「指定版本」的手段（见
+        // `split_edition_suffix`），剥完才是清单里的真名
+        let (model, _) = split_edition_suffix(model);
+        let target = model.trim().to_lowercase();
+        if target.is_empty() {
+            return None;
+        }
+        let has = |models: &[Value]| {
+            models.iter().any(|item| {
+                item.get("id")
+                    .map(value_text)
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case(&target)
+            })
+        };
+        let inner = self.read_inner();
+        match (has(&inner.cn.models), has(&inner.intl.models)) {
+            (true, false) => Some(EDITION_CN),
+            (false, true) => Some(EDITION_INTL),
+            // 两版都有（同一个上游名字）或两版都没有（不认识）→ 不收窄
+            _ => None,
+        }
     }
 
     /// 是否曾成功采用远程清单（挂进响应 meta 用；聚合层据此算「来源」）
     pub fn remote_refreshed(&self) -> bool {
-        self.read().remote_refreshed
+        let inner = self.read_inner();
+        inner.cn.remote_refreshed || inner.intl.remote_refreshed
     }
 
-    /// 最后一次成功远程刷新的时间（毫秒，未刷新过为 0）
+    /// 指定版本是否来自远程
+    pub fn remote_refreshed_of(&self, edition: &str) -> bool {
+        self.read(edition).remote_refreshed
+    }
+
+    /// 最后一次成功远程刷新的时间（毫秒，未刷新过为 0）—— 取两个版本里更近的一次
     pub fn last_refreshed_at(&self) -> i64 {
-        self.read().last_refreshed_at
+        let inner = self.read_inner();
+        inner.cn.last_refreshed_at.max(inner.intl.last_refreshed_at)
     }
 
-    /// 目录条数（/health 的 models 字段）
+    /// 指定版本的最后刷新时间
+    pub fn last_refreshed_at_of(&self, edition: &str) -> i64 {
+        self.read(edition).last_refreshed_at
+    }
+
+    /// 目录条数（/health 的 models 字段）—— 合并去重后的条数
     pub fn count(&self) -> usize {
-        self.read().models.len()
+        self.list().len()
     }
 
     /// GET /v1/models 的 OpenAI 风格响应：`{object, data: [...], meta: {...}}`
@@ -357,16 +720,15 @@ impl ModelCatalog {
     /// 它与聚合输出逐字段相同（聚合层复用同一个 list_item / 信封）。
     #[allow(dead_code)]
     pub fn list_response(&self) -> Value {
-        let state = self.read();
-        let data: Vec<Value> = state
-            .models
+        let data: Vec<Value> = self
+            .list()
             .iter()
             .map(|model| list_item(model, kind_id(ProviderKind::WorkBuddy)))
             .collect();
         list_response_from(
             data,
-            if state.remote_refreshed { "remote" } else { "builtin" },
-            state.last_refreshed_at,
+            if self.remote_refreshed() { "remote" } else { "builtin" },
+            self.last_refreshed_at(),
         )
     }
 
@@ -376,7 +738,7 @@ impl ModelCatalog {
     /// 这条保留给排障探针按布尔直读。
     #[allow(dead_code)]
     pub fn is_remote(&self) -> bool {
-        self.read().remote_refreshed
+        self.remote_refreshed()
     }
 
     /// 远程配置刷新（与桌面端行为一致）：
@@ -406,15 +768,10 @@ impl ModelCatalog {
                 // 不校验 HTTP 状态：与 Node 一致 —— 先按 JSON 解析，再看有没有可用模型
                 Ok(response) => match response.payload {
                     Some(payload) => {
-                        let raw = payload
-                            .get("data")
-                            .and_then(|data| data.get("models"))
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
+                        let raw = picker_models(&payload);
                         let allowed = apply_filters(raw.clone());
                         if !allowed.is_empty() {
-                            self.apply_remote(allowed, "auto", false);
+                            self.apply_remote(allowed, "auto", false, params.edition);
                             return RefreshOutcome::refreshed(
                                 self.count(),
                                 "v3/config",
@@ -461,7 +818,7 @@ impl ModelCatalog {
                         if allowed.is_empty() {
                             RefreshOutcome::not_refreshed("企业模型列表为空")
                         } else {
-                            self.apply_remote(allowed, "custom:", true);
+                            self.apply_remote(allowed, "custom:", true, params.edition);
                             RefreshOutcome::refreshed(self.count(), "enterprise")
                         }
                     }
@@ -482,7 +839,13 @@ impl ModelCatalog {
     /// 与网关默认不一致）。`enterprise` 为 true 时走企业分支：
     /// modelType 按 `custom:` 前缀区分企业定制/内置模型
     /// （判定用**原始 id**，大小写不敏感的处理只用于 isDefault 那一处）。
-    fn apply_remote(&self, models: Vec<Value>, custom_prefix: &str, enterprise: bool) {
+    fn apply_remote(
+        &self,
+        models: Vec<Value>,
+        custom_prefix: &str,
+        enterprise: bool,
+        edition: &str,
+    ) {
         let mapped: Vec<Value> = models
             .into_iter()
             .map(|model| {
@@ -514,12 +877,13 @@ impl ModelCatalog {
             last_refreshed_at: logging::now_ms(),
             remote_refreshed: true,
         };
-        self.write(state.clone());
+        self.write(edition, state.clone());
         // 落持久化缓存（进程重启后由 `initial_state` 读回，见 `catalog_cache`
         // 的模块头）。必须在写锁**之外**：缓存写入要拿库连接锁，而本目录的
-        // 硬约束是「持锁期间不做 IO」。
+        // 硬约束是「持锁期间不做 IO」。**按版本分键**：两个版本的清单不同，
+        // 写进同一个键就是「谁后刷谁覆盖」。
         catalog_cache::save(
-            catalog_cache::SCOPE_WORKBUDDY,
+            cache_scope_of(edition),
             &state.models,
             state.last_refreshed_at,
         );
@@ -589,6 +953,34 @@ impl ModelCatalog {
             return RefreshOutcome::not_refreshed(REASON_NO_SESSION);
         };
 
+        // 这份清单属于哪个版本：按账号记录里的 `edition` 分槽（缺省国内版）。
+        // 上游两个站点下发的清单不同（见 `builtin_models_intl` 的说明），
+        // 分槽之后国际版与国内版账号不再互相覆盖。
+        let edition = normalize_edition(session.get("edition").and_then(Value::as_str));
+        let outcome = self.refresh_session(&session, proxy.as_ref(), auth, edition).await;
+        if outcome.refreshed {
+            logging::log(
+                "[Models]",
+                &format!("✅ 模型目录已更新（{} 个，来源 {}）", outcome.count, outcome.source),
+            );
+        } else {
+            logging::verbose("[Models]", &format!("模型目录未更新: {}", outcome.reason));
+        }
+        // 另一个版本也补刷一次（只在那个版本确实有账号时）：上游两个站点下发
+        // 两套清单，只刷一边会让管理页的另一行一直停在内置兜底 —— 用户看到的
+        // 就是「一行是远程清单、另一行是内置清单」。
+        self.refresh_other_edition(store, auth, edition).await;
+        outcome
+    }
+
+    /// 按给定会话刷新一次：端点 / 企业 id / 鉴权头 / UA 全部从会话派生。
+    async fn refresh_session(
+        &self,
+        session: &Value,
+        proxy: Option<&ResolvedProxy>,
+        auth: &crate::server::core::auth::AuthService,
+        edition: &str,
+    ) -> RefreshOutcome {
         let endpoint = session
             .get("endpoint")
             .and_then(Value::as_str)
@@ -601,28 +993,78 @@ impl ModelCatalog {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let headers = crate::server::core::auth::AuthService::build_auth_headers(&session);
+        let headers = crate::server::core::auth::AuthService::build_auth_headers(session);
         let user_agent = user_agent_for_edition(session.get("edition").and_then(Value::as_str));
+        self.refresh(RefreshParams {
+            endpoint: &endpoint,
+            enterprise_id: Some(&enterprise_id),
+            headers: &headers,
+            user_agent: &user_agent,
+            proxy,
+            edition,
+        })
+        .await
+    }
 
+    /// 补刷「另一个版本」的清单（该版本没有可用账号时什么也不做）。
+    ///
+    /// 失败只记 verbose：主版本的刷新结果才是这次调用的返回值，补刷是**尽力**
+    /// 动作 —— 把它升级成错误会让「国际版刷成功、国内版网络抖动」变成一次整体失败。
+    async fn refresh_other_edition(
+        &self,
+        store: &crate::server::core::account_store::AccountStore,
+        auth: &crate::server::core::auth::AuthService,
+        edition: &str,
+    ) {
+        let other = if edition == EDITION_INTL { EDITION_CN } else { EDITION_INTL };
+        let Some(account_id) = workbuddy_account_of_edition(store, other) else {
+            return;
+        };
+        let Some(entry) = store.session_for_account(&account_id) else {
+            return;
+        };
+        let proxy = crate::server::core::proxies::session_proxy(&entry.session);
         let outcome = self
-            .refresh(RefreshParams {
-                endpoint: &endpoint,
-                enterprise_id: Some(&enterprise_id),
-                headers: &headers,
-                user_agent: &user_agent,
-                proxy: proxy.as_ref(),
-            })
+            .refresh_session(&entry.session, proxy.as_ref(), auth, other)
             .await;
         if outcome.refreshed {
             logging::log(
                 "[Models]",
-                &format!("✅ 模型目录已更新（{} 个，来源 {}）", outcome.count, outcome.source),
+                &format!("✅ 模型目录（{}）已更新（{} 个）", other, outcome.count),
             );
         } else {
-            logging::verbose("[Models]", &format!("模型目录未更新: {}", outcome.reason));
+            logging::verbose(
+                "[Models]",
+                &format!("模型目录（{}）未更新: {}", other, outcome.reason),
+            );
         }
-        outcome
     }
+}
+
+/// 取某个版本（`cn` / `intl`）的第一个可用 WorkBuddy 账号 id。
+///
+/// 给 [`ModelCatalog::refresh_other_edition`] 用：账号公开形态带 `edition`
+/// （`account_store` 把版本写进了公开字段），按它筛即可。
+fn workbuddy_account_of_edition(
+    store: &crate::server::core::account_store::AccountStore,
+    edition: &str,
+) -> Option<String> {
+    store
+        .accounts_for_provider(kind_id(ProviderKind::WorkBuddy))
+        .into_iter()
+        .find(|account| {
+            account
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+                && normalize_edition(account.get("edition").and_then(Value::as_str)) == edition
+        })
+        .and_then(|account| {
+            account
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 /// 刷新入参（对应 Node 版 refresh 的 options 对象）
@@ -632,6 +1074,9 @@ pub struct RefreshParams<'a> {
     pub headers: &'a [(String, String)],
     pub user_agent: &'a str,
     pub proxy: Option<&'a ResolvedProxy>,
+    /// 这份清单属于哪个版本（`cn` / `intl`）—— 上游按站点下发两套清单，
+    /// 落地与缓存都按它分槽，见 `EDITION_CN` 的说明。
+    pub edition: &'a str,
 }
 
 /// 刷新结果：成功 `{refreshed:true, count, source}`，
@@ -684,7 +1129,10 @@ fn encode_uri_component(value: &str) -> String {
 /// （Node 侧注释「供 CLI/调试」，本进程没有 CLI，故只作排障口保留）。
 #[allow(dead_code)]
 pub fn builtin_models_snapshot() -> Value {
-    Value::Array(builtin_models())
+    json!({
+        "cn": builtin_models_cn(),
+        "intl": builtin_models_intl(),
+    })
 }
 
 // ─── 进程级目录句柄（聚合目录的读取口）──────────────────────
@@ -706,4 +1154,182 @@ static GLOBAL: OnceLock<ModelCatalog> = OnceLock::new();
 /// （最坏情况是「还没被 `/v3/config` 刷新过」的内置清单，与改造前的初始态一致）。
 pub fn global_catalog() -> ModelCatalog {
     GLOBAL.get_or_init(ModelCatalog::new).clone()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 上游 `/v3/config` 的两份清单形状（按实测裁剪）：`data.models` 是全量目录，
+    /// `data.agents[].models` 是选择器那份。取后者 —— 这是与 hub 对齐的关键一步。
+    #[test]
+    fn picker_models_prefers_the_cli_agent_list() {
+        let payload = json!({
+            "data": {
+                "models": [
+                    {"id": "auto", "name": "Auto", "maxOutputTokens": 32000},
+                    {"id": "hy3", "name": "Hy3", "maxOutputTokens": 64000, "credits": "x0.00"},
+                    {"id": "deepseek-v3-1", "name": "DeepSeek-V3.1", "maxOutputTokens": 64000},
+                    {"id": "fast-model", "name": "快速", "maxOutputTokens": 48000},
+                ],
+                "agents": [
+                    {"name": "cli", "models": ["hy3", "deepseek-v3-1"]},
+                    {"name": "ide", "models": ["auto", "fast-model", "hy3"]},
+                ],
+            }
+        });
+        let picked = picker_models(&payload);
+        let ids: Vec<String> = picked.iter().map(|item| item.get("id").map(value_text).unwrap_or_default()).collect();
+        assert_eq!(vec!["hy3", "deepseek-v3-1"], ids);
+        // 元数据仍从 `data.models` 取（credits / 输出上限都在那份条目上）
+        assert_eq!(Some("x0.00"), picked[0].get("credits").and_then(Value::as_str));
+    }
+
+    /// cli agent 缺席时取最长的那份；两份都没有时回落到 `data.models`。
+    #[test]
+    fn picker_models_falls_back_to_longest_then_to_the_full_catalog() {
+        let longest = json!({
+            "data": {
+                "models": [{"id": "a", "maxOutputTokens": 32000}],
+                "agents": [
+                    {"name": "ide", "models": ["a"]},
+                    {"name": "web", "models": ["a", "b", "c"]},
+                ],
+            }
+        });
+        let ids: Vec<String> = picker_models(&longest)
+            .iter()
+            .map(|item| item.get("id").map(value_text).unwrap_or_default())
+            .collect();
+        assert_eq!(vec!["a", "b", "c"], ids);
+
+        let no_agents = json!({ "data": { "models": [{"id": "only", "maxOutputTokens": 32000}] } });
+        let ids: Vec<String> = picker_models(&no_agents)
+            .iter()
+            .map(|item| item.get("id").map(value_text).unwrap_or_default())
+            .collect();
+        assert_eq!(vec!["only"], ids, "没有 agent 清单时保持改造前的行为，不清空目录");
+    }
+
+    /// 选择器列了、`data.models` 里没有的 id 必须保留（上游把它放进选择器
+    /// 就是可用的证据；缺元数据只影响展示）。
+    #[test]
+    fn picker_models_keeps_ids_without_metadata() {
+        let payload = json!({
+            "data": {
+                "models": [{"id": "hy3", "name": "Hy3", "maxOutputTokens": 64000}],
+                "agents": [{"name": "cli", "models": ["hy3", "gemini-3.8-flash"]}],
+            }
+        });
+        let ids: Vec<String> = picker_models(&payload)
+            .iter()
+            .map(|item| item.get("id").map(value_text).unwrap_or_default())
+            .collect();
+        assert_eq!(vec!["hy3", "gemini-3.8-flash"], ids);
+    }
+
+    /// 对象形态的 agent 清单与重复 id 都要能处理。
+    #[test]
+    fn picker_models_handles_object_shape_and_dedups() {
+        let payload = json!({
+            "data": {
+                "models": [{"id": "hy3", "maxOutputTokens": 64000}],
+                "agents": {
+                    "cli": { "models": [{"id": "hy3"}, {"id": "hy3"}, "glm-5.3"] },
+                },
+            }
+        });
+        let ids: Vec<String> = picker_models(&payload)
+            .iter()
+            .map(|item| item.get("id").map(value_text).unwrap_or_default())
+            .collect();
+        assert_eq!(vec!["hy3", "glm-5.3"], ids);
+    }
+
+    #[test]
+    fn normalize_edition_recognizes_aliases() {
+        assert_eq!(normalize_edition(Some("intl")), EDITION_INTL);
+        assert_eq!(normalize_edition(Some("Global")), EDITION_INTL);
+        assert_eq!(normalize_edition(Some("workbuddy-ai")), EDITION_INTL);
+        assert_eq!(normalize_edition(Some("cn")), EDITION_CN);
+        assert_eq!(normalize_edition(None), EDITION_CN);
+        assert_eq!(normalize_edition(Some("nonsense")), EDITION_CN);
+    }
+
+    /// 两份内置表必须**真的是两套**：版本独有模型各在一边、同名模型的倍率不同。
+    /// 这是「不能只有一份清单」的直接证据（也是这次改造的验收条件）。
+    #[test]
+    fn builtin_tables_are_two_different_catalogs() {
+        let cn = builtin_models_cn();
+        let intl = builtin_models_intl();
+        assert!(!cn.is_empty() && !intl.is_empty());
+        let ids = |models: &[Value]| -> Vec<String> {
+            models
+                .iter()
+                .filter_map(|item| item.get("id").map(value_text))
+                .collect()
+        };
+        let cn_ids = ids(&cn);
+        let intl_ids = ids(&intl);
+        assert!(cn_ids.iter().any(|id| id == "hy3-b"), "国内版应有 hy3-b");
+        assert!(!intl_ids.iter().any(|id| id == "hy3-b"), "国际版不该有 hy3-b");
+        assert!(intl_ids.iter().any(|id| id == "gpt-5.6-sol"), "国际版应有 gpt-5.6-sol");
+        assert!(!cn_ids.iter().any(|id| id == "gpt-5.6-sol"), "国内版不该有 gpt-5.6-sol");
+        let credits = |models: &[Value], id: &str| -> String {
+            models
+                .iter()
+                .find(|item| item.get("id").map(value_text).as_deref() == Some(id))
+                .and_then(|item| item.get("credits").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string()
+        };
+        assert_ne!(
+            credits(&cn, "fast-model"),
+            credits(&intl, "fast-model"),
+            "同名模型的倍率两版不同，合成一份必然有一边是错的"
+        );
+    }
+
+    /// 版本归属判定：只在一份清单里出现的模型才收窄，两版都有 / 都不认识一律不收窄。
+    #[test]
+    fn edition_exclusive_of_splits_version_only_models() {
+        let catalog = ModelCatalog::new();
+        assert_eq!(catalog.edition_exclusive_of("gpt-5.6-sol"), Some(EDITION_INTL));
+        assert_eq!(catalog.edition_exclusive_of("hy3-b"), Some(EDITION_CN));
+        // 两版都有（同一个上游名字）→ 不强制版本
+        assert_eq!(catalog.edition_exclusive_of("fast-model"), None);
+        // 不认识 → 不收窄（宁可让上游如实报错，也不凭空猜一个版本）
+        assert_eq!(catalog.edition_exclusive_of("no-such-model"), None);
+        assert_eq!(catalog.edition_exclusive_of("   "), None);
+    }
+
+    /// 版本后缀的解析：下游用 `xxx-intl` / `xxx-cn` 指定版本。
+    #[test]
+    fn edition_suffix_is_split_off_the_requested_name() {
+        assert_eq!(
+            split_edition_suffix("deepseek-v4.1-flash-intl"),
+            ("deepseek-v4.1-flash".to_string(), Some(EDITION_INTL))
+        );
+        assert_eq!(
+            split_edition_suffix("deepseek-v4.1-flash-cn"),
+            ("deepseek-v4.1-flash".to_string(), Some(EDITION_CN))
+        );
+        // 大小写不敏感（后缀与真名都可能被客户端改写）
+        assert_eq!(
+            split_edition_suffix("Deepseek-V4.1-Flash-INTL"),
+            ("Deepseek-V4.1-Flash".to_string(), Some(EDITION_INTL))
+        );
+        // 不带后缀 / 空串 → 原样
+        assert_eq!(split_edition_suffix("fast-model"), ("fast-model".to_string(), None));
+        assert_eq!(split_edition_suffix("  "), (String::new(), None));
+        // 后缀本身不构成有效名字时**不剥**（`-cn` 结尾的真名不该被误伤）
+        assert_eq!(split_edition_suffix("-intl"), ("-intl".to_string(), None));
+        // 带后缀的名字仍然能判出版本归属（先剥再查清单）
+        let catalog = ModelCatalog::new();
+        assert_eq!(
+            catalog.edition_exclusive_of("gpt-5.6-sol-intl"),
+            Some(EDITION_INTL)
+        );
+    }
 }

@@ -99,13 +99,19 @@ pub(super) async fn session_for(
 /// `keys` 是请求名到各家上游真名的解析器：限额冷却按**真名**判定（理由见
 /// `routing::CooldownKeys`）—— 传请求名会让别名请求的冷却查不到、已限额的
 /// 账号被反复选中。第三级「恢复最早的那个」同样按真名读 `resetAt`。
+///
+/// `session_key` 是会话粘性键（`upstream::session_affinity::derive_affinity_key`
+/// 从请求体派生；没有 messages 时为 None）：同一对话固定同一账号（prompt cache
+/// 命中），不同对话之间**轮询**分摊（见 `routing::pick_account_for_session`）。
 pub(super) async fn select_target_account(
     service: &UpstreamService,
     providers: &[&str],
     keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
+    session_key: Option<&str>,
+    model: &str,
 ) -> Result<RouteTarget, GatewayError> {
-    let accounts = accounts_in_providers(service, providers);
+    let accounts = accounts_for_model(service, providers, model);
     // 这些家都没有账号记录 → 用第一家的默认登录态（环境变量旁路等）
     if accounts.is_empty() {
         return Ok(RouteTarget {
@@ -124,7 +130,14 @@ pub(super) async fn select_target_account(
     let mut excluded: Vec<String> = tried_ids.to_vec();
     let now = logging::now_ms();
     loop {
-        let picked = routing::pick_account_by_priority(&accounts, keys, &counts, &excluded, now);
+        let picked = routing::pick_account_for_session(
+            &accounts,
+            keys,
+            &counts,
+            &excluded,
+            now,
+            session_key,
+        );
         let Some(picked) = picked else {
             break;
         };
@@ -236,6 +249,61 @@ pub(super) fn accounts_in_providers(service: &UpstreamService, providers: &[&str
         .into_iter()
         .filter(|account| providers.contains(&provider_of(account)))
         .collect()
+}
+
+/// 候选账号池 + **按模型所属版本收窄**（WorkBuddy 的版本亲和）。
+///
+/// ── 为什么需要它（模型 id 不带版本）──────────────────────────
+/// 对外 `/v1/models` 里同名模型只有一条（`fast-model` 国际版 x0.34 / 国内版
+/// x0.21 合并成一条），实际打哪个站点由**选中的账号**决定。对两版都有的模型
+/// 这没问题（同一个上游名字，谁都能跑），但**版本独有**的模型会被选错：
+/// `hy3-b` 只有国内版有、`gpt-5.6-sol` 只有国际版有，而选账号按优先级取队首
+/// （本机队首是国际版账号）→ 请求 `hy3-b` 打到 `www.workbuddy.ai`，上游回
+/// 「模型不存在」。
+///
+/// 收窄只在 [`ModelCatalog::edition_exclusive_of`] 给出唯一版本时发生；
+/// 两版都有的模型保持原集合，交给既有的优先级 / 并发 / 会话粘性选路。
+pub(super) fn accounts_for_model(
+    service: &UpstreamService,
+    providers: &[&str],
+    model: &str,
+) -> Vec<Value> {
+    let accounts = accounts_in_providers(service, providers);
+    restrict_workbuddy_edition(accounts, model)
+}
+
+/// WorkBuddy 账号的版本收窄（其余家原样保留）。
+///
+/// ── 收窄后一个都不剩时**退回原集合**（有意）──────────────────
+/// 「那个版本一个可用账号都没有」的正确表现是上游如实报错（模型不存在 / 未授权），
+/// 而不是 503「没有可用账号」—— 后者会把排查方向引到账号页，而问题其实在
+/// 「这个模型属于另一个版本」。
+fn restrict_workbuddy_edition(accounts: Vec<Value>, model: &str) -> Vec<Value> {
+    use crate::server::core::models::{global_catalog, normalize_edition, split_edition_suffix};
+    // 两级判据，**显式后缀优先**：
+    //   1. 下游在模型名上写了版本（`deepseek-v4.1-flash-intl`）—— 用户明确要的版本；
+    //   2. 否则看模型是否**只属于**某一个版本（`hy3-b` 只在国内版）。
+    // 都没有（两版都有的模型、不认识的名字）→ 不收窄，交给既有选路。
+    let (_name, explicit) = split_edition_suffix(model);
+    let Some(edition) = explicit.or_else(|| global_catalog().edition_exclusive_of(model)) else {
+        return accounts;
+    };
+    let workbuddy = crate::server::core::providers::DEFAULT_PROVIDER_ID;
+    let narrowed: Vec<Value> = accounts
+        .iter()
+        .filter(|account| {
+            if provider_of(account) != workbuddy {
+                return true;
+            }
+            normalize_edition(account.get("edition").and_then(Value::as_str)) == edition
+        })
+        .cloned()
+        .collect();
+    if narrowed.is_empty() {
+        accounts
+    } else {
+        narrowed
+    }
 }
 
 /// 组装选路结果；代理解析失败时把提示**带进选路结果**（本次回退直连）。
@@ -417,8 +485,9 @@ pub(super) fn pick_next_account(
     providers: &[&str],
     keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
+    model: &str,
 ) -> Option<Value> {
-    let accounts = accounts_in_providers(service, providers);
+    let accounts = accounts_for_model(service, providers, model);
     let counts = connection_counts(service);
     routing::pick_account_by_priority(&accounts, keys, &counts, tried_ids, logging::now_ms())
 }
@@ -480,4 +549,84 @@ pub(super) fn report_limit_event(
             "resetAtText": if reset_at > 0 { format_reset_text(reset_at as f64) } else { String::new() },
         })),
     );
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn account(id: &str, provider: &str, edition: &str) -> Value {
+        json!({ "id": id, "provider": provider, "edition": edition, "enabled": true })
+    }
+
+    fn ids(items: &[Value]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect()
+    }
+
+    /// 版本独有模型收窄 WorkBuddy 候选账号，其余家不受影响。
+    #[test]
+    fn version_only_models_narrow_workbuddy_candidates() {
+        let accounts = vec![
+            account("intl-1", "workbuddy", "intl"),
+            account("cn-1", "workbuddy", "cn"),
+            account("raccoon-1", "raccoon", "cn"),
+        ];
+        // 国内版独有 → 国际版账号被排除（否则请求会打到 www.workbuddy.ai 报模型不存在）
+        assert_eq!(
+            ids(&restrict_workbuddy_edition(accounts.clone(), "hy3-b")),
+            vec!["cn-1", "raccoon-1"]
+        );
+        // 国际版独有 → 国内版账号被排除
+        assert_eq!(
+            ids(&restrict_workbuddy_edition(accounts.clone(), "gpt-5.6-sol")),
+            vec!["intl-1", "raccoon-1"]
+        );
+        // 两版都有 → 原样（同一个上游名字，交给优先级 / 并发选路）
+        assert_eq!(restrict_workbuddy_edition(accounts.clone(), "fast-model").len(), 3);
+        // 不认识 → 原样
+        assert_eq!(restrict_workbuddy_edition(accounts, "no-such-model").len(), 3);
+    }
+
+    /// 收窄后一个账号都不剩时退回原集合：让上游如实报「模型不存在」，
+    /// 而不是 503「没有可用账号」（那会把排查方向引到账号页）。
+    #[test]
+    fn an_empty_narrowing_falls_back_to_the_full_set() {
+        let only_intl = vec![account("intl-1", "workbuddy", "intl")];
+        assert_eq!(ids(&restrict_workbuddy_edition(only_intl, "hy3-b")), vec!["intl-1"]);
+    }
+
+    /// 下游用版本后缀指定版本时，**后缀优先于「队首账号所属版本」** ——
+    /// 这是「两版都有的模型（`deepseek-v4.1-flash`）想固定走某一版」的唯一手段。
+    #[test]
+    fn an_explicit_edition_suffix_wins() {
+        let accounts = vec![
+            account("intl-1", "workbuddy", "intl"),
+            account("cn-1", "workbuddy", "cn"),
+            account("raccoon-1", "raccoon", "cn"),
+        ];
+        assert_eq!(
+            ids(&restrict_workbuddy_edition(
+                accounts.clone(),
+                "deepseek-v4.1-flash-intl"
+            )),
+            vec!["intl-1", "raccoon-1"]
+        );
+        assert_eq!(
+            ids(&restrict_workbuddy_edition(
+                accounts.clone(),
+                "deepseek-v4.1-flash-cn"
+            )),
+            vec!["cn-1", "raccoon-1"]
+        );
+        // 不带后缀 → 两版都有 → 不收窄（走队首账号所属版本）
+        assert_eq!(
+            restrict_workbuddy_edition(accounts, "deepseek-v4.1-flash").len(),
+            3
+        );
+    }
 }

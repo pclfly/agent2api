@@ -633,6 +633,28 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// 该账号凭证的**过期时间**（毫秒）；判不出返回 `None`。
+    ///
+    /// ── 它解决的唯一问题：维护窗口 ≠ 转发窗口 ──────────────────
+    /// [`Self::credentials_expiring`] 的窗口是**转发**语义（「快过期才刷」，
+    /// 各家 5 分钟），而凭证自动维护是**周期性**动作（默认每 10 分钟一轮）。
+    /// 固定 5 分钟的窗口**小于**维护间隔，于是两次维护之间会漏掉一批凭证：
+    /// 某凭证在第 6 分钟进入窗口、第 11 分钟过期，而维护在第 5 分钟与第 15 分钟
+    /// 各跑一次 —— 第 5 分钟它还没临期（跳过），第 15 分钟它已经过期 4 分钟。
+    /// 转发不受影响（请求链路的懒刷新兜底），但账号页会白白显示一段「已过期」。
+    ///
+    /// 维护模块因此需要一个**可比较的过期时间**，好按「间隔 + 余量」自己算窗口
+    /// （见 `core::credential_maintenance` 的 `maintenance_window_ms`）。
+    ///
+    /// 判据仍是各家知识（过期时间在哪个字段），但语义从「要不要刷」变成
+    /// 「还有多久过期」。**默认 `None` = 本家没有可读的过期时间** ——
+    /// 维护任务随即回落到 `credentials_expiring`，行为与改动前完全一致。
+    ///
+    /// 与 `credentials_expiring` 同一硬约束：同步、只取快照，**不跨 await**。
+    fn credentials_expires_at_ms(&self, _store: &AccountStore, _account_id: &str) -> Option<i64> {
+        None
+    }
+
     /// 本 provider 是否允许「一个账号都没有时用默认登录态转发」
     /// （模块头扩展 3；workbuddy 的 `WORKBUDDY_TOKEN` 旁路）。
     fn allows_anonymous_default_session(&self) -> bool {
@@ -929,6 +951,13 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::Zcode => &super::zcode::adapter::ZCODE_ADAPTER,
         ProviderKind::ZcodeIntl => &super::zcode::adapter::ZCODE_INTL_ADAPTER,
         ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
+        // 三家新反代：LobsterAI 无状态（OpenAI 兼容 SSE）、Loomy 无状态
+        // （标准 OpenAI SSE）、MiniMax 无状态 + `UpstreamResponse::Anthropic`
+        // （Anthropic Messages 请求体 + 响应折回 chat SSE，复用与 ZCode 活动
+        // 套餐同一条翻译链 —— 不需要 `forward_conversation`）。
+        ProviderKind::LobsterAi => &super::lobsterai::LOBSTERAI_ADAPTER,
+        ProviderKind::Loomy => &super::loomy::LOOMY_ADAPTER,
+        ProviderKind::Minimax => &super::minimax::MINIMAX_ADAPTER,
     }
 }
 
@@ -990,6 +1019,12 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 不在的话刷新循环根本不会问它，症状是"界面上点了刷新、日志里
         // 一句 trae 都没有"（与"刷了但没取到"是两种完全不同的故障）。
         ProviderKind::Trae,
+        // 三家新反代。均已接真身：LobsterAI / Loomy / MiniMax 的目录刷新
+        // 都走远程拉取（`supports_model_refresh()` 为 true），因此必须在本
+        // 列表里 —— 不在的话刷新循环根本不会问它们。
+        ProviderKind::LobsterAi,
+        ProviderKind::Loomy,
+        ProviderKind::Minimax,
     ]
 }
 

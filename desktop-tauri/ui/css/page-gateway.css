@@ -193,6 +193,17 @@
 .models-table .alias .t[data-copy]:active { opacity: .55; }
 .mname { color: var(--text-3); font-size: 11.5px; }
 .rate { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+/* 倍率为 0 = 上游的「限时免费」档（WorkBuddy 国际版的 deepseek-v4.1-flash /
+   hy4-preview-f / hy3，国内版的 hy3 / hy3-b / hy3-c）：做成小徽章，
+   与普通倍率数字一眼可分 —— 只印「0.00x」会让人以为是读错了。 */
+.rate-free {
+  color: var(--ok);
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-bd);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-weight: 600;
+}
 
 /* ── 能力位两列（「上下文 / 输出」与「能力」）─────────────────────────
    cell 内容是一个按钮：点开「模型能力」弹窗。两列的入口语义相同（能力是一个

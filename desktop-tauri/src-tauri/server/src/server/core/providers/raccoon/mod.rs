@@ -335,6 +335,18 @@ impl ProviderAdapter for RaccoonAdapter {
         }
     }
 
+    /// JWT 里的 `exp`（毫秒；解不出 → None）。
+    ///
+    /// 给凭证自动维护算「维护窗口」用（见 trait 的说明）：转发窗口是 5 分钟，
+    /// 维护间隔默认 10 分钟 —— 没有这一项时，两次维护之间到期的凭证会漏刷。
+    fn credentials_expires_at_ms(&self, store: &AccountStore, account_id: &str) -> Option<i64> {
+        if account_id.is_empty() {
+            return None;
+        }
+        let credentials = credentials::snapshot_for(store, account_id).ok()?;
+        credentials.expires_at.map(|value| value as i64)
+    }
+
     /// 小浣熊支持网页登录（trait 扩展 7）：官方登录页在登录成功后跳转
     /// `office-raccoon://auth/callback?code=…`，网关用那个一次性 code 换凭证。
     ///

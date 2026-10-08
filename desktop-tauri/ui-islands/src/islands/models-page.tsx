@@ -107,7 +107,7 @@ import {
   openAddCustomProvider, openCapability, openCustomModel, openMapping, providerOptions, refreshAll,
   refreshModels, registerColumnSettings, removeCustomProvider, render, resolveProvider, restoreSavedFilters,
   rowEnabled, rowKeyOf, runRowAction, same, selectProvider, setSearch, setStateFilter, setTableEl,
-  shared, subscribe, syncHead, toast, upstreamOptions, viewData, visibleColumns, writeAddModel,
+  shared, splitRailKey, subscribe, syncHead, toast, upstreamOptions, viewData, visibleColumns, writeAddModel,
   writeBinding, writeRemoveMapping, writeRemoveModel,
   type Align, type Binding, type ColumnView, type CustomModelContext, type MappingContext,
 } from './models-panel-state'
@@ -126,10 +126,28 @@ const cellClass = (base: string, align?: Align): string => (align ? `${base} ta-
  */
 const RAIL_HIDE_COUNT_ON_HOVER = '[.pv-row:hover_&_[data-slot=nav-item-count]]:invisible'
 
-/** 倍率文案：后端给的 `x1.5` 这类字符串只留数值部分（照抄旧实现） */
+/**
+ * 倍率列的展示：`x1.5` → `1.5x`；**`x0.00` 是「限时免费」**。
+ *
+ * 上游用 0 倍率表达限免档（WorkBuddy 国际版当前是 `deepseek-v4.1-flash` /
+ * `hy4-preview-f` / `hy3`，国内版是 `hy3` / `hy3-b` / `hy3-c`）——
+ * 直接渲染成 `0.00x` 会让人以为是「免费但不知道为什么」，所以单独给文案。
+ * 空值给 `—`（不是「0 倍」：那两件事完全不同）。
+ */
 function formatCredits(credits: unknown): string {
-  const match = /x\s*([\d.]+)/i.exec(String(credits || ''))
-  return match ? `${match[1]}x` : String(credits || '')
+  const text = String(credits ?? '').trim()
+  if (!text) return '—'
+  const match = /x\s*([\d.]+)/i.exec(text)
+  if (!match) return text
+  const value = Number(match[1])
+  if (Number.isFinite(value) && value === 0) return '限时免费'
+  return `${match[1]}x`
+}
+
+/** 这条倍率是不是「限时免费」档（决定是否加高亮样式） */
+function isFreeCredits(credits: unknown): boolean {
+  const match = /x\s*([\d.]+)/i.exec(String(credits ?? ''))
+  return !!match && Number(match[1]) === 0
 }
 
 /** 搜索 / 状态 / 提供商三个条件（口径与旧实现逐条对齐） */
@@ -137,7 +155,13 @@ function matches(model: ManageModel, keyword: string, provider: string, stateFil
   if (stateFilter === 'enabled' && !rowEnabled(model)) return false
   if (stateFilter === 'disabled' && rowEnabled(model)) return false
   if (stateFilter === 'mapped' && !(model.aliases || []).length) return false
-  if (provider !== 'all' && (model.provider || '') !== provider) return false
+  if (provider !== 'all') {
+    // 左栏的选中项可能是 `provider\u0001edition`（有版本维度的家，见 railKeyOf）——
+    // WorkBuddy 的国际版 / 国内版是两条独立的清单，各自只该显示自己的模型
+    const [wantProvider, wantEdition] = splitRailKey(provider)
+    if ((model.provider || '') !== wantProvider) return false
+    if (wantEdition && String(model.edition || '') !== wantEdition) return false
+  }
   if (!keyword) return true
   const hay = [model.id, model.name, ...(model.aliases || [])].join(' ').toLowerCase()
   return hay.includes(keyword)
@@ -189,7 +213,10 @@ function ModelsPage() {
     const counts = builtinRailItems(state.data)
     const customs = customSource.list()
     const total = [...counts.values()].reduce((sum, item) => sum + item.n, 0)
-    const allLabel = `全部（${counts.size} 家）`
+    // 「家」按 **provider** 数，不按列表行数：WorkBuddy 占两行（国内版 / 国际版，
+    // 见 railKeyOf），把它算成两家会让这个数字与账号页/提供商页对不上。
+    const providerCount = new Set([...counts.keys()].map(key => splitRailKey(key)[0])).size
+    const allLabel = `全部（${providerCount} 家）`
     return (
       <aside className='prov-rail' id='prov-rail' aria-label='按提供商选择'>
         <div className='rail-label'>内置提供商</div>
@@ -438,7 +465,9 @@ function ModelsPage() {
       case 'rate':
         return (
           <td className={cellClass('cell-rate', column.align)}>
-            <span className='rate'>{model.credits ? formatCredits(model.credits) : '—'}</span>
+            <span className={`rate${isFreeCredits(model.credits) ? ' rate-free' : ''}`}>
+              {formatCredits(model.credits)}
+            </span>
           </td>
         )
       case 'source':
@@ -468,7 +497,7 @@ function ModelsPage() {
   function modelRow(model: ManageModel) {
     const busyRow = state.pending.has(rowKeyOf(model))
     return (
-      <tr key={`${model.provider || ''}\u0001${model.id}`}>
+      <tr key={`${model.provider || ''}\u0001${model.edition || ''}\u0001${model.id}`}>
         {columns.map(column => (
           <React.Fragment key={column.key}>{cellFor(column, model, busyRow)}</React.Fragment>
         ))}
@@ -503,7 +532,11 @@ function ModelsPage() {
     const collapsible = showGroups && !keyword && state.stateFilter === 'all' && !paging.paged
     const groups = new Map<string, { label: string; items: ManageModel[] }>()
     for (const model of shown) {
-      const key = model.provider || ''
+      // 分组键是 (provider, edition)：WorkBuddy 一家有**两条**清单（国内版 /
+      // 国际版，上游两个站点下发的模型与倍率都不同），只按 provider 分组会把
+      // 它们并成一组、标题只显示先出现的那个版本 —— 那正是改造前「倍率对不上」
+      // 的观感来源。其余家的 edition 是空串，键与原来等价。
+      const key = `${model.provider || ''}\u0001${model.edition || ''}`
       if (!groups.has(key)) groups.set(key, { label: model.providerLabel || key || '未知', items: [] })
       groups.get(key)?.items.push(model)
     }

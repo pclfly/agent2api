@@ -663,6 +663,37 @@ impl AccountStore {
             }
         }
 
+        if let Some(value) = patch.get("product") {
+            // 出站身份（WB / VSC / CLI）是 **workbuddy 专属**的账号属性：
+            // 其他家的适配器不读这个字段，允许设置只会让用户以为改了有用。
+            if record.provider()
+                != crate::server::core::providers::DEFAULT_PROVIDER_ID
+            {
+                return Err(AccountStoreError::bad_request(
+                    "出站身份（WB / VSC / CLI）只适用于 WorkBuddy 账号",
+                ));
+            }
+            let next = crate::server::core::providers::workbuddy::identity::resolve_product(
+                value.as_str(),
+            );
+            let current = crate::server::core::providers::workbuddy::identity::resolve_product(
+                record.get("product").and_then(Value::as_str),
+            );
+            if next != current {
+                record.set(
+                    "product",
+                    Value::String(
+                        crate::server::core::providers::workbuddy::identity::product_id(next)
+                            .to_string(),
+                    ),
+                );
+                changes.push(format!(
+                    "出站身份 → {}",
+                    crate::server::core::providers::workbuddy::identity::product_label(next)
+                ));
+            }
+        }
+
         Ok(changes)
     }
 

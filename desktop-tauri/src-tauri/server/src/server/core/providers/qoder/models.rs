@@ -288,29 +288,72 @@ fn catalog_for(state: &CatalogState, region: Region) -> Vec<Value> {
     }
 }
 
-/// 当前清单（两个地区的**并集**，按 id 去重、global 优先）。
+/// 当前清单（两个地区的**并集**，按 id 去重）。
 ///
 /// 聚合目录与路由判定读这里 —— 它们只有「这个模型名认不认识」这一个问题，
 /// 不关心账号在哪一边（那由请求时的 `resolve` 收窄）。
+///
+/// ── 去重优先级：**远程清单先于静态兜底**（2026-10 修）────────────
+/// 两个地区各自「远程优先、否则兜底」，但并集时如果只按地区排序（global 先），
+/// 就会出现**一边的兜底把另一边的远程真数据整条盖掉**：国际版账号登录过又删掉
+/// （或从没刷新成功过）时，`global` 那格是空的 → 用兜底清单，而兜底的
+/// `Qwen3.8-Flash` 带着 `DEFAULT_CONTEXT_WINDOW`（200K、没有档位表）排在前面，
+/// 中国版刚拉回来的真条目（1M、带 200K/400K/1M 三档）被丢掉 —— 于是
+/// `/v1/models` 对外广告 200K，而实际转发（`resolve` 按账号地区优先）用的是 1M，
+/// 同一个模型在「广告」与「真用」两条路上读数不一致。
+///
+/// 因此优先级是**两维**的：① 远程 > 兜底；② 同档之内 global > cn（保留原口径）。
+/// 兜底只该在「这一边确实没有远程清单」时代表这一边，不该越界代表另一边。
 pub fn list() -> Vec<Value> {
     let state = read_state();
+    merge_union(
+        catalog_for(&state, Region::Global),
+        catalog_for(&state, Region::Cn),
+        !state.global.is_empty(),
+        !state.cn.is_empty(),
+    )
+}
+
+/// [`list`] 的纯函数形态（不碰进程级句柄，可直接测）。
+///
+/// `global_remote` / `cn_remote` 是「这一边的清单是不是远程拉回来的」——
+/// 由调用方从 `CatalogState` 的两格是否为空得出（`catalog_for` 已在空时回落兜底）。
+fn merge_union(
+    global: Vec<Value>,
+    cn: Vec<Value>,
+    global_remote: bool,
+    cn_remote: bool,
+) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
+    // `seen` 始终保持有序：`binary_search` 要求它有序，而 `binary_search` 让
+    // 每次去重判定从线性扫描变成对数 —— 两个地区的清单都不大，但这没有代价。
     let mut seen: Vec<String> = Vec::new();
-    for region in [Region::Global, Region::Cn] {
-        for model in catalog_for(&state, region) {
+    // 两维优先级展开成四次「地区 pass」：① 远程 global ② 远程 cn
+    // ③ 兜底 global ④ 兜底 cn。先到先得，于是同 id 只留优先级最高的那一条。
+    let passes: [(Vec<Value>, Region, bool); 4] = [
+        (global.clone(), Region::Global, global_remote),
+        (cn.clone(), Region::Cn, cn_remote),
+        (global, Region::Global, !global_remote),
+        (cn, Region::Cn, !cn_remote),
+    ];
+    for (models, region, wanted_remote) in passes {
+        if !wanted_remote {
+            continue;
+        }
+        for model in models {
             let id = text_of(&model, "id");
             if id.is_empty() {
                 continue;
             }
             let key = id.to_lowercase();
-            if seen.iter().any(|known| known == &key) {
+            if seen.binary_search(&key).is_ok() {
                 continue;
             }
-            seen.push(key);
             let mut model = model;
             if let Some(object) = model.as_object_mut() {
                 object.insert("region".to_string(), Value::String(region.id().to_string()));
             }
+            seen.insert(seen.binary_search(&key).unwrap_or_else(|at| at), key);
             out.push(model);
         }
     }
@@ -640,4 +683,108 @@ fn js_truthy(value: &Value) -> bool {
 #[allow(dead_code)]
 pub fn count() -> usize {
     list().len()
+}
+
+#[cfg(test)]
+mod tests {
+    //! 并集去重优先级的回归测试：**远程清单先于静态兜底**。
+    //!
+    //! 这一组守的是那个真实故障：国际版没有远程清单（兜底，200K、无档位）把
+    //! 中国版远程清单里的 `Qwen3.8-Flash`（1M、三档）整条盖掉，`/v1/models`
+    //! 广告 200K 而转发用 1M。测的是纯函数 `merge_union`，不碰进程级句柄。
+    use super::*;
+
+    /// 一条最小条目：只要 `id` 就够（去重与 region 标注只看它）。
+    fn model(id: &str) -> Value {
+        json!({ "id": id, "name": id })
+    }
+
+    /// 取某 id 被保留的那条（找不到时 panic，测试里可以 unwrap）。
+    fn find<'a>(models: &'a [Value], id: &str) -> &'a Value {
+        models
+            .iter()
+            .find(|model| model.get("id").and_then(Value::as_str) == Some(id))
+            .expect("这一条应当被保留")
+    }
+
+    /// 一条 id 只在并集里出现一次。
+    fn assert_unique(models: &[Value]) {
+        let mut ids: Vec<String> = models
+            .iter()
+            .map(|model| text_of(model, "id").to_lowercase())
+            .collect();
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(total, ids.len(), "并集里不该有重复 id");
+    }
+
+    #[test]
+    fn remote_catalog_wins_over_the_other_regions_fallback() {
+        // 国际版只有兜底（`global_remote = false`），中国版是远程拉回来的。
+        let merged = merge_union(vec![model("Qwen3.8-Flash")], vec![model("Qwen3.8-Flash")], false, true);
+        assert_eq!(1, merged.len());
+        assert_unique(&merged);
+        assert_eq!(
+            Some("cn"),
+            find(&merged, "Qwen3.8-Flash").get("region").and_then(Value::as_str),
+            "同 id 时保留的必须是远程那一侧的条目（兜底不得越界代表另一边）"
+        );
+    }
+
+    #[test]
+    fn fallback_of_one_region_still_represents_itself() {
+        // 反向：中国版是兜底、国际版是远程 —— 保留国际版那条。
+        let merged = merge_union(vec![model("Qwen3.8-Flash")], vec![model("Qwen3.8-Flash")], true, false);
+        assert_eq!(
+            Some("global"),
+            find(&merged, "Qwen3.8-Flash").get("region").and_then(Value::as_str)
+        );
+    }
+
+    #[test]
+    fn same_tier_keeps_the_global_first_rule() {
+        // 两边都是远程（或都是兜底）时，保持原有的「global 优先」口径不变。
+        let both_remote = merge_union(vec![model("Auto")], vec![model("Auto")], true, true);
+        assert_eq!(
+            Some("global"),
+            find(&both_remote, "Auto").get("region").and_then(Value::as_str)
+        );
+        let both_fallback = merge_union(vec![model("Auto")], vec![model("Auto")], false, false);
+        assert_eq!(
+            Some("global"),
+            find(&both_fallback, "Auto").get("region").and_then(Value::as_str)
+        );
+    }
+
+    #[test]
+    fn ids_only_present_on_one_side_survive() {
+        // 并集不是交集：只在一边存在的模型必须留下（用户要看到完整清单，
+        // 否则分不清「模型不存在」与「没权限」）。
+        let merged = merge_union(
+            vec![model("Ultimate"), model("Sonus")],
+            vec![model("Auto"), model("GLM-5.2")],
+            false,
+            true,
+        );
+        assert_eq!(4, merged.len());
+        assert_unique(&merged);
+        for id in ["Ultimate", "Sonus", "Auto", "GLM-5.2"] {
+            let _ = find(&merged, id);
+        }
+    }
+
+    #[test]
+    fn dedup_is_case_insensitive_and_ignores_blank_ids() {
+        // 上游 id 大小写不稳（`display_name` 去空白后的形态），去重按小写；
+        // 没有 id 的条目整条丢弃（它进不了 `/v1/models`）。
+        let merged = merge_union(
+            vec![model("QFModel"), json!({ "name": "没有 id" })],
+            vec![model("qfmodel")],
+            true,
+            false,
+        );
+        assert_eq!(1, merged.len());
+        assert_eq!(Some("QFModel"), merged[0].get("id").and_then(Value::as_str));
+    }
 }

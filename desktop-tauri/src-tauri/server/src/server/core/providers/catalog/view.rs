@@ -31,12 +31,26 @@ fn public_builtin_items(active: &[(ProviderKind, Vec<Value>)]) -> Vec<(String, V
             if !claimed.insert(name.to_lowercase()) {
                 continue;
             }
-            let Some(upstream) = manifest.iter().find(|item| model_id(item) == wire.model) else { continue };
+            // 取清单里**同名的**条目优先：版本后缀别名（`xxx-intl`）在清单里
+            // 有自己的条目（带可读展示名与 `editionAliasOf`），借真名条目生成会
+            // 把展示名盖成对外名
+            let Some(upstream) = manifest
+                .iter()
+                .find(|item| model_id(item).eq_ignore_ascii_case(&name))
+                .or_else(|| manifest.iter().find(|item| model_id(item) == wire.model))
+            else {
+                continue;
+            };
             let mut item = list_item(upstream, provider);
             if let Some(object) = item.as_object_mut() {
                 object.insert("id".to_string(), Value::String(name.clone()));
                 if !name.eq_ignore_ascii_case(&wire.model) {
-                    object.insert("name".to_string(), Value::String(name));
+                    // 版本后缀别名（`xxx-intl`）自带可读展示名（`X（国际版）`），
+                    // 不要被对外名盖掉 —— 「对外名当展示名」这条规则是给用户
+                    // 自定义别名用的（那种条目没有 `editionAliasOf`）
+                    if upstream.get("editionAliasOf").is_none() {
+                        object.insert("name".to_string(), Value::String(name));
+                    }
                     object.insert("is_default".to_string(), Value::Bool(false));
                 }
             }
@@ -98,19 +112,62 @@ pub fn session_models(store: &AccountStore) -> Vec<Value> {
 }
 
 pub fn models_by_provider(store: &AccountStore) -> Value {
+    // 一家可能出现**多条**清单（WorkBuddy 按版本两条，见 `manifests_for`）——
+    // 按 provider 合并去重，否则后一条会把前一条的名字整个覆盖掉。
     let mut map = Map::new();
     for (kind, manifest) in active_manifests(store) {
-        let mut names: Vec<_> = public_builtin_items(&[(kind, manifest)]).into_iter()
-            .map(|(_, item)| model_id(&item)).collect();
-        names.sort_by_key(|name| name.to_lowercase());
-        map.insert(kind_id(kind).to_string(), json!(names));
+        let names: Vec<String> = public_builtin_items(&[(kind, manifest)])
+            .into_iter()
+            .map(|(_, item)| model_id(&item))
+            .collect();
+        merge_names(&mut map, kind_id(kind), names);
     }
     for (provider, items) in super::super::custom::catalog_providers(store) {
-        let mut names: Vec<_> = items.iter().map(model_id).collect();
-        names.sort_by_key(|name| name.to_lowercase());
-        map.insert(provider, json!(names));
+        let names: Vec<String> = items.iter().map(model_id).collect();
+        merge_names(&mut map, &provider, names);
+    }
+    for value in map.values_mut() {
+        if let Some(list) = value.as_array_mut() {
+            list.sort_by_key(|item| item.as_str().unwrap_or("").to_lowercase());
+        }
     }
     Value::Object(map)
+}
+
+/// 把一批模型名并进某个 provider 的列表（大小写不敏感去重，保持首次出现的位置）。
+fn merge_names(map: &mut Map<String, Value>, provider: &str, names: Vec<String>) {
+    let entry = map
+        .entry(provider.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(list) = entry.as_array_mut() else { return };
+    for name in names {
+        let exists = list.iter().any(|item| {
+            item.as_str()
+                .map(|text| text.eq_ignore_ascii_case(&name))
+                .unwrap_or(false)
+        });
+        if !exists {
+            list.push(Value::String(name));
+        }
+    }
+}
+
+/// 管理页那一列的展示名。
+///
+/// WorkBuddy 一家有**两条**清单（国内版 / 国际版，上游两个站点下发的模型与倍率
+/// 都不同），只写「WorkBuddy」会让两行看起来是重复数据 —— 加上版本后缀，用户
+/// 一眼能对上自己账号所属的站点。
+fn provider_label_of(provider: &str, edition: &str) -> String {
+    let base = super::super::label_of(provider);
+    if provider == crate::server::core::providers::DEFAULT_PROVIDER_ID && !edition.is_empty() {
+        let suffix = if edition == crate::server::core::models::EDITION_INTL {
+            "国际版"
+        } else {
+            "国内版"
+        };
+        return format!("{base} {suffix}");
+    }
+    base
 }
 
 /// 每条原始 ID 都返回一个默认绑定；历史的同名映射合并进默认绑定，避免两个开关
@@ -136,6 +193,15 @@ pub fn manage_view(store: &AccountStore) -> Value {
         let (remote, refreshed_at) = refresh_meta(kind);
         let source = if remote { "remote" } else { "builtin" };
         for item in manifest {
+            // 版本后缀别名（`hy3-intl` / `deepseek-v4.1-flash-cn`）不进管理页的模型
+            // 列表：它不是上游模型，而是「同名模型两版都有、想指定打哪一站」时用的
+            // **路由别名**（见 `providers::catalog::append_edition_alias`）。放进列表
+            // 会让「国际版 / 国内版」两行的条数比官方桌面端选择器多出一截
+            // （实测 27/22 对 20/15）—— 用户据此判断清单对不对，读数必须是真模型数。
+            // 别名本身照旧可用（对外 `/v1/models` 仍广告它），只是不在这张表里占一行。
+            if item.get("editionAliasOf").is_some() {
+                continue;
+            }
             let id = model_id(&item);
             if id.is_empty() { continue; }
             let default = rules.binding(provider, &id, &id);
@@ -173,10 +239,27 @@ pub fn manage_view(store: &AccountStore) -> Value {
                 .find(|entry| entry.matches(provider, &id))
                 .map(|entry| capability::overridden_keys(&entry.values))
                 .unwrap_or_default();
+            // 倍率：workbuddy 用 `credits`（"x2.00 credits" 字符串），accio 用
+            // `usageMultiple`（数字 0.44）—— 统一成 UI 倍率列认的 "x{值}" 格式
+            // （解析见 ui 的 `/x\s*([\d.]+)/`）。两者都缺时如实给 null。
+            let credits = item
+                .get("credits")
+                .filter(|value| !value.is_null())
+                .cloned()
+                .or_else(|| {
+                    item.get("usageMultiple")
+                        .and_then(Value::as_f64)
+                        .map(|value| Value::String(format!("x{value}")))
+                })
+                .unwrap_or(Value::Null);
             models.push(json!({
-                "id": id, "name": item.get("name"), "credits": item.get("credits"),
+                "id": id, "name": item.get("name"), "credits": credits,
                 "isDefault": item.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
-                "provider": provider, "providerLabel": super::super::label_of(provider),
+                "provider": provider,
+                // 版本：WorkBuddy 两条清单各带一个（`cn` / `intl`），其余家为空串。
+                // 前端按 (provider, edition) 分组，同名模型的倍率才不会被混淆。
+                "edition": item.get("edition").and_then(Value::as_str).unwrap_or(""),
+                "providerLabel": provider_label_of(provider, item.get("edition").and_then(Value::as_str).unwrap_or("")),
                 "source": source, "enabled": enabled, "aliases": aliases,
                 "capabilities": capability::effective(&item),
                 "capOverrides": cap_overrides,

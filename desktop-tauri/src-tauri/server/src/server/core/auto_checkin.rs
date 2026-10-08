@@ -49,7 +49,10 @@ pub const DEFAULT_TIME: &str = "00:01";
 
 /// 可勾选的签到提供商（界面上的复选框）。默认全选。
 ///
-///   - **WorkBuddy**：腾讯的每日签到接口；
+///   - **WorkBuddy**：国内版走腾讯的每日签到接口；**国际版**走「每日活跃打卡」
+///     （桌面端轻量对话 + 网页通道 agent 会话跑到 `completed`，
+///     `providers::workbuddy::web_daily`）—— 国际站没有签到接口，官方奖励只认
+///     跑完的网页端会话；
 ///   - **小浣熊**：「桌面登录积分」链路（`providers::raccoon` 的每日积分发放）；
 ///   - **AutoClaw 国内版 / 国际版**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin`）。两个地区**都支持** —— 任务接口在
@@ -60,12 +63,26 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     活动列表里只有促销），由 `billing::checkin::supports_checkin` 按 edition
 ///     排除。中国版里 Free 套餐账号也可能没有被下发活动（实测如此），那种情况
 ///     实现返回一条中性结果（「当前没有可领取的签到活动」），不算失败。
+///   - **LobsterAI**：三步链路（slot → context → check_in，客户端幂等键，
+///     `providers::lobsterai::checkin`）；
+///   - **Loomy**：`POST /points/first-login`（触发每日额度初始化，
+///     幂等判据 `alreadyProcessed`，`providers::loomy::checkin`）；
+///   - **MiniMax**：`signin/status` + `signin/claim`（必须带 `timezone_id`，
+///     幂等判据 `claim_result`，`providers::minimax::checkin`）。
 ///
 /// 这是「有签到活动」的清单，不是「有积分概念」的清单：CatPaw 有积分查询但
 /// 没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 5] =
-    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder"];
+pub const CHECKIN_PROVIDERS: [&str; 8] = [
+    "workbuddy",
+    "raccoon",
+    "autoclaw",
+    "autoclaw-intl",
+    "qoder",
+    "lobsterai",
+    "loomy",
+    "minimax",
+];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {
@@ -74,17 +91,18 @@ pub fn default_providers() -> Vec<String> {
 
 /// 提供商的展示名（从注册表查，查不到就原样回显 id）。
 ///
-/// ── 为什么 WorkBuddy 要带上「国内版」────────────────────────
+/// ── 为什么 WorkBuddy 要带上「国内签到 / 国际活跃」────────────────
 /// 这个标签只出现在**签到语境**（提供商复选框、配置错误提示、签到范围变更日志），
-/// 而签到对 WorkBuddy 是**有版本限定**的：只有国内版有签到活动，国际版账号
-/// 一律被 `billing::checkin::supports_checkin` 排除（上游事实：腾讯的每日签到
-/// 接口只有国内站有）。注册表里的 `label` 是这家在**所有语境**下的通用展示名
-/// （账号卡片、筛选、模型清单都用它），改成「WorkBuddy 国内版」会让那些地方
-/// 出现一个没头没尾的版本后缀。
+/// 而 WorkBuddy 在这条链路上是**两个动作**、按版本分：
+///   - 国内版 → 腾讯的每日签到接口（`billing.claim_daily_checkin`）；
+///   - 国际版 → 每日活跃打卡（桌面端轻量对话 + 网页通道 agent 会话，
+///     `providers::workbuddy::web_daily`）—— 国际站没有签到接口，
+///     官方奖励认的是「跑完的网页端会话」。
 ///
-/// 因此在这里覆盖而不是改注册表：分叉的原因不是「名字不一样」，而是
-/// 「签到这条链路只有国内版能走」—— 标签替用户把这件事讲清楚，
-/// 他勾上它时就知道国际版账号不会参与，而不是签完发现被跳过了才回来查。
+/// 注册表里的 `label` 是这家在**所有语境**下的通用展示名（账号卡片、筛选、
+/// 模型清单都用它），改成带动作后缀会让那些地方出现一个没头没尾的括注。
+/// 因此在这里覆盖：用户勾上它时就知道两个版本各自会发生什么，
+/// 而不是签完发现某个版本被跳过了才回来查。
 ///
 /// 另外几家没有这个后缀：小浣熊没有版本区分（`edition` 概念不适用于它），
 /// AutoClaw 两地的签到链路都存在且同形 —— 它的展示名已经带「国内版 / 国际版」
@@ -95,7 +113,7 @@ pub fn default_providers() -> Vec<String> {
 /// 「Qoder 中国版」——用户勾上它时就知道自家国际版账号不会参与。
 fn provider_label(id: &str) -> &str {
     match id {
-        "workbuddy" => "WorkBuddy 国内版",
+        "workbuddy" => "WorkBuddy（国内签到 / 国际活跃）",
         "qoder" => "Qoder 中国版",
         other => crate::server::core::providers::PROVIDERS
             .iter()

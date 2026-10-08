@@ -31,6 +31,8 @@ mod accio;
 mod autoclaw;
 mod catpaw;
 pub mod codearts;
+mod lobsterai;
+mod minimax;
 mod qoder;
 mod trae;
 mod zcode;
@@ -262,6 +264,10 @@ pub struct LoginService {
     /// 也不该让别的 provider 每次轮询都陪着带一份别人用不到的东西。
     /// 表里同一时刻最多一条（见 `login/trae.rs` 模块头）。
     trae_login: Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::trae::login::Session>>>>,
+    /// LobsterAI 网页登录的额外状态（`state → 进行中的一轮`）。
+    ///
+    /// 与 [`Self::trae_login`] 同一形态、同一理由（持有本机回调监听器）。
+    lobsterai_login: Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::lobsterai::oauth::Session>>>>,
 }
 
 impl LoginService {
@@ -272,6 +278,7 @@ impl LoginService {
             tasks: LoginTasks::new(),
             autoclaw_oauth: Arc::new(Mutex::new(HashMap::new())),
             trae_login: Arc::new(Mutex::new(HashMap::new())),
+            lobsterai_login: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -282,6 +289,13 @@ impl LoginService {
     /// Trae 登录的待办表（`login/trae.rs` 用它挂这一轮的回调监听器）。
     pub(crate) fn trae_login(&self) -> &Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::trae::login::Session>>>> {
         &self.trae_login
+    }
+
+    /// LobsterAI 登录的待办表（`login/lobsterai.rs` 用它挂回调监听器）。
+    pub(crate) fn lobsterai_login(
+        &self,
+    ) -> &Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::lobsterai::oauth::Session>>>> {
+        &self.lobsterai_login
     }
 
     /// 取消一次登录：任务表那一步见 [`LoginTasks::cancel`]，这里多做的事是
@@ -312,6 +326,10 @@ impl LoginService {
             // 与 AutoClaw 那次「取消后立刻重试抢不到端口」是同一个坑。
             if state.starts_with("trae-") {
                 self.close_trae_login();
+            }
+            // LobsterAI 与 Trae 同一处置（同样持有本机回调端口）。
+            if state.starts_with("lobsterai-") {
+                self.close_lobsterai_login();
             }
         }
         canceled
