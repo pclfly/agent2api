@@ -71,6 +71,8 @@ type RequestEntry = {
   clientReasoning?: string; upstreamReasoning?: string
   durationMs?: number; firstResponseMs?: number | null
   promptTokens?: number; completionTokens?: number; totalTokens?: number; cacheReadTokens?: number
+  /** 本次请求消耗的积分（上游 usage.credit；null/缺省 = 上游没报这个字段，不是 0） */
+  credit?: number | null
   attempts?: number; attemptDetails?: unknown[]; sensitiveHits?: unknown[]
   /** 模型测试发起的请求（后端 `is_test`；此前落盘的老行没有这个键） */
   isTest?: boolean
@@ -258,6 +260,7 @@ const COLUMNS: Column[] = [
   { key: 'model', label: '模型', sel: '.req-model', track: 'minmax(0, 1.3fr)' },
   { key: 'dur', label: '用时', sel: '.req-dur', track: '96px', align: 'right' },
   { key: 'usage', label: '用量', sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
+  { key: 'credit', label: '消耗', sel: '.req-credit', track: '96px', align: 'right' },
   { key: 'error', label: '错误', sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
   { key: 'detail', label: '详情', sel: '.req-detail', track: '60px', align: 'right' },
 ]
@@ -494,6 +497,20 @@ function formatTokens(value: unknown): string {
 }
 
 /**
+ * 消耗积分读数：上游 usage.credit 的原值（小数）。与「用量」列同一取向 —— 不缩写、
+ * 不取整：一次请求可能只消耗 0.02 积分，四舍五入成整数会显示 0，让人以为没扣费。
+ *
+ * 精度取 6 位小数再去尾零：上游实测粒度是两位（0.34 / 0.02），6 位足够覆盖更细的
+ * 读数又不会显示成一串 0。整数（如限免档的 0）直接给整数，不带 `.000000` 的尾巴。
+ */
+function formatCredit(value: unknown): string {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '-'
+  if (Number.isInteger(number)) return String(number)
+  return number.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')
+}
+
+/**
  * 进行中行的「已用时」：now - ts 取整秒（进行中不足 1 秒也显示 1 秒 —— 「0秒」读起来像没动）。
  * 1 秒轮询每拍重绘，这个数自然一秒一跳。
  */
@@ -702,7 +719,7 @@ function runningFirstLine(entry: RequestEntry): React.ReactNode {
 /**
  * 一个数据单元格（网格项，带 .req-xxx 列类名与 ta-* 对齐类）。
  *
- * 按列 key 建表而不是在行内联九个分支：行只回答「按哪些列、什么顺序」，「某一格长什么样」只有
+ * 按列 key 建表而不是在行内联十个分支：行只回答「按哪些列、什么顺序」，「某一格长什么样」只有
  * 一处实现 —— 列设置重排时才不会各画一个样。类名与旧实现的产出逐字一致（CSS 与窄窗口重排都按
  * 这些类名走），空态占位的类名也照旧（重试列空时只有 .req-none，没有 .req-retry）。
  */
@@ -891,6 +908,27 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
         <span key={key} className={className} title={`${line1}\n${line2}`}>
           <span className='req-usage-line'>{line1}</span>
           <span className='req-usage-line sub'>{line2}</span>
+        </span>
+      )
+    }
+
+    case 'credit': {
+      // 进行中：积分要等收尾才记账（与用量列同一时点），此刻没有读数 —— 留空
+      if (isRunning(entry)) return <span key={key} className={className} />
+      // 上游没报 credit（非 WorkBuddy 的家、旧行）→ 「-」。这是「不知道」而不是「0」，
+      // 与「用量」列失败时的「-」同一条纪律：不拿 0 冒充「没消耗」。
+      const raw = entry.credit
+      if (raw === null || raw === undefined) {
+        return <span key={key} className={`req-none ${base} ta-${align}`} title='上游未回报本次消耗的积分'>-</span>
+      }
+      const number = Number(raw)
+      if (!Number.isFinite(number)) {
+        return <span key={key} className={`req-none ${base} ta-${align}`} title='上游未回报本次消耗的积分'>-</span>
+      }
+      const text = formatCredit(number)
+      return (
+        <span key={key} className={className} title={`本次请求消耗 ${text} 积分`}>
+          <span className='req-credit-line'>{text}</span>
         </span>
       )
     }

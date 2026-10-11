@@ -9,7 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@ui'
-import { handleExternalClick, markdownHtml, shared, type UpdateInfo } from './update-shared'
+import { handleExternalClick, isWebPanel, markdownHtml, shared, type UpdateInfo } from './update-shared'
 
 /**
  * 「检测到更新」弹窗（按需建、关闭即卸）—— 从 update-panel.tsx 拆出。
@@ -67,6 +67,9 @@ export function showUpdateModal(
   onGoUpdate: (info: UpdateInfo) => Promise<void>,
 ): void {
   if (!info || info.hasUpdate !== true) return
+  // 网页面板不弹：弹窗的「去更新」会开始下载并安装，而网页端那条链是明确拒绝的
+  // （见 update-shared 的 isWebPanel）。版本号与更新日志在设置页面板里照样能看。
+  if (isWebPanel()) return
   const latest = String(info.latestVersion || '').trim()
   if (!latest) return
   if (shared().wbApp?.currentPage === 'settings') return

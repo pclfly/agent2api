@@ -289,6 +289,19 @@ pub struct RequestEntry {
     /// `row.get(n)` 的序号。
     #[serde(rename = "isTest", default)]
     pub is_test: bool,
+    /// **本次请求消耗的积分**（上游 usage 块里的 `credit`；`None` = 上游没报这个
+    /// 字段 —— 非 WorkBuddy 的家、或该行来自还没有此列的旧版本）。
+    ///
+    /// ── 为什么是 `Option<f64>` 而不是 `f64` ─────────────────────
+    /// 「上游没报」与「上游报了 0」是两回事，后者是**真实读数**（WorkBuddy 的
+    /// 限时免费档 `x0.00` 每次就是扣 0）。缺字段给 `None`，请求日志的「消耗」列
+    /// 显示「-」而不是编一个 0 出来 —— 那会让「这家不报积分」与「这次没花钱」
+    /// 在界面上分不开。旧行 `default` 读成 `None`，同一口径。
+    ///
+    /// 序列化键名 `credit`（与字段同名，故无 `rename`）；与 `is_test` 同一位置
+    /// 纪律：新加的列排在结构体末尾，不牵动前面所有 `row.get(n)` 的序号。
+    #[serde(default)]
+    pub credit: Option<f64>,
 }
 
 /// 一个被命中的敏感词及其次数（存储契约）。
@@ -398,6 +411,8 @@ impl RequestEntry {
         copy.completion_tokens = 0;
         copy.total_tokens = 0;
         copy.cache_read_tokens = 0;
+        // 积分消耗同口径清零（清成 None 而不是 0，理由见 `normalize` 里的 credit）
+        copy.credit = None;
         copy
     }
 }
@@ -426,6 +441,9 @@ pub struct NewRequestEntry {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    /// 本次请求消耗的积分（上游 usage.credit；`None` = 上游没报这个字段）。
+    /// 见 `RequestEntry::credit` 与 `core::upstream::usage::UsageTokens::credit`。
+    pub credit: Option<f64>,
     /// 实际承载本次请求的 provider id（Agent2API 改造 W2b-T3 新增填入，
     /// W4 接上持久化：见 `normalize` 末尾的透传）。
     ///
@@ -468,6 +486,7 @@ impl NewRequestEntry {
             completion_tokens: 0,
             total_tokens: 0,
             cache_read_tokens: 0,
+            credit: None,
             provider: None,
             client_model: String::new(),
             upstream_model: String::new(),
@@ -501,6 +520,11 @@ impl NewRequestEntry {
         let failed = !(200..300).contains(&self.status)
             || self.error.as_deref().is_some_and(|text| !text.is_empty());
         let token = |value: i64| if failed { 0 } else { value.max(0) };
+        // 积分消耗与 token 同一口径：失败请求的消耗**清零成 None**（不是 0）。
+        // 上游报错时 credit 通常缺失；万一某条错误响应带了半截 usage，清成
+        // 「没报」比记成「失败了但消耗 0 积分」更准确 —— 后者会让报表把一次
+        // 失败的请求读成「确认没花钱」，而事实是我们不知道它扣没扣。
+        let credit = if failed { None } else { self.credit };
         // provider 从入参透传到记账条目（W2b 留的丢弃点在此接上）。
         // `None`（转发链没走到选路就失败）与空串（上游返回了空 id）都归一成
         // **空串**：两者在报表语义上都是「未知承载者」，多一种表示只会让
@@ -529,6 +553,7 @@ impl NewRequestEntry {
             completion_tokens: token(self.completion_tokens),
             total_tokens: token(self.total_tokens),
             cache_read_tokens: token(self.cache_read_tokens),
+            credit,
             provider,
             // 双名透传（trim 的理由与 provider 相同：空白不该造出一个
             // 「看起来不同的名字」）；空串语义 = 没有点名 / 没有发出去

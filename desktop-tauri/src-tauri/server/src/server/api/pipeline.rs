@@ -577,6 +577,10 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     entry.completion_tokens = snapshot.completion_tokens;
     entry.total_tokens = snapshot.total_tokens;
     entry.cache_read_tokens = snapshot.cache_read_tokens;
+    // 本次消耗积分（上游 usage.credit；None = 上游没报这个字段）。与四个 token
+    // 同源、同一「最后一次为准」口径，收尾记账时一并落库 —— 请求日志的「消耗」
+    // 列读它，回答「这次请求扣了多少积分、是哪个模型扣的」。
+    entry.credit = snapshot.credit;
     context.stats.record(entry);
     // 原始正文落库（request_raw 表）：与明细同 id、同开始时刻。独立于 record
     // 的一次写入（大字段不进记账热路径，理由见 `RequestStats::store_raw`）；

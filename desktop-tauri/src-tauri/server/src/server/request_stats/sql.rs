@@ -70,7 +70,7 @@ use super::report::normalize_status_filter;
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test";
+     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, credit";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -122,6 +122,10 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         // SQLite 没有布尔类型，按 INTEGER 读再判非零 —— 不依赖驱动对 bool 的
         // 隐式转换（手改过的库里写成 2 也照样算「是测试」）
         is_test: row.get::<_, i64>(23)? != 0,
+        // 末列是 schema v9 加的（本次消耗积分，REAL 可空）；旧行 NULL → None，
+        // 与「上游没报」在写入侧收敛成同一个值（见 `RequestEntry::credit`）。
+        // 读成 Option<f64>：NULL 原样给 None，不替旧行编一个 0
+        credit: row.get(24)?,
     })
 }
 
@@ -601,7 +605,7 @@ pub(super) fn update_running_request(
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
-         is_test = ?22 \
+         is_test = ?22, credit = ?23 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -628,6 +632,7 @@ pub(super) fn update_running_request(
             // 来源标记收尾时**再写一次**（而不是只在首发时写）：这条 UPDATE 是
             // 无进行中行时的兜底之外的主路径，写一次保证两条插入路径口径一致
             entry.is_test as i64,
+            entry.credit,
         ],
     )
 }
@@ -645,9 +650,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits, client_reasoning, upstream_reasoning, is_test) \
+         sensitive_hits, client_reasoning, upstream_reasoning, is_test, credit) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22)",
+         ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             entry.id,
             entry.ts,
@@ -671,6 +676,7 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.client_reasoning,
             entry.upstream_reasoning,
             entry.is_test as i64,
+            entry.credit,
         ],
     )?;
     Ok(())
@@ -849,6 +855,72 @@ pub(super) fn count_raw_matching(
 /// 清空全部原始正文（`clear()` / `mode=all` 全清时与明细一起清）
 pub(super) fn delete_all_raw(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute("DELETE FROM request_raw", [])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::db::test_temp::TempDb;
+
+    /// 起一条最小可入库的明细（只填列序里有值的字段，其余走默认）。
+    fn entry(id: &str, credit: Option<f64>) -> RequestEntry {
+        RequestEntry {
+            ts: 1_700_000_000_000,
+            id: id.to_string(),
+            model: "deepseek-v4.1-flash".to_string(),
+            account_id: String::new(),
+            account_name: String::new(),
+            status: 200,
+            duration_ms: 100,
+            first_response_ms: Some(50),
+            attempts: 1,
+            error: None,
+            prompt_tokens: 93,
+            completion_tokens: 321,
+            total_tokens: 414,
+            cache_read_tokens: 0,
+            credit,
+            provider: "workbuddy-intl".to_string(),
+            client_model: String::new(),
+            upstream_model: String::new(),
+            client_reasoning: String::new(),
+            upstream_reasoning: String::new(),
+            attempt_details: Vec::new(),
+            sensitive_hits: Vec::new(),
+            phase: String::new(),
+            phase_started_at: None,
+            is_test: false,
+        }
+    }
+
+    /// credit 的落库 → 读回往返：三种形态（小数 / 0 / 缺失）必须**逐字保留**。
+    ///
+    /// 这是最易碎的一环：`credit` 排在 `REQUEST_COLUMNS` 末尾（序号 24），
+    /// 中间插列或漏读都会静默取错值；而「缺失」与「0」在 SQLite 里分别是 NULL
+    /// 与 0.0，读侧必须靠 `Option<f64>` 分得开（见 `RequestEntry::credit`）。
+    #[test]
+    fn credit_round_trips_through_insert_and_select() {
+        let (db, _guard) = TempDb::open("req-credit-roundtrip");
+        db.with_mut(|conn| {
+            insert_request(conn, &entry("w-billed", Some(0.34))).expect("插入计费行");
+            insert_request(conn, &entry("w-free", Some(0.0))).expect("插入限免行");
+            insert_request(conn, &entry("w-missing", None)).expect("插入无 credit 行");
+        })
+        .expect("库可用");
+
+        let rows = db
+            .with(|conn| {
+                select_page_desc(conn, &FilterPlan::of(&RequestQuery::default()), 0, 10)
+            })
+            .expect("库可用")
+            .expect("查询可用");
+        assert_eq!(rows.len(), 3);
+        let by_id = |id: &str| rows.iter().find(|row| row.id == id).expect("该行在结果里");
+        assert_eq!(by_id("w-billed").credit, Some(0.34));
+        // 显式 0 与「没报」必须分得开 —— 前者是限免档的真实读数，后者是「不知道」
+        assert_eq!(by_id("w-free").credit, Some(0.0));
+        assert_eq!(by_id("w-missing").credit, None);
+    }
 }
 
 // ─── 聚合：读-改-写 ─────────────────────────────────────────

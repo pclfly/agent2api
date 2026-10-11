@@ -30,19 +30,31 @@ use serde_json::Value;
 
 use crate::server::logging;
 
-/// 一次上报的用量（四种 token 计数，字段名对应存储契约）
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// 一次上报的用量（四种 token 计数 + 本次消耗的积分，字段名对应存储契约）
+///
+/// 为什么不派生 `Eq`：`credit` 是浮点，浮点不满足全等关系（`NaN != NaN`）。
+/// 只保留 `PartialEq`，比对用量是否相同时用 `assert_eq!` 即可。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UsageTokens {
     pub prompt: i64,
     pub completion: i64,
     pub total: i64,
     pub cache_read: i64,
+    /// 本次请求消耗的积分（上游在 usage 块里随 token 一起回传的 `credit`）。
+    ///
+    /// ── 为什么是 `Option<f64>` 而不是 `f64` ─────────────────────
+    /// 「上游没报这个字段」与「上游报了 0」是两回事，且后者是**真实读数**
+    /// （WorkBuddy 的限时免费档 `x0.00` 每次请求就是扣 0 积分）。缺字段时给
+    /// `None`，请求日志的「消耗」列据此显示「-」而不是编一个 0 出来 —— 那会
+    /// 让「这家不报积分」与「这次没花钱」在界面上分不开。
+    pub credit: Option<f64>,
 }
 
-/// 从 usage 对象里提取 token 数（字段名兼容见模块头部）。
+/// 从 usage 对象里提取 token 数与积分消耗（字段名兼容见模块头部）。
 ///
 /// 返回 None 只有一种情况：`usage` 不是对象（null / 数字 / 字符串 / 数组）。
-/// 对象内单个字段缺失按 0 算；`total_tokens` 缺失时按 prompt + completion 补。
+/// 对象内单个字段缺失按 0 算（`credit` 例外：缺失给 `None`）；`total_tokens`
+/// 缺失时按 prompt + completion 补。
 pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
     let object = usage.as_object()?;
     let prompt = number_field(object.get("prompt_tokens"))
@@ -58,7 +70,11 @@ pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
         .or_else(|| number_field(object.get("cache_read_tokens")))
         .or_else(|| number_field(object.get("cache_read_input_tokens")))
         .unwrap_or(0);
-    Some(UsageTokens { prompt, completion, total, cache_read })
+    // 积分消耗：WorkBuddy 上游在同一个 usage 块里回传 `credit`（与
+    // `prompt_cache_hit_tokens` 同块 —— 见 `workbuddy/normalize.rs` 的逆向实测
+    // 与参考实现的 `_extract_usage`）。其它家不报这个键 → None。
+    let credit = number_field_f64(object.get("credit"));
+    Some(UsageTokens { prompt, completion, total, cache_read, credit })
 }
 
 /// 取数值字段：`as_i64` 对 `1.0` 这类浮点形态会失败，所以再补一次 f64 转换
@@ -68,6 +84,17 @@ fn number_field(value: Option<&Value>) -> Option<i64> {
     value
         .as_i64()
         .or_else(|| value.as_f64().map(|number| number as i64))
+}
+
+/// 取浮点数值字段（积分消耗）：整数与浮点两种形态都收（上游给 `0` 与给
+/// `0.0` 都见过）；非数值类型（字符串 / null / 对象）返回 None。
+///
+/// 与 `number_field` 分开而不是复用它：那个把结果 `as i64`，积分是小数
+/// （实测 `0.34` / `0.02`），截断会丢掉全部精度。负数不在这里夹 —— 语义上
+/// 积分不会是负的，但真收到负值应当如实带出来（那是上游的异常读数，不是
+/// 我们该替它掩盖的东西）。
+fn number_field_f64(value: Option<&Value>) -> Option<f64> {
+    value?.as_f64()
 }
 
 /// 在途请求当前所处的**转发阶段**（请求日志状态列的第一个读数）。
@@ -182,6 +209,12 @@ pub struct TelemetrySnapshot {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    /// 本次请求消耗的积分（上游 usage 块里的 `credit`；`None` = 上游没报这个
+    /// 字段 —— 例如非 WorkBuddy 的家，或更早版本写入的行）。
+    ///
+    /// 与四个 token 计数同点采集（`report_usage`），同一「最后一次为准」口径。
+    /// 存 `Option<f64>` 的理由见 [`UsageTokens::credit`]：缺失 ≠ 0。
+    pub credit: Option<f64>,
     /// 上游首帧到达的**绝对时刻**（毫秒 Unix 时间戳；None = 全程没有帧到达，
     /// 例如转发前就失败 / 请求尚未开始下发）。
     ///
@@ -942,6 +975,13 @@ impl RequestTelemetry {
         guard.completion_tokens = tokens.completion;
         guard.total_tokens = tokens.total;
         guard.cache_read_tokens = tokens.cache_read;
+        // 积分消耗与 token 同一次上报（上游把两者放在同一个 usage 块里）。
+        // **不覆盖已采到的值**：末帧若没带 `credit`（部分实现只在有消耗时才给），
+        // `tokens.credit` 是 None，写进去会把先前某一帧采到的真实读数抹成「没报」。
+        // 与 `note_upstream_model` 的「空串不写」同一纪律 —— 「没有」不能覆盖「有」。
+        if tokens.credit.is_some() {
+            guard.credit = tokens.credit;
+        }
     }
 
     /// 记一次「上游首帧已到达」。
@@ -1038,5 +1078,72 @@ impl RequestTelemetry {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 上游在 usage 块里带了 credit（WorkBuddy 的形态）→ 提取出小数，与 token 同块。
+    #[test]
+    fn credit_is_read_from_the_usage_block_alongside_tokens() {
+        let usage = json!({
+            "prompt_tokens": 93,
+            "completion_tokens": 321,
+            "total_tokens": 414,
+            "prompt_cache_hit_tokens": 0,
+            "credit": 0.34,
+        });
+        let tokens = extract_usage(&usage).expect("usage 是对象");
+        assert_eq!(tokens.prompt, 93);
+        assert_eq!(tokens.completion, 321);
+        assert_eq!(tokens.total, 414);
+        assert_eq!(tokens.credit, Some(0.34));
+    }
+
+    /// 上游没报 credit（非 WorkBuddy 的家）→ None，**不是 0**：
+    /// 「没报」与「报了 0」必须分得开（后者是限免档的真实读数）。
+    #[test]
+    fn missing_credit_is_none_not_zero() {
+        let usage = json!({ "prompt_tokens": 10, "completion_tokens": 5 });
+        let tokens = extract_usage(&usage).expect("usage 是对象");
+        assert_eq!(tokens.credit, None);
+    }
+
+    /// 上游显式报 0（WorkBuddy 限时免费档 x0.00）→ Some(0.0)，与「没报」区分开。
+    #[test]
+    fn explicit_zero_credit_stays_some_zero() {
+        let usage = json!({ "prompt_tokens": 10, "credit": 0 });
+        let tokens = extract_usage(&usage).expect("usage 是对象");
+        assert_eq!(tokens.credit, Some(0.0));
+    }
+
+    /// credit 是字符串 / null 这类非数值形态 → None（不猜、不解析）。
+    #[test]
+    fn non_numeric_credit_is_none() {
+        let usage = json!({ "prompt_tokens": 10, "credit": "0.34" });
+        assert_eq!(extract_usage(&usage).unwrap().credit, None);
+        let usage = json!({ "prompt_tokens": 10, "credit": null });
+        assert_eq!(extract_usage(&usage).unwrap().credit, None);
+    }
+
+    /// 上报一次 usage 就把 credit 落进槽位（记账点从快照读它）。
+    #[test]
+    fn report_usage_records_credit_into_the_snapshot() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.report_usage(&json!({ "prompt_tokens": 1, "credit": 0.02 }));
+        assert_eq!(telemetry.snapshot().credit, Some(0.02));
+    }
+
+    /// 后续一帧没带 credit 时**不清空**已采到的读数（「没有」不覆盖「有」）——
+    /// 否则末帧缺字段会把先前某一帧采到的真实消耗抹成「没报」。
+    #[test]
+    fn a_later_frame_without_credit_keeps_the_recorded_value() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.report_usage(&json!({ "prompt_tokens": 1, "credit": 0.5 }));
+        telemetry.report_usage(&json!({ "prompt_tokens": 2 }));
+        assert_eq!(telemetry.snapshot().credit, Some(0.5));
     }
 }

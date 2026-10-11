@@ -206,7 +206,7 @@ pub fn is_reserved(key: &str) -> bool {
 /// 退役后查询按账号各自到期触发，一行一账号才能逐条更新、逐条被选路读取
 /// （kv 整份读改写撑不住这个粒度）。旧快照的数据由 `core::usage_records`
 /// 启动时导入，升级后余额列不会变空白。
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -591,6 +591,33 @@ CREATE TABLE IF NOT EXISTS account_usage_records (
 );
 ";
 
+/// 版本 9：`requests` 补一列 `credit` —— 本次请求消耗的积分。
+///
+/// ── 存什么 ──────────────────────────────────────────────────
+/// 上游在对话响应的 usage 块里随 token 一起回传的 `credit`（WorkBuddy 逆向
+/// 实测，与 `prompt_cache_hit_tokens` 同块；见 `core::upstream::usage::
+/// extract_usage` 与 `providers::workbuddy::normalize` 的说明）。请求日志的
+/// 「消耗」列读它，回答「这次请求到底扣了多少积分、是哪个模型扣的」。
+///
+/// ── 为什么是可空 REAL 而不是 NOT NULL DEFAULT 0 ─────────────
+/// 「上游没报这个字段」与「上游报了 0」是两回事：后者是真实读数（WorkBuddy
+/// 的限时免费档 `x0.00` 每次就是扣 0），前者只该显示成「-」。用 `DEFAULT 0`
+/// 会让旧行与不报积分的那几家全部伪装成「消耗 0」，把「这家不报积分」这件
+/// 事从数据里抹掉。所以列可空、旧行读出来是 NULL。
+///
+/// 用 REAL 而不是 INTEGER：积分是小数（实测 `0.34` / `0.02`），整数列会把
+/// 小数截断成 0。SQLite 的 REAL 是 8 字节 IEEE 双精度，与本项目的 `f64`
+/// 一一对应。
+///
+/// 加列走 ALTER 的全部理由（为什么不动 v1 的 DDL、为什么不能写 IF NOT EXISTS、
+/// 幂等靠版本号）与 [`V2_SCHEMA`] 完全相同，不赘述。
+const V9_SCHEMA: &str = "
+-- ── requests 补一列（schema v9）──────────────────────────────
+-- credit：本次请求消耗的积分（上游 usage 块的 credit；NULL = 上游没报，
+--   与「报了 0」不同 —— 见 V9_SCHEMA 的说明）
+ALTER TABLE requests ADD COLUMN credit REAL;
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -654,6 +681,8 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         7 => conn.execute_batch(V7_SCHEMA),
         // v8：account_usage_records 每账号余额记录表（取代旧 kv 快照，见 V8_SCHEMA）
         8 => conn.execute_batch(V8_SCHEMA),
+        // v9：requests 补「本次消耗积分」一列（上游 usage.credit，见 V9_SCHEMA）
+        9 => conn.execute_batch(V9_SCHEMA),
         _ => Ok(()),
     }
 }

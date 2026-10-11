@@ -91,6 +91,8 @@ export type UpdateTokenStatus = {
 
 /** 「软件更新」这一族用到的壳侧接口（见 bridge.rs 的「软件更新」一节） */
 export type UpdateBridge = {
+  /** 'desktop' | 'macos' | 'windows' | 'linux' | 'web'（headless 面板注入 'web'） */
+  readonly platform?: string
   /** 壳命令：当前版本号只有壳知道，由壳带上去交给后端比较 */
   checkUpdate(): Promise<UpdateInfo | null | undefined>
   /** 后端缓存里的最近一次检查结果（定时任务写入） */
@@ -164,6 +166,18 @@ export function shared(): SharedWindow {
 /** toast 的统一出口（运行期读 wbApp，不在模块顶层解构） */
 export function toast(message: string, kind?: 'err' | 'ok'): void {
   shared().wbApp?.toast?.(message, kind)
+}
+
+/**
+ * 是否 headless 网页面板（Docker / 自托管，`platform === 'web'`）。
+ *
+ * 网页端只**读**版本号，不提供下载与安装：那条链是壳命令（download_update /
+ * run_installer），web_shim 里明确拒绝。界面据此收起下载按钮与「检测到更新」
+ * 弹窗，免得给出一个点了必然报错的入口。桥拿不到 platform（浏览器直开）时按
+ * 非网页端处理，与 settings-state 的 readPanelLogin 同一取向。
+ */
+export function isWebPanel(): boolean {
+  return shared().workbuddyDesktop?.platform === 'web'
 }
 
 export function errorMessage(error: unknown): string {

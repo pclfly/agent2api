@@ -127,6 +127,7 @@
         { key: 'model', sel: '.req-model', track: 'minmax(0, 1.3fr)' },
         { key: 'dur', sel: '.req-dur', track: '96px' },
         { key: 'usage', sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
+        { key: 'credit', sel: '.req-credit', track: '96px' },
         { key: 'error', sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
         { key: 'detail', sel: '.req-detail', track: '60px' },
       ],
@@ -254,7 +255,7 @@
     // 写出的条件有两个，**缺一不可**：
     //   · 有拖过的列 → 用户宽度得有人表达；
     //   · 当前可见列与登记的全集不同（藏了列 / 换了顺序）→ CSS 里那条写死的
-    //     默认轨道（page-requests.css 的 9 条）是按**全集 + 原始顺序**排的，
+    //     默认轨道（page-requests.css 的 10 条）是按**全集 + 原始顺序**排的，
     //     藏一列就少一格、换个顺序就对不上位置，不写变量的话格子数与轨道数
     //     对不上，整行错位（第一格吃掉第二格的宽度）。这一条以前漏了：
     //     藏列之后只要没拖过任何列宽，就退回 CSS 默认 —— 正是最容易踩到的路径

@@ -452,11 +452,22 @@ pub fn shim_js() -> &'static str {
       return httpCall(request.method || 'GET', request.path || '/', request.body);
     },
     check_update: function () {
-      // 网页端走镜像更新（拉新镜像重启容器），不提供安装包下载
-      return Promise.resolve({
-        currentVersion: 'web', latestVersion: 'web', hasUpdate: false,
-        notes: '网页端通过 Docker 镜像更新：拉取新镜像后重启容器即可。',
-        publishedAt: '', pageUrl: '', installerKind: 'none',
+      // 网页端没有壳替它报版本号：不带 current，由后端回落到镜像自身的版本
+      // （api::update 的 /check 分支）。这样「当前版本」显示的是真实镜像版本，
+      // 不再是写死的 'web'。
+      //
+      // 结果只用于**展示**官方最新版本与更新日志 —— 资产与安装能力一律抹掉：
+      // 网页端的 download_update / run_installer 是明确拒绝的，留着 asset 会让
+      // 面板冒出「下载并安装」，点了必然报错。界面另按 platform 守卫（第二道）。
+      return call('GET', '/api/update/check').then(function (info) {
+        if (!info || typeof info !== 'object') return info;
+        var notes = String(info.notes || '');
+        var hint = '网页端通过 Docker 镜像更新：拉取新镜像后重启容器即可。';
+        info.notes = notes ? notes + '\n\n---\n\n' + hint : hint;
+        info.asset = null;
+        info.downloadSupported = false;
+        info.installerKind = 'none';
+        return info;
       });
     },
     get_update_status: function () { return call('GET', '/api/update/status'); },
@@ -1084,6 +1095,79 @@ mod tests {
                 body.contains(&format!("payload.{key}")),
                 "verifySmsLogin 漏掉了 `{key}` —— 后端会读它，丢键的后果是\
                  后端在打上游之前就报「参数不完整」，现象指向错误的排查方向"
+            );
+        }
+    }
+
+    /// 网页端的 `check_update` 必须打真接口，且抹掉下载 / 安装能力。
+    ///
+    /// ── 这条用例钉的是什么（真实缺陷）────────────────────────────
+    /// 它原先返回一段写死的常量：`currentVersion: 'web', latestVersion: 'web'`。
+    /// 于是 Docker 面板上「当前版本 / 最新版本」两个读数都显示 `web`，更新日志
+    /// 也只有一句 Docker 提示 —— 用户看到的是两个字符串 `web`，而不是版本号。
+    ///
+    /// 两个方向都要守住：
+    ///   · **必须查**：改回写死常量 = 回归；`call('GET', '/api/update/check')`
+    ///     是「当前版本」的事实来源（后端按镜像自身版本回落，见 api::update）。
+    ///   · **不能装**：网页端的 download_update / run_installer 是明确拒绝的
+    ///     （见 invokeShell 的拒绝分支），结果里留着 asset 会让面板冒出
+    ///     「下载并安装」按钮，点了必然报错。
+    #[test]
+    fn web_check_update_queries_backend_and_strips_install() {
+        let script = shim_js();
+        let start = script
+            .find("check_update:")
+            .expect("shim 脚本里必须有 check_update");
+        // 切到下一个方法为止：只在这个整形体里断言，免得别处同名字符串让断言假通过
+        let end = script[start..]
+            .find("get_update_status")
+            .map(|offset| start + offset)
+            .expect("check_update 之后应当还有 get_update_status");
+        let body = &script[start..end];
+
+        assert!(
+            body.contains("call('GET', '/api/update/check')"),
+            "check_update 必须打真接口取版本号；写死常量会让两个版本读数都变成 `web`"
+        );
+        assert!(
+            !body.contains("currentVersion: 'web'") && !body.contains("latestVersion: 'web'"),
+            "check_update 不能再返回写死的 'web' —— 那正是「版本号显示成 web」的根因"
+        );
+        // 安装能力必须抹掉：asset 为空、下载不支持、形态给 none
+        assert!(body.contains("info.asset = null"), "必须清掉 asset，否则会冒出下载按钮");
+        assert!(body.contains("info.downloadSupported = false"), "必须把 downloadSupported 置 false");
+        assert!(body.contains("info.installerKind = 'none'"), "安装包形态在网页端应当是 none");
+        // 官方更新日志要保留（只查不改），Docker 提示以追加形式给出
+        assert!(body.contains("info.notes"), "应当保留官方更新日志并追加 Docker 提示");
+    }
+
+    /// 网页端「检查更新」只读不写：桥里不得出现任何触发下载 / 安装的调用。
+    ///
+    /// 这条防的是「以后有人顺手把 asset 填回去、或让 check_update 直接触发下载」——
+    /// 用户的诉求是只查官方最新版本号、不对本地做任何修改。
+    ///
+    /// 断言只认**调用形态**（`invokeShell('…')` / `call(…, '/api/update/download')`）
+    /// 而不是裸方法名：注释里提到这些命令是正常的（本文件就提到了），拿裸名字去
+    /// 匹配会被自己的说明文字绊倒。
+    #[test]
+    fn web_bridge_never_triggers_download_or_install() {
+        let script = shim_js();
+        let start = script.find("check_update:").expect("必须有 check_update");
+        let end = script[start..]
+            .find("get_update_status")
+            .map(|offset| start + offset)
+            .expect("check_update 之后应当还有 get_update_status");
+        let body = &script[start..end];
+        for forbidden in [
+            "invokeShell('download_update'",
+            "invokeShell('run_installer'",
+            "invokeShell('update_progress'",
+            "'/api/update/download'",
+            "'/api/update/cancel'",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "check_update 里出现了 `{forbidden}` —— 网页端检查更新不得触发下载 / 安装"
             );
         }
     }

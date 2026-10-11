@@ -567,8 +567,12 @@ function syncUpdateBadge() {
   // 只放一个「新」字而不是数字：这里没有「未读条数」的含义，
   // 写成数字容易被误会成还有多少个版本可以更新
   badge.textContent = '新';
+  // 网页面板只读版本号，没有下载入口（升级靠换镜像）——提示语随之改写
+  const webPanel = window.workbuddyDesktop?.platform === 'web';
   badge.title = `发现新版本 ${latest}（当前 ${info.currentVersion || '未知'}），`
-    + '点开「设置 - 软件更新」可查看更新日志并下载';
+    + (webPanel
+      ? '点开「设置 - 软件更新」可查看更新日志；网页端请拉取新镜像后重启容器'
+      : '点开「设置 - 软件更新」可查看更新日志并下载');
   badge.style.display = '';
 }
 

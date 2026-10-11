@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 
 use crate::server::config;
 use crate::server::core::proxies::{describe_account_proxy, normalize_account_proxy};
-use crate::server::core::update::{set_token, status_json, UpdateError};
+use crate::server::core::update::{set_token, status_json, UpdateError, CURRENT_VERSION};
 use crate::server::errors::{management_error, GatewayError};
 use crate::server::http::{ok_json, parse_body};
 use crate::server::logging;
@@ -67,14 +67,7 @@ async fn dispatch(
     body: &Bytes,
 ) -> Response {
     if method == Method::GET && full_path == "/api/update/check" {
-        // `url.searchParams.get('current') || ''`：缺省是空串（不是 null）
-        let current = query
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(key, _)| *key == "current")
-            .map(|(_, value)| percent_decode(value))
-            .unwrap_or_default();
-        return match state.update().check(&current).await {
+        return match state.update().check(&check_current_version(query)).await {
             Ok(data) => ok_json(data),
             Err(error) => update_error(error),
         };
@@ -215,6 +208,31 @@ fn js_string(value: &Value) -> String {
     }
 }
 
+/// `/api/update/check` 的 `current` 参数：查不到或为空时回落到本二进制的版本号。
+///
+/// ── 为什么要有这个回落 ──────────────────────────────────────
+/// 版本比较需要一个「我是谁」。桌面壳的 `check_update` 会把 `package_info` 的
+/// 版本号带上来，但 headless / Docker 形态没有壳 —— 网页桥（web_shim）直接打
+/// 这条接口，没人能替它报版本。早先的实现把空串原样交给 `check`，
+/// `build_check_result` 于是给出 `currentVersion: null` + `hasUpdate: null`，
+/// 界面上显示成「无法比较」：明明查到了最新版本，却给不出「是不是最新」的结论。
+///
+/// 回落用的是编译期常量（`CURRENT_VERSION`，取自本 crate 的 Cargo.toml）：
+/// 镜像里跑的就是这份二进制，它报的版本就是镜像的版本。
+fn check_current_version(query: &str) -> String {
+    let requested = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "current")
+        .map(|(_, value)| percent_decode(value))
+        .unwrap_or_default();
+    if requested.trim().is_empty() {
+        CURRENT_VERSION.to_string()
+    } else {
+        requested
+    }
+}
+
 /// 查询串的百分号解码（`current=1.0.0-beta%2B1` 这类形态）。
 /// 失败时原样返回（不是致命错误，交给版本比较处理）。
 fn percent_decode(value: &str) -> String {
@@ -250,4 +268,47 @@ fn percent_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_current_version, percent_decode};
+    use crate::server::core::update::CURRENT_VERSION;
+
+    /// 不带 `current`（网页桥的形态）必须回落到本二进制版本，而不是空串。
+    ///
+    /// 真实缺陷：网页端点「检查更新」显示的两个版本号都是写死的 `'web'`；把桥改
+    /// 成打真接口之后，如果这里仍把空串交下去，界面就变成「当前版本 —、无法比较」
+    /// —— 从一个错读数换成另一个错读数。headless 形态没有壳替它报版本，回落是
+    /// 唯一的事实来源。
+    #[test]
+    fn missing_current_falls_back_to_binary_version() {
+        assert_eq!(check_current_version(""), CURRENT_VERSION);
+        assert_eq!(check_current_version("foo=1"), CURRENT_VERSION);
+        // 显式给空串与只给空白同样算「没给」：壳那边取值失败时会带上来一个空串
+        assert_eq!(check_current_version("current="), CURRENT_VERSION);
+        assert_eq!(check_current_version("current=%20"), CURRENT_VERSION);
+    }
+
+    /// 带了 `current` 就照用，不覆盖调用方给的版本号 —— 桌面壳的版本以
+    /// `package_info` 为准（可能与 Cargo.toml 不一致，见 commands.rs 的说明）。
+    #[test]
+    fn explicit_current_is_used_verbatim() {
+        assert_eq!(check_current_version("current=1.2.3"), "1.2.3");
+        // 百分号解码与 `+` → 空格在取值路径上照旧生效
+        assert_eq!(check_current_version("current=1.0.0-beta%2B1"), "1.0.0-beta+1");
+        assert_eq!(check_current_version("current=1.0.0+build"), "1.0.0 build");
+        // 多个参数时只认 current，前后顺序无所谓
+        assert_eq!(check_current_version("a=1&current=9.9.9&b=2"), "9.9.9");
+    }
+
+    /// 取值路径本身的行为（回归保护：改动回落逻辑时别把解码弄坏）
+    #[test]
+    fn percent_decode_handles_escapes_and_plus() {
+        assert_eq!(percent_decode("1.0.0"), "1.0.0");
+        assert_eq!(percent_decode("a%2Bb"), "a+b");
+        assert_eq!(percent_decode("a+b"), "a b");
+        // 残缺的转义原样保留（不是致命错误）
+        assert_eq!(percent_decode("a%2"), "a%2");
+    }
 }

@@ -2,7 +2,7 @@ import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { Badge, Button, Progress } from '@ui'
 import {
-  errorMessage, handleExternalClick, markdownHtml, safeExternal, shared, toast,
+  errorMessage, handleExternalClick, isWebPanel, markdownHtml, safeExternal, shared, toast,
   type DownloadTask, type UpdateInfo,
 } from './update-shared'
 import { showUpdateModal } from './update-modal'
@@ -553,6 +553,9 @@ async function load(): Promise<void> {
  * 把正在下的任务顶掉。
  */
 async function openAndDownload(checkedInfo?: UpdateInfo | null): Promise<void> {
+  // 网页面板没有下载与安装能力（见 isWebPanel）：这条路只由「检测到更新」弹窗的
+  // 「去更新」触发，而弹窗在网页端已经不弹了；留着这道闸是防别的调用方误走。
+  if (isWebPanel()) return
   if (checkedInfo?.hasUpdate === true) {
     // 这里的时刻取本地时钟（照旧实现）：弹窗那份结果刚拿到手，标成「刚刚查的」才准
     publish({ info: checkedInfo, checkedAt: Date.now() })
@@ -586,6 +589,10 @@ async function openAndDownload(checkedInfo?: UpdateInfo | null): Promise<void> {
 
 /** 面板上那颗按钮的形态；null = 不渲染（显隐一律条件渲染，理由见文件头） */
 function downloadButton(snap: Snapshot): { label: string; disabled: boolean } | null {
+  // 网页面板只读版本号，不给下载 / 安装入口：那条链是壳命令，网页端明确拒绝
+  // （见 update-shared 的 isWebPanel）。这里挡在最前面，顺带也挡掉 openAndDownload
+  // 的自动触发 —— 它开头就检查 downloadButton。
+  if (isWebPanel()) return null
   // 有更新且真的有可下载资产时才给出「下载并安装」
   const actionable = snap.info?.hasUpdate === true && !!snap.info?.asset?.url
   if (!actionable && snap.phase !== 'downloading' && snap.phase !== 'ready') return null
@@ -662,6 +669,11 @@ function UpdatePanel() {
     : '—'
   const tag = String(snap.info?.latestVersion || '').trim()
   const logMeta = tag ? `${tag}${snap.checkedAt ? ` · 检查于 ${formatClock(snap.checkedAt)}` : ''}` : ''
+  // 网页面板只查版本号、不下载也不安装（Docker 形态靠换镜像升级），提示语随之改写，
+  // 免得说一堆在这里做不到的事
+  const tip = isWebPanel()
+    ? '检查官方仓库的最新发布版本与更新日志。网页端（Docker 部署）只读版本信息，不提供下载与安装 —— 升级请拉取新镜像后重启容器。检查更新的出网线路与 GitHub 令牌在「更新设置」里：线路默认直连（直连失败时自动借 Clash Verge 的混合端口重试一次），选定指定出口后只走该出口；填写 GitHub 令牌可把检查限额从 60 次/小时提高到 5000 次/小时。'
+    : '更新包从 GitHub 发布页下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。检查更新与下载安装包的出网线路、GitHub 令牌都在「更新设置」里：线路默认直连（直连失败时自动借 Clash Verge 的混合端口重试一次），选定指定出口后只走该出口；填写 GitHub 令牌可把检查限额从 60 次/小时提高到 5000 次/小时。'
 
   return (
     <section className='panel' onClick={handleExternalClick}>
@@ -669,7 +681,7 @@ function UpdatePanel() {
         <h2>软件更新</h2>
         <span
           className='tip-q'
-          data-tip='更新包从 GitHub 发布页下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。检查更新与下载安装包的出网线路、GitHub 令牌都在「更新设置」里：线路默认直连（直连失败时自动借 Clash Verge 的混合端口重试一次），选定指定出口后只走该出口；填写 GitHub 令牌可把检查限额从 60 次/小时提高到 5000 次/小时。'
+          data-tip={tip}
         ></span>
         {/* id 保留：app.js 的 renderTopbarStatus 按 id 镜像徽章文案与语义色（配色经
             data-tone 传；设置页顶栏那枚镜像目前还不读它，保持一致没坏处） */}
