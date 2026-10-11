@@ -5,7 +5,7 @@
  *   · 快照层 —— `GET /api/checkin-center` 的一次聚合：每日签到分组（判定在后端，
  *     与批量签到同一对判据）、自动签到设置、签到历史台账、一次性项的账号清单。
  *     页面打开 / 切入时拉一次，签到动作完成后整体重拉。
- *   · 惰性层 —— 新手任务（Loomy）的任务状态。它是上游查询，快照刻意不带
+ *   · 惰性层 —— 新手任务（Loomy / 小浣熊）的任务状态。它是上游查询，快照刻意不带
  *     （见 api::checkin_center 的模块头）；这里按账号缓存查询结果，
  *     界面用「上次查询时间」如实呈现缓存的新旧。
  *
@@ -19,6 +19,7 @@ import {
   errorMessage, formatTime, shared, toast,
   type OnboardingTask, type OnboardingTaskRaw,
 } from './accounts-shared'
+import { t } from '../i18n'
 
 /* ─── 快照类型（/api/checkin-center 的响应，字段可能缺，逐个归一）─── */
 
@@ -28,6 +29,8 @@ export type CheckinAccountRow = {
   available: boolean
   checkinAt: number | null
   checkedInToday: boolean
+  /** cn / intl（缺失 null）：WorkBuddy 国际版在这张表里执行的是「领日活」 */
+  edition?: string | null
 }
 
 export type CheckinProviderGroup = {
@@ -45,10 +48,18 @@ export type CheckinHistoryEntry = {
   date?: string | null
   reason?: string | null
   succeeded?: number | null
+  /** 活跃保活数（WorkBuddy 国际版）：与 succeeded 分开统计，不落 checkinAt */
+  active?: number | null
   total?: number | null
   skipped?: number | null
   failed?: string[] | null
   failedCount?: number | null
+}
+
+/** WorkBuddy 国际版日活保活的模型链（config.json 的 checkinKeepalive） */
+export type KeepaliveState = {
+  models: string[]
+  defaultModels: string[]
 }
 
 /** 自动签到的状态（与 /api/auto-checkin 同形；tasks-panel 迁来同款读法） */
@@ -71,15 +82,32 @@ export type CheckinCenterSnapshot = {
     todayEligible: number
   }
   extras: {
-    onboarding: Array<{ id: string; name: string }>
-    welfare: Array<{ id: string; name: string }>
-    plans: Array<{ id: string; name: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }>
+    /** 新手任务行；`settled` 是后端的一次性福利结算记忆（已结清才非空） */
+    onboarding: Array<{ id: string; name: string; provider?: string; settled?: OnboardingSettledRaw }>
+    /** CodeArts 福利行：`welfare` 是后端落盘的本地领取台账（day/accepted/…，原样透传），
+     *  「已领取」标记按它判（见 accounts-domain 的 welfareStateOf） */
+    welfare: Array<{ id: string; name: string; provider?: string; welfare?: unknown }>
+    plans: Array<{ id: string; name: string; provider?: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }>
   }
   auto: AutoCheckinState
+  /** WorkBuddy 国际版日活保活的模型链（后端快照直接给当前生效值 + 缺省值） */
+  keepalive?: KeepaliveState
   history: CheckinHistoryEntry[]
 }
 
-/** 一个 Loomy 账号的 novice 任务缓存（status: idle = 还没查过） */
+/**
+ * 后端的一次性福利**结算记忆**（`settled` / `settledAt` / 快照行上的 `settled` 对象）：
+ * 一次性福利全部领完那一刻落盘，之后查询零上游、恒是「已领完」这个结论
+ * （见 server 的 `core::providers::onboarding_memory`）。
+ */
+export type OnboardingSettledRaw = {
+  at?: unknown
+  tasks?: unknown
+  earned?: unknown
+  total?: unknown
+}
+
+/** 一个新手任务账号的任务缓存（Loomy / 小浣熊 / CodeArts；status: idle = 还没查过） */
 export type OnboardingCache = {
   status: 'idle' | 'loading' | 'loaded' | 'error'
   error?: string
@@ -89,6 +117,14 @@ export type OnboardingCache = {
   earned: number
   total: number
   claiming: boolean
+  /**
+   * 这份结果来自**结算记忆**（后端已确认这条一次性福利领完）：进页面直接用
+   * 快照渲染，不必再查上游；「查询任务」按钮仍可强制实查（`refresh`）。
+   * 记忆路径不写 `checkedAt`（那是「查询于」，记忆是「结算于」，见 `settledAt`）。
+   */
+  settled?: boolean
+  /** 结算时刻（后端记忆里的 `at`；仅 `settled` 时有） */
+  settledAt?: number
 }
 
 /* ─── 本岛用到的桥（在 accounts-shared 的 AccountsBridge 之上补签到两组）─── */
@@ -98,16 +134,24 @@ type CheckinBridge = {
   getAutoCheckin?(): Promise<AutoCheckinState>
   saveAutoCheckin?(patch: Record<string, unknown>): Promise<AutoCheckinState>
   runAutoCheckinNow?(): Promise<(CheckinHistoryEntry & AutoCheckinState) | null | undefined>
+  /** WorkBuddy 国际版日活保活的模型链（读 / 存；与 bridge.rs、web_shim.rs 三处成对） */
+  getCheckinKeepalive?(): Promise<KeepaliveState>
+  saveCheckinKeepalive?(models: string[]): Promise<KeepaliveState>
+  /** WorkBuddy 国际版日活任务的手动粒度入口（mode: full | claim | keepalive） */
+  runCheckinActivity?(id: string, mode: string): Promise<Record<string, unknown> | null | undefined>
   checkinAllAccounts?(id?: string | null): Promise<{
     results?: Array<Record<string, unknown>>
     succeeded?: number
+    active?: number
     total?: number
   } | null | undefined>
-  getOnboardingTasks?(id: string): Promise<{
+  getOnboardingTasks?(id: string, refresh?: boolean): Promise<{
     tasks?: OnboardingTaskRaw[]
     earned?: unknown
     total?: unknown
     unclaimed?: unknown
+    settled?: unknown
+    settledAt?: unknown
   } | null | undefined>
   claimOnboardingTasks?(id: string): Promise<{
     results?: Array<Record<string, unknown>>
@@ -115,6 +159,8 @@ type CheckinBridge = {
     earned?: unknown
     total?: unknown
     unclaimed?: unknown
+    settled?: unknown
+    settledAt?: unknown
   } | null | undefined>
 }
 
@@ -148,9 +194,13 @@ export type CheckinStore = {
   autoSaving: boolean
   /** 签到时刻的编辑草稿：null = 跟随后端值 */
   autoTimeDraft: string | null
+  /** 保活模型链保存中（输入框临时禁用） */
+  keepaliveSaving: boolean
+  /** 保活模型链的编辑草稿：null = 跟随后端值（逗号分隔的一行文本） */
+  keepaliveDraft: string | null
   /** 单账号签到在途（行内按钮的去重闸） */
   signing: ReadonlySet<string>
-  /** Loomy 新手任务的按账号缓存 */
+  /** 新手任务的按账号缓存（Loomy / 小浣熊） */
   onboarding: ReadonlyMap<string, OnboardingCache>
 }
 
@@ -163,6 +213,8 @@ let store: CheckinStore = {
   runningAll: false,
   autoSaving: false,
   autoTimeDraft: null,
+  keepaliveSaving: false,
+  keepaliveDraft: null,
   signing: new Set<string>(),
   onboarding: new Map<string, OnboardingCache>(),
 }
@@ -199,6 +251,7 @@ function normalizeTask(raw: OnboardingTaskRaw): OnboardingTask | null {
     group: typeof raw.group === 'string' && raw.group ? raw.group : '',
     points: Number(raw.points) || 0,
     done: raw.done === true,
+    blocked: raw.blocked === true,
   }
 }
 
@@ -221,16 +274,54 @@ function numberOf(value: unknown): number {
 export async function loadCheckinCenter(): Promise<void> {
   try {
     const data = await bridge().getCheckinCenter?.()
-    if (!data) throw new Error('后端未返回签到中心数据')
+    if (!data) throw new Error(t('后端未返回签到中心数据'))
     patch({
       snapshot: data,
       loaded: true,
       loadError: '',
       // 时刻草稿跟着后端值走（首次加载 / 异地修改后都以服务端为准）
       autoTimeDraft: null,
+      keepaliveDraft: null,
     })
+    // 快照带回了结算记忆 ⇒ 直接用它铺缓存，页面不必为已领完的账号再查一次上游
+    seedSettledCaches(data.extras?.onboarding ?? [])
   } catch (error) {
     patch({ loaded: true, loadError: errorMessage(error) })
+  }
+}
+
+/**
+ * 用快照里的结算记忆铺新手任务缓存（`settled` 非空的那些账号）。
+ *
+ * ── 为什么直接铺而不是「查一次再确认」───────────────────────
+ * 记忆本身就是后端的结论（一次性福利已全部领完，见 onboardingSettled 的说明），
+ * 再问一次上游只会得到同一个答案。这也是本功能的初衷：进页面不该为一条早就
+ * 领完的福利反复查询。用户想实查仍可点「查询任务」（`refresh`），那时记忆若与
+ * 上游不符会被后端覆盖 —— 铺在这里的只是当前这份快照。
+ *
+ * 界面这边**刚实查过、且查出了待领项**的账号不动：那说明记忆已被后端清掉
+ * （上游出了新一期活动），只是手上这份快照还是旧的。
+ */
+function seedSettledCaches(rows: Array<{ id: string; settled?: OnboardingSettledRaw }>): void {
+  for (const row of rows) {
+    const memory = row.settled
+    if (!memory || typeof memory !== 'object') continue
+    const current = store.onboarding.get(row.id)
+    if (current?.status === 'loaded' && current.unclaimed > 0) continue
+    const tasks = normalizeTasks(memory.tasks)
+    const at = numberOf(memory.at)
+    patchOnboarding(row.id, {
+      status: 'loaded',
+      error: undefined,
+      // 记忆不是「查询」来的：checkedAt 留空，界面按 settledAt 显示「结算于」
+      checkedAt: undefined,
+      settled: true,
+      settledAt: at > 0 ? at : undefined,
+      tasks,
+      unclaimed: 0,
+      earned: numberOf(memory.earned),
+      total: numberOf(memory.total),
+    })
   }
 }
 
@@ -270,61 +361,96 @@ export async function runAllCheckin(): Promise<void> {
     const result = await bridge().runAutoCheckinNow?.()
     if (result) {
       const succeeded = numberOf(result.succeeded)
+      const active = numberOf(result.active)
       const total = numberOf(result.total)
       const failed = numberOf(result.failedCount)
+      const activeText = active > 0 ? t('，日活保活 {n} 个', { n: active }) : ''
       if (failed > 0) {
-        toast(`签到完成：${succeeded}/${total} 成功，${failed} 个失败`, 'err')
+        toast(t('签到完成：{succeeded}/{total} 成功{active}，{failed} 个失败', {
+          succeeded, total, active: activeText, failed,
+        }), 'err')
       } else {
-        toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取`)
+        toast(t('✅ 签到完成：{succeeded}/{total} 个账号成功领取{active}', {
+          succeeded, total, active: activeText,
+        }))
       }
       // 余额读数是账号页自己缓存里的，不查它还是签到前的旧值（不 await：
       // 那是账号页的动作层，静默刷新，结果落在余额列上）
       accountsView().wbAccountsView?.refreshUsageAfterCheckin?.(null)
     }
   } catch (error) {
-    toast(`签到失败：${errorMessage(error)}`, 'err')
+    toast(t('签到失败：{error}', { error: errorMessage(error) }), 'err')
   } finally {
-    patch({ runningAll: false })
-    await loadCheckinCenter()
-    // 快照到位后自动处理 Loomy 新手任务（不 await：签到结果已经播报过，
-    // 查询与领取是后台的一次跟进，进度直接落在「待领新手任务」卡上）
-    void autoProcessOnboarding(getCheckinStore().snapshot?.extras.onboarding ?? [])
-    shared().wbApp?.refresh?.()
+      patch({ runningAll: false })
+      await loadCheckinCenter()
+      // 快照到位后自动处理新手任务（不 await：签到结果已经播报过，
+      // 查询与领取是后台的一次跟进，进度直接落在「待领新手任务」卡上）
+      void autoProcessOnboarding(getCheckinStore().snapshot?.extras.onboarding ?? [])
+      shared().wbApp?.refresh?.()
   }
 }
 
 /**
- * 单账号签到（签到中心明细行上的「签到 / 重签」；端点与原账号页行内按钮相同）。
+ * 单账号签到 / 日活任务（签到中心明细行上的按钮）。
+ *
+ * ── 四种模式 ────────────────────────────────────────────────
+ *   - `checkin`（缺省）：普通单账号签到，走既有端点（除 WorkBuddy 国际版外
+ *     的所有账号都是它）；
+ *   - `full` / `claim` / `keepalive`：WorkBuddy 国际版日活任务的三档手动粒度
+ *     （保活+领取 / 只领取 / 只保活），走独立端点 —— 与批量签到那条「恒走
+ *     完整组合」的入口分开，粒度细分只属于手动按钮。
+ *
+ * 在途键是 `${id}:${mode}`：三颗按钮各自的转圈互不牵连，点「保活」不禁用
+ * 「领取」。结果行的 toast 按模式分流 —— 国际版的结果必须分清「保活」与
+ * 「领取」两件事，混在一句话里正是当初造成困惑的根源。
  */
-export async function signSingleAccount(id: string): Promise<void> {
-  if (store.signing.has(id)) return
+export async function signSingleAccount(id: string, mode: 'checkin' | 'full' | 'claim' | 'keepalive' = 'checkin'): Promise<void> {
+  const busyKey = `${id}:${mode}`
+  if (store.signing.has(busyKey)) return
   const next = new Set(store.signing)
-  next.add(id)
+  next.add(busyKey)
   patch({ signing: next })
   try {
-    const result = await bridge().checkinAllAccounts?.(id)
-    const row = result?.results?.[0]
-    const claim = row?.claim as { success?: boolean; msg?: string } | undefined
-    if (row?.error) {
-      toast(`签到失败：${row.error}`, 'err')
-    } else if (claim?.success === true) {
-      toast(`✅ ${claim.msg || '签到成功'}`)
+    let row: Record<string, unknown> | undefined
+    if (mode === 'checkin') {
+      const result = await bridge().checkinAllAccounts?.(id)
+      row = result?.results?.[0]
     } else {
-      toast(claim?.msg || '今日已领取', 'err')
+      row = (await bridge().runCheckinActivity?.(id, mode)) ?? undefined
+    }
+    const claim = row?.claim as
+      | { success?: boolean; msg?: string; alreadyCompleted?: boolean }
+      | undefined
+    const activity = row?.activity as { pokeSucceeded?: boolean | null } | null | undefined
+    if (row?.error) {
+      toast(t('签到失败：{error}', { error: String(row.error) }), 'err')
+    } else if (mode === 'keepalive') {
+      // 只保活：结果就一句话（保活成功 / 失败），不存在领取语义
+      if (activity?.pokeSucceeded === true) toast(t('✅ {message}', { message: claim?.msg || t('活跃保活完成') }))
+      else toast(claim?.msg || t('活跃保活失败'), 'err')
+    } else if (claim?.success === true) {
+      toast(t('✅ {message}', { message: claim.msg || t('签到成功') }))
+    } else if (claim?.alreadyCompleted === true) {
+      toast(claim?.msg || t('今日已领取'), 'err')
+    } else if (activity?.pokeSucceeded === true) {
+      // 完整模式：保活成功但没领到 —— 后端 msg 把「活动未开启」一并交代
+      toast(t('✅ {message}', { message: claim?.msg || t('活跃保活完成，但活动未开启') }))
+    } else {
+      toast(claim?.msg || t('未领取'), 'err')
     }
     accountsView().wbAccountsView?.refreshUsageAfterCheckin?.(id)
   } catch (error) {
-    toast(`签到失败：${errorMessage(error)}`, 'err')
+    toast(t('签到失败：{error}', { error: errorMessage(error) }), 'err')
   } finally {
     const rest = new Set(getCheckinStore().signing)
-    rest.delete(id)
+    rest.delete(busyKey)
     patch({ signing: rest })
     await loadCheckinCenter()
-    // 只处理刚签的这个账号：从快照的 Loomy 清单里过滤，不是 Loomy 账号则数组为空
-    // （新手任务目前只有 Loomy 一家有，别的家不发无意义的查询）
-    const loomyRows = (getCheckinStore().snapshot?.extras.onboarding ?? [])
+    // 只处理刚签的这个账号：从快照的新手任务清单里过滤，账号不在清单里则数组为空
+    // （清单由后端按 provider 组装：Loomy / 小浣熊 / CodeArts，别的家不发无意义的查询）
+    const onboardingRows = (getCheckinStore().snapshot?.extras.onboarding ?? [])
       .filter(row => row.id === id)
-    void autoProcessOnboarding(loomyRows)
+    void autoProcessOnboarding(onboardingRows)
     shared().wbApp?.refresh?.()
   }
 }
@@ -342,10 +468,10 @@ export async function saveAutoCheckin(patchBody: Record<string, unknown>, label:
     const next = await bridge().saveAutoCheckin?.(patchBody)
     if (next) {
       patch({ snapshot: mergeAuto(next), autoTimeDraft: null })
-      toast(`已保存：${label}`)
+      toast(t('已保存：{label}', { label }))
     }
   } catch (error) {
-    toast(`保存失败：${errorMessage(error)}`, 'err')
+    toast(t('保存失败：{error}', { error: errorMessage(error) }), 'err')
   } finally {
     patch({ autoSaving: false })
   }
@@ -362,7 +488,7 @@ export async function submitAutoTime(value: string): Promise<void> {
   if (!time) return
   await saveAutoCheckin(
     { enabled: getCheckinStore().snapshot?.auto?.enabled === true, time },
-    '签到触发时刻',
+    t('签到触发时刻'),
   )
 }
 
@@ -375,7 +501,7 @@ export async function toggleAutoProvider(optionId: string, checked: boolean): Pr
   else picked.delete(optionId)
   // 顺序取 providerOptions 的注册顺序（与后端落盘口径一致）
   const providers = options.map(option => option.id).filter(id => picked.has(id))
-  await saveAutoCheckin({ providers }, '签到提供商')
+  await saveAutoCheckin({ providers }, t('签到提供商'))
 }
 
 /** 快照里只换 auto 段（保存响应是新状态，其余快照原样保留） */
@@ -385,31 +511,85 @@ function mergeAuto(next: AutoCheckinState): CheckinCenterSnapshot | null {
   return { ...current, auto: next }
 }
 
-/* ─── Loomy 新手任务（惰性查询 + 一键领取）─── */
+/* ─── WorkBuddy 国际版日活保活的模型链 ─── */
+
+/** 保活模型链的编辑草稿（输入过程；提交在 blur / 回车时走 submitKeepaliveModels） */
+export function setKeepaliveDraft(value: string): void {
+  patch({ keepaliveDraft: value })
+}
+
+/**
+ * 提交保活模型链（失焦 / 回车）：按逗号 / 顿号 / 空白拆成数组交给后端
+ * （后端对字符串入参也会再拆一遍，这里先拆是为了在界面上先归一成干净的一行）。
+ * 空清单 = 恢复缺省链（语义在后端，界面只管把草稿原样交上去）。
+ */
+export async function submitKeepaliveModels(value: string): Promise<void> {
+  const draft = value.trim()
+  if (!draft) return
+  const models = draft.split(/[，、,]/).map(item => item.trim()).filter(Boolean)
+  if (getCheckinStore().keepaliveSaving) return
+  patch({ keepaliveSaving: true })
+  try {
+    const next = await bridge().saveCheckinKeepalive?.(models)
+    if (next) {
+      const current = getCheckinStore().snapshot
+      patch({ snapshot: current ? { ...current, keepalive: next } : current, keepaliveDraft: null })
+      toast(t('已保存：保活模型链'))
+    }
+  } catch (error) {
+    toast(t('保存失败：{error}', { error: errorMessage(error) }), 'err')
+  } finally {
+    patch({ keepaliveSaving: false })
+  }
+}
+
+/* ─── 新手任务（惰性查询 + 一键领取；Loomy / 小浣熊）─── */
 
 /**
  * 签到完成后的自动处理（原账号页「签到后自动弹窗领取」口径的延续）：
- * 对 [`rows`] 里的 Loomy 账号逐个查询任务状态（只读），有未领取的**立即自动领取**。
+ * 对 [`rows`] 里的账号逐个查询任务状态，有未领取的**立即自动领取**。
  *
  * ── 为什么自动领取是安全的 ──────────────────────────────────
- * 新手任务是一次性福利，服务端幂等（重复上报 alreadyCompleted，不重复加分），
- * 自动领取不会多拿；全部领完后查询结果 unclaimed=0，之后签到就只是签到。
- * 逐账号串行（与签到同一条防风控口径），单账号查询失败不拖累其它账号。
+ * 新手任务是一次性福利，两家的领取接口都幂等（Loomy 重复上报 alreadyCompleted、
+ * 小浣熊已发放过返回 granted=false，都不会重复加分），自动领取不会多拿；
+ * 全部领完后查询结果 unclaimed=0，之后签到就只是签到。逐账号串行
+ * （与签到同一条防风控口径），单账号查询失败不拖累其它账号。
  *
- * `rows` 传快照的 `extras.onboarding`（全部 Loomy 账号）；单账号签到时传只含
- * 该账号的数组（用户点的是谁就处理谁）。领取完成后 claimOnboarding 内部会
- * 重拉快照，「待领新手任务」总览卡随之归零。
+ * ── CodeArts 为什么也在自动补领里 ──────────────────────────
+ * 它的新手任务只有「新人注册礼」这一条，且是**一次性**的：领过一次之后上游就
+ * 不再回 `claimable`，于是下一轮查询的 `unclaimed=0`，之后每次签到都只是签到
+ * —— 自动补领在这里只会发一次写请求，与 Loomy 同构。
+ * 边界仍然留着：本家**不进** `auto_checkin` 的提供商清单（那是后端的定时任务，
+ * 无人看守），这里的"自动"只发生在用户刚点过签到之后。另外两类一次性活动
+ * （学生认证 / 邀请礼）连入口都没有，判据见 `Campaign::is_newbie_gift`。
+ *
+ * `rows` 传快照的 `extras.onboarding`（全部支持新手任务的账号）；单账号签到时
+ * 传只含该账号的数组（用户点的是谁就处理谁）。领取完成后 claimOnboarding
+ * 内部会重拉快照，「待领新手任务」总览卡随之归零。
+ *
+ * ── 已结算的账号跳过 ────────────────────────────────────────
+ * 快照带结算记忆、或缓存里 `settled` 已置位的账号**不发查询**（这正是本功能
+ * 要消灭的那次多余上游请求）；真出了新一期活动，用户手点「查询任务」时会被
+ * 实查发现（`refresh`），后端届时也会清掉记忆。
  */
-async function autoProcessOnboarding(rows: Array<{ id: string }>): Promise<void> {
+async function autoProcessOnboarding(
+  rows: Array<{ id: string; settled?: OnboardingSettledRaw }>,
+): Promise<void> {
   for (const row of rows) {
+    if (settledOf(row.id)) continue
     await queryOnboarding(row.id)
   }
   for (const row of rows) {
     const cache = getCheckinStore().onboarding.get(row.id)
-    if (cache?.status === 'loaded' && cache.unclaimed > 0 && !cache.claiming) {
+    if (cache?.status === 'loaded' && cache.unclaimed > 0 && !cache.claiming && !cache.settled) {
       await claimOnboarding(row.id)
     }
   }
+}
+
+/** 这个账号的一次性福利是否已结算（缓存里的 `settled`；铺缓存见 `seedSettledCaches`） */
+function settledOf(id: string): boolean {
+  return store.onboarding.get(id)?.settled === true
 }
 
 function onboardingOf(id: string): OnboardingCache {
@@ -430,27 +610,39 @@ function patchOnboarding(id: string, next: Partial<OnboardingCache>): void {
  * `expand: true`（界面上点「查询任务」）在查到任务后**默认展开**清单 ——
  * 查询这个动作本身就是「我要看」，让它多付一次点击才能看到结果是反的；
  * 签到后的自动处理不展开（autoProcessOnboarding），不让后台动作替用户动界面。
+ *
+ * `refresh: true`（只有界面上点「查询任务」才传）要求后端**实查上游**：一次性
+ * 福利结算过之后后端默认吃记忆（零上游），手点那颗按钮的语义就是「我不信缓存，
+ * 现在去问一次」—— 上游真出了新一期活动，这一次就会看到，后端也会同步清掉记忆。
  */
-export async function queryOnboarding(id: string, options?: { expand?: boolean }): Promise<void> {
+export async function queryOnboarding(
+  id: string,
+  options?: { expand?: boolean; refresh?: boolean },
+): Promise<void> {
   const current = onboardingOf(id)
   if (current.status === 'loading' || current.claiming) return
-  patchOnboarding(id, { status: 'loading', error: undefined })
+  patchOnboarding(id, { status: 'loading', error: undefined, settled: false })
   try {
-    const data = await bridge().getOnboardingTasks?.(id)
+    const data = await bridge().getOnboardingTasks?.(id, options?.refresh === true)
     const tasks = normalizeTasks(data?.tasks)
+    const settled = data?.settled === true
     patchOnboarding(id, {
       status: 'loaded',
       checkedAt: Date.now(),
       tasks,
-      unclaimed: tasks.filter(task => !task.done).length,
+      // blocked（前置没满足，如 CodeArts 新人礼未到门槛）不算待领：把它们计入
+      // 待领数会让「一键领取（N）」承诺一件点成失败的事，而一次性的东西失败不起
+      unclaimed: tasks.filter(task => !task.done && !task.blocked).length,
       earned: numberOf(data?.earned),
       total: numberOf(data?.total),
+      settled,
+      settledAt: settled ? numberOf(data?.settledAt) || undefined : undefined,
     })
     if (options?.expand === true && tasks.length > 0 && !onboardingExpanded(id)) {
       toggleOnboardingExpand(id)
     }
   } catch (error) {
-    patchOnboarding(id, { status: 'error', error: errorMessage(error) })
+    patchOnboarding(id, { status: 'error', error: errorMessage(error), settled: false })
   }
 }
 
@@ -475,7 +667,7 @@ export async function claimOnboarding(id: string): Promise<void> {
     const rows = Array.isArray(data?.results) ? data.results : []
     for (const row of rows) {
       const key = typeof row?.key === 'string' ? row.key : ''
-      if (key && row?.ok !== true) failedKeys.set(key, String(row?.error || '领取失败'))
+      if (key && row?.ok !== true) failedKeys.set(key, String(row?.error || t('领取失败')))
     }
     const server = normalizeTasks(data?.tasks)
     const merged = (server.length ? server : onboardingOf(id).tasks).map(task => ({
@@ -484,19 +676,24 @@ export async function claimOnboarding(id: string): Promise<void> {
       error: failedKeys.get(task.key),
     }))
     const claimedCount = merged.filter(task => task.done && !failedKeys.has(task.key)).length
+    // 后端在这一轮把一次性福利结清了（响应带 settled）⇒ 本地也置位：此后进页面
+    // 直接用记忆渲染，不再为这个账号发查询（要实查仍可手点「查询任务」）。
+    const settled = data?.settled === true
     patchOnboarding(id, {
       claiming: false,
       checkedAt: Date.now(),
       tasks: merged,
-      unclaimed: merged.filter(task => !task.done).length,
+      unclaimed: merged.filter(task => !task.done && !task.blocked).length,
       earned: numberOf(data?.earned),
       total: numberOf(data?.total),
+      settled,
+      settledAt: settled ? numberOf(data?.settledAt) || undefined : undefined,
     })
     const failed = merged.filter(task => task.error && !task.done).length
     if (failed) {
-      toast(`新手任务有 ${failed} 项领取失败，可重试`, 'err')
+      toast(t('新手任务有 {n} 项领取失败，可重试', { n: failed }), 'err')
     } else if (claimedCount) {
-      toast(`✅ 新手任务领取完成，累计 ${numberOf(data?.earned)} 积分`)
+      toast(t('✅ 新手任务领取完成，累计 {n} 积分', { n: numberOf(data?.earned) }))
     }
   } catch (error) {
     const message = errorMessage(error)
@@ -508,7 +705,7 @@ export async function claimOnboarding(id: string): Promise<void> {
         error: task.done ? undefined : message,
       })),
     })
-    toast(`领取失败：${message}`, 'err')
+    toast(t('领取失败：{error}', { error: message }), 'err')
   } finally {
     await loadCheckinCenter()
   }
@@ -527,19 +724,22 @@ export function groupTone(group: CheckinProviderGroup): 'done' | 'part' | 'todo'
 /** 历史条目的一行摘要（时间线副标题） */
 export function historyLine(entry: CheckinHistoryEntry): string {
   const succeeded = numberOf(entry.succeeded)
+  const active = numberOf(entry.active)
   const total = numberOf(entry.total)
   const skipped = numberOf(entry.skipped)
   const failed = numberOf(entry.failedCount)
-  const parts = [`成功 ${succeeded}`]
-  if (skipped > 0) parts.push(`跳过 ${skipped}`)
-  if (failed > 0) parts.push(`失败 ${failed}`)
-  return `${parts.join(' · ')}${total ? `（共 ${total} 个账号）` : ''}`
+  const parts = [t('成功 {n}', { n: succeeded })]
+  if (active > 0) parts.push(t('保活 {n}', { n: active }))
+  if (skipped > 0) parts.push(t('跳过 {n}', { n: skipped }))
+  if (failed > 0) parts.push(t('失败 {n}', { n: failed }))
+  return `${parts.join(' · ')}${total ? t('（共 {n} 个账号）', { n: total }) : ''}`
 }
 
 /** 「下次执行」的人话（today / tomorrow 相对面板时刻） */
 export function nextRunText(auto: AutoCheckinState | null | undefined): string {
-  if (auto?.enabled !== true) return '未开启'
+  if (auto?.enabled !== true) return t('未开启')
   const at = Number(auto.nextRunAt)
-  if (!Number.isFinite(at) || at <= 0) return formatTime(at) || `每天 ${auto.time}`
-  return `${formatTime(at)}（每天 ${auto.time}）`
+  const time = auto.time ?? ''
+  if (!Number.isFinite(at) || at <= 0) return formatTime(at) || t('每天 {time}', { time })
+  return t('{date}（每天 {time}）', { date: formatTime(at), time })
 }

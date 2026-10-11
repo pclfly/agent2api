@@ -300,6 +300,10 @@ impl ServerState {
         // CodeArts 同理：授权地址由适配器拼（同步无参），而 portal 只认 `port`，
         // 所以端口要在发起登录之前就写在进程级常量里（见该模块 `set_loopback_port`）。
         crate::server::core::providers::codearts::oauth::set_loopback_port(port);
+        // Antigravity 的网页登录同理：Google 授权页完成后要回到
+        // `http://localhost:{port}/oauth-callback`（redirect_uri 由适配器在发起
+        // 登录时本地拼），端口必须在第一次发起之前就位（见该模块 `set_loopback_port`）。
+        crate::server::core::providers::antigravity::oauth::set_loopback_port(port);
         let config_dir = config::config_dir();
         // 与 Node 版一致：verbose 由环境变量 AGENT2API_VERBOSE=1 打开
         // （旧名 WORKBUDDY_VERBOSE 仍可读，新名优先），
@@ -339,6 +343,10 @@ impl ServerState {
         // 每账号的余额查询记录（余额不足跳过 / 自动禁用的底座）：装库句柄时
         // 顺带做旧 kv 快照的一次性迁移与内存事实表的装载（见 usage_records 模块头）。
         core::usage_records::install(db.clone());
+        // 每账号的「限制器」（余额 / Token 规则列表）：Token 周期消耗的窗口
+        // 聚合读同一个库（schema v9 的聚合索引），装句柄即可 —— 事实表的刷新
+        // 由 usage_query 的心跳循环驱动（见 limiter 模块头）。
+        core::limiter::install(db.clone());
         // 出网代理池（「网络代理」页维护的命名代理；账号按 id 引用它们）：
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。

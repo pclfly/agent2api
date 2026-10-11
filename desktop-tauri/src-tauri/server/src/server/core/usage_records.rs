@@ -313,11 +313,57 @@ pub const MAX_QUERY_INTERVAL_SECONDS: i64 = 86_400;
 /// 「缺省」必须与全局任务时代的行为对齐：那时「定时查询积分」默认开启
 /// （每 10 分钟），账号什么都不配也在查；因此每账号化的缺省同样是**开启**
 /// （间隔取 1 分钟 —— 用户升级反馈指定的值），而不是「未配置 = 不查」——
-/// 否则升级后所有人的余额列都会静默停更。余额不足的缺省处理同理：全局
-/// 任务时代没有这个概念，跳过（阈值 1）是最温和的兜底 —— 没钱的账号让路，
-/// 有钱的照常，且余额回升自动恢复，不需要任何人善后。
+/// 否则升级后所有人的余额列都会静默停更。
+///
+/// 余额不足的缺省处理按 provider 区分（见 [`default_low_balance_mode`]）：
+/// 大多数家沿用跳过（阈值 1）—— 全局任务时代没有这个概念，它是最温和的
+/// 兜底；唯独 Cline 免费池缺省**不处理**，原因见那边的文档。
 pub const DEFAULT_QUERY_INTERVAL_SECONDS: i64 = 60;
 pub const DEFAULT_LOW_BALANCE_THRESHOLD: f64 = 1.0;
+
+/// Cline 免费池的 provider id（从注册表推导，与 `account_store::CLINE_FREE_PROVIDER_ID`
+/// 同源 —— 注册表改了 id 这里跟着变）。
+const CLINE_FREE_PROVIDER: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::ClineFree,
+);
+
+/// CodeArts 的 provider id（缺省「不处理」，真正的缺省限制是 Token 规则，见上）。
+const CODEARTS_PROVIDER: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::CodeArts,
+);
+
+/// 各 provider 缺省的「余额不足处理」档（记录上没有 `lowBalance` 配置时用）。
+///
+/// 这个函数只描述**旧 `lowBalance` 字段**的缺省视图；限制器上线后真正的缺省
+/// 规则（含 CodeArts 的 Token 自然日规则）在 `limiter::default_rules`。
+///
+/// - **Cline 免费池（`cline-free`）→ `off`（不处理）**：免费池的 credit 长期
+///   贴着 0 走、用超了还是负数（欠费是常态），跳过档的缺省阈值 1 会把几乎
+///   整个池从选路里剔掉。免费池能不能用交给上游裁决（真没钱时 402 自会按
+///   错误处置轮换），不靠余额读数预判。
+/// - **CodeArts（`codearts`）→ `off`**：它的有效缺省限制是一条 Token 自然日
+///   规则（见 `limiter::default_rules`，余额读数常判不出、余额规则形同虚设）；
+///   旧字段表达不了 Token 规则，显示 off 比显示一个不会生效的「跳过」诚实。
+/// - **其余 provider → `skip`（跳过）**：没钱让路、有钱照常、余额回升自动
+///   恢复，不需要任何人善后（历史缺省，不变）。
+pub fn default_low_balance_mode(provider: &str) -> &'static str {
+    if provider == CLINE_FREE_PROVIDER || provider == CODEARTS_PROVIDER {
+        "off"
+    } else {
+        "skip"
+    }
+}
+
+/// 缺省档的完整形状（mode + threshold）：公开形态（store_view）与写入侧
+/// 归一化（store_crud）共用，保证三处「缺省」永远是同一个对象。
+/// off 档阈值归零存放（与 `apply_patch` 的 off 形态一致）。
+pub fn default_low_balance(provider: &str) -> Value {
+    if default_low_balance_mode(provider) == "off" {
+        serde_json::json!({ "mode": "off", "threshold": 0.0 })
+    } else {
+        serde_json::json!({ "mode": "skip", "threshold": DEFAULT_LOW_BALANCE_THRESHOLD })
+    }
+}
 
 /// 账号配置的自动查询间隔（秒）。
 ///
@@ -341,53 +387,25 @@ pub fn query_interval_of(account: &Value) -> Option<i64> {
     }
 }
 
-/// 「余额不足自动禁用」档的阈值。仅 `lowBalance.mode == "disable"` 的账号有值
-/// —— **缺省（无配置）不启用禁用**：自动禁用是不自动恢复的硬动作，缺省必须是
-/// 用户显式选过才会发生；缺省档只有软跳过（见 [`balance_blocked`]）。
-/// 阈值非法（非正 / 非有限数）一律 None —— 判不出就放行，不猜。
+/// 「余额不足自动禁用」档的阈值。判定读**限制器的有效规则**（`core::limiter`）：
+/// 记录上有显式 `limiters` 时按其中的余额 disable 规则取最大阈值；没有时按旧
+/// `lowBalance` / provider 缺省推导 —— 与升级前逐字一致。**缺省（推导结果为空）
+/// 不启用禁用**：自动禁用是不自动恢复的硬动作，缺省必须是用户显式选过才会发生。
+/// 阈值非法（非正 / 非有限数）在规则解析层已拦，这里不再重复判。
 pub fn low_balance_disable_threshold(account: &Value) -> Option<f64> {
-    let config = account.get("lowBalance")?;
-    if config.get("mode").and_then(Value::as_str) != Some("disable") {
-        return None;
-    }
-    valid_threshold(config.get("threshold"))
+    crate::server::core::limiter::balance_disable_threshold(account)
 }
 
 /// 账号是否应因「余额不足」在选路时被跳过（软跳过档）。
 ///
-/// 条件：处理方式为 `skip` + 阈值合法 + 内存事实里有这个账号的读数且**严格小于**
-/// 阈值（等于阈值仍可用，与 OmniProxy 同口径）。缺省（无配置）= skip、阈值 1：
-/// 没钱的账号让路、有钱的照常、回升自动恢复，是无需善后的缺省档。
-/// 判不出的情况 —— 显式 off、无读数、unlimited、账号已删 —— 一律放行：
+/// 判定读**限制器的有效规则**（`core::limiter::balance_skip_blocked`）：任一
+/// 启用的余额 skip 规则满足「最近读数**严格小于**阈值（等于阈值仍可用，与
+/// OmniProxy 同口径）」即拦。缺省（无 `limiters` 键）按旧配置推导：Cline 免费池
+/// 不处理（free 池余额贴 0 是常态，跳过会把整个池剔掉），其余 skip、阈值 1。
+/// 判不出的情况 —— 无读数、unlimited、账号已删 —— 一律放行：
 /// 跳过是对「这个账号此刻没钱」的断言，断言拿不出证据就不能拦请求。
 pub fn balance_blocked(account: &Value, facts: &HashMap<String, BalanceFact>) -> bool {
-    let (mode, threshold) = match account.get("lowBalance") {
-        // 缺省：跳过、阈值 1（见 DEFAULT_* 的模块级说明）
-        None => ("skip", DEFAULT_LOW_BALANCE_THRESHOLD),
-        Some(config) => {
-            let mode = config.get("mode").and_then(Value::as_str).unwrap_or("skip");
-            let threshold = valid_threshold(config.get("threshold"))
-                .unwrap_or(DEFAULT_LOW_BALANCE_THRESHOLD);
-            (mode, threshold)
-        }
-    };
-    if mode != "skip" {
-        return false;
-    }
-    let Some(id) = account.get("id").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(fact) = facts.get(id) else {
-        return false;
-    };
-    matches!(fact.remaining, Some(remaining) if remaining < threshold)
-}
-
-/// 阈值的合法性口径：有限且 > 0。DB / JSON 里可能有手工脏值，宁可放行也不猜。
-fn valid_threshold(value: Option<&Value>) -> Option<f64> {
-    value
-        .and_then(Value::as_f64)
-        .filter(|threshold| threshold.is_finite() && *threshold > 0.0)
+    crate::server::core::limiter::balance_skip_blocked(account, facts)
 }
 
 // ─── 旧 kv 快照的一次性迁移 ─────────────────────────────────

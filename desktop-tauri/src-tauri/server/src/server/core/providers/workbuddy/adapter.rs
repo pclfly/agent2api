@@ -630,7 +630,10 @@ async fn default_session_token(store: &AccountStore, region: Region) -> Result<S
 ///     也会给一个 —— 两个同名头会让上游按不确定的值解释，保留身份侧的那个
 ///     （它就是按身份算出来的正确值）；
 ///   - WB 身份头里没有 `X-Domain`，去重不影响既有行为。
-fn chat_headers(
+///
+/// `pub(super)`：本目录的 `keepalive`（国际版每日活跃保活）与转发共用同一套
+/// 头集合 —— 保活必须长得和真对话一模一样，抄一份必然漂移。
+pub(super) fn chat_headers(
     session: &Value,
     region: Region,
     request_id: &str,
@@ -667,7 +670,11 @@ fn chat_headers(
 /// `endpoint_for(realm, product)` 同款）：当前唯一与地区默认不同的是
 /// 「国内版 + VSCode 插件 → www.workbuddy.cn」。其余组合返回 None，走既有
 /// 回落链（账号 endpoint → 地区默认）—— WB 身份因此完全不受影响。
-fn chat_completions_url(session: &Value, region: Region) -> String {
+///
+/// `pub(super)`：与 `chat_headers` 同理，本目录的 `keepalive`（国际版每日
+/// 活跃保活）复用同一个 URL 构造 —— WB 默认身份走的是 else 回落链，与拆家
+/// 前的 URL 逻辑逐字相同，因此保活拿到的 URL 与真对话一致。
+pub(super) fn chat_completions_url(session: &Value, region: Region) -> String {
     let edition = region.edition();
     let product = identity::product_of(session);
     let endpoint = if let Some(overridden) = identity::identity_endpoint(edition, product) {

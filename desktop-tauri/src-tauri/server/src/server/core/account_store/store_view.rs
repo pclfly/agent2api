@@ -266,7 +266,9 @@ impl AccountStore {
             // 账号字段、桌面端判定、deviceId 语义两地完全一致，
             // 差别只在域名（那是转发与凭证层的事，公开形态不体现）
             self.to_autoclaw_public_account(record)
-        } else if record.provider() == super::QODER_PROVIDER_ID {
+        } else if super::is_qoder_family(&record.provider()) {
+            // 两个地区（`qoder` / `qoder-intl`）共用这一份公开形态：地区由
+            // provider id（兜底 `mode` 字段）派生进 `edition` / `editionLabel`
             self.to_qoder_public_account(record)
         } else if record.provider() == super::codearts_accounts::CODEARTS_PROVIDER_ID {
             self.to_codearts_public_account(record)
@@ -295,6 +297,11 @@ impl AccountStore {
             // Loomy（讯飞）：单一入口（手机验证码登录），公开形态带 userId /
             // phone / session 尾四位的展示字段（见 `loomy_accounts.rs`）
             self.to_loomy_public_account(record)
+        } else if super::is_monkeycode_family(&record.provider()) {
+            // MonkeyCode 的两个站点（`monkeycode` / `monkeycode-intl`）共用这一份
+            // 公开形态：字段两地完全一致，差别只在站点域名（那是转发与凭证层的
+            // 事，公开形态只用 `edition` 把地区标出来供界面显示）
+            self.to_monkeycode_public_account(record)
         } else if record.provider() == super::kuku_accounts::KUKU_PROVIDER_ID {
             // KukuAI（百度文库库库 AI）：单一入口（粘贴 Cookie / 导入本机登录态），
             // 公开形态带 uid(=uk) / loginName(=昵称) / tokenTail（见
@@ -303,6 +310,15 @@ impl AccountStore {
         } else if record.provider() == super::MINIMAX_PROVIDER_ID {
             // MiniMax Code（中国版）：公开形态见 `minimax_accounts.rs`
             self.to_minimax_public_account(record)
+        } else if record.provider() == super::COMMANDCODE_PROVIDER_ID {
+            // Command Code：单一入口（粘贴 `user_` API Key），公开形态去掉 key
+            // 本体、只留尾号与「有没有 key」（见 `commandcode_accounts.rs`）
+            self.to_commandcode_public_account(record)
+        } else if record.provider() == super::ANTIGRAVITY_PROVIDER_ID {
+            // Antigravity（Google）：单一入口（粘贴 Google refresh token），
+            // 公开形态去掉 token 本体、只留 refresh token 尾号与
+            // 「有没有 refreshToken / accessToken」（见 `antigravity_accounts.rs`）
+            self.to_antigravity_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
@@ -324,7 +340,7 @@ impl AccountStore {
                 );
                 // 没有转发能力的家：界面据此说明「启用了也不会被转发」，
                 // 而不是把一个失效的启用开关当成正常账号展示。
-                // 五家现在都能转发，所以正常配置下这里恒为 true ——
+                // 各家现在都能转发，所以正常配置下这里恒为 true ——
                 // 保留这个字段是因为「能用账号管理、但转发还没接上」这种过渡期
                 // 状态将来还会出现，而界面需要有办法如实说出来。
                 fields.insert(
@@ -332,7 +348,7 @@ impl AccountStore {
                     Value::Bool(forwards_requests(record)),
                 );
                 // 最近一次签到成功的时刻（0 = 从未签过）。跨家统一注入的理由与上面
-                // 两条相同：它是「这条账号的签到状态」这一个事实，五家的存放位置
+                // 两条相同：它是「这条账号的签到状态」这一个事实，各家的存放位置
                 // 一致（`checkinAt`），界面不必按 provider 查表。
                 //
                 // 给出的是**时间戳**而不是「今天签过没」的布尔：自然日的边界要按
@@ -360,7 +376,7 @@ impl AccountStore {
                 // 每账号的余额查询设置（自动查询 + 余额不足处理）：跨家统一注入
                 // 的理由与 hasCredentials 相同 —— 心跳调度、选路跳过 / 禁用与前端
                 // 弹窗、徽章读的是**同一份事实**，不能各家形状一个口径。
-                // 恒为对象（未配置 = 关闭 / off 的规范化形状，与写入侧
+                // 恒为对象（未配置 = 各家缺省档的规范化形状，与写入侧
                 // `apply_patch` 的归一化一致），读侧不必判「键缺失」。
                 fields.insert(
                     "usageQuery".to_string(),
@@ -368,7 +384,15 @@ impl AccountStore {
                 );
                 fields.insert(
                     "lowBalance".to_string(),
-                    low_balance_public(record.fields().get("lowBalance")),
+                    low_balance_public(&record.provider(), record.fields().get("lowBalance")),
+                );
+                // 每账号的「限制器」有效规则（余额 / Token 规则列表）：恒为数组 ——
+                // 记录上没有 `limiters` 键（旧版写的记录）时由 lowBalance / provider
+                // 缺省**推导**（见 `limiter::effective_rules`），前端因此不必自带
+                // 推导逻辑，弹窗、徽章与后端选路读到的永远是同一份规则。
+                fields.insert(
+                    "limiters".to_string(),
+                    crate::server::core::limiter::effective_rules_json_in(record.fields()),
                 );
                 Value::Object(fields)
             }
@@ -526,15 +550,17 @@ fn usage_query_public(value: Option<&Value>) -> Value {
 
 /// 记录上的 `lowBalance` → 公开形态的规范化形状。
 ///
-/// 缺省（无配置）= `skip`、阈值 1（与 `usage_records::balance_blocked` 同一口径）；
-/// 显式 `off` 必须保持 off —— 那是用户关掉的，缺省不能覆盖它。skip / disable
+/// 缺省（无配置）按 provider 区分（与 `usage_records::balance_blocked` 同一口径，
+/// 见 `default_low_balance_mode`）：Cline 免费池 = `off`（不处理），其余 = `skip`、
+/// 阈值 1；显式配置一律原样尊重 —— 那是用户选过的，缺省不能覆盖它。skip / disable
 /// 档下阈值缺失或非法时回落缺省 1。
-fn low_balance_public(value: Option<&Value>) -> Value {
-    use crate::server::core::usage_records::DEFAULT_LOW_BALANCE_THRESHOLD;
+fn low_balance_public(provider: &str, value: Option<&Value>) -> Value {
+    use crate::server::core::usage_records::{default_low_balance, default_low_balance_mode, DEFAULT_LOW_BALANCE_THRESHOLD};
+    let default_mode = default_low_balance_mode(provider);
     let Some(fields) = value.and_then(Value::as_object) else {
-        return json!({ "mode": "skip", "threshold": DEFAULT_LOW_BALANCE_THRESHOLD });
+        return default_low_balance(provider);
     };
-    let mode = fields.get("mode").and_then(Value::as_str).unwrap_or("skip");
+    let mode = fields.get("mode").and_then(Value::as_str).unwrap_or(default_mode);
     let threshold = fields
         .get("threshold")
         .and_then(Value::as_f64)

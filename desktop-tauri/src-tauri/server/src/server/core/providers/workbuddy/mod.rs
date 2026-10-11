@@ -10,8 +10,7 @@
 //!             tool 配对 / 前缀缓存键），从参考项目 workbuddy2api 移植
 //! identity.rs 出站身份（WB / VSC / CLI）：三种客户端指纹与配额通道，
 //!             按账号的 `product` 字段选择（与 `region` 正交）
-//! web_daily.rs 国际版的「每日活跃打卡」（桌面端轻量对话 + 网页通道 agent
-//!             会话）—— 国际站没有签到接口，官方奖励只认跑完的网页端会话
+//! keepalive.rs 国际版每日活跃保活的请求构造（免费模型链缺省值 + 最小流式 body）
 //! ```
 //!
 //! ── 为什么是一个目录而不是单文件 ─────────────────────────────
@@ -30,13 +29,13 @@ pub mod adapter;
 /// 出站身份（WB / VSC / CLI）：三种客户端指纹与配额通道。
 /// 见 `identity` 模块头的对照表。
 pub mod identity;
+/// 国际版每日活跃保活的请求构造（免费模型链缺省值 + 最小流式 body）。
+pub mod keepalive;
 pub mod normalize;
 pub mod region;
-/// 国际版的「每日活跃打卡」（桌面端轻量对话 + 网页通道 agent 会话）。
-/// 见 `web_daily` 模块头的上游事实与成败口径。
-pub mod web_daily;
 
 pub use adapter::{
     ensure_leading_system_message, WorkBuddyAdapter, WORKBUDDY_ADAPTER, WORKBUDDY_INTL_ADAPTER,
 };
+pub use keepalive::{DEFAULT_FREE_MODELS, build_daily_activity_request};
 pub use region::{is_workbuddy_family, Region};
