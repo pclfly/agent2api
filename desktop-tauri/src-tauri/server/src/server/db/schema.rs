@@ -154,6 +154,23 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 它不是配置项（配置写入绝不能动它，否则用户配好的代理会被改一次 API Key
     // 清空）。条目不落独立表、只整份读写，理由见那个模块头。
     "proxyPool",
+    // 订阅（core::subscriptions）：整份 `{items: [...]}` 一个键 —— 「网络代理」
+    // 页「订阅」区块维护的订阅链接，内核（sub_kernel）拉起时从 api 层拿启用
+    // 清单。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能动它。
+    "subscriptions",
+    // OfficeAce 模型可用性探测的结论（core::providers::officeace::probe）：
+    // 整份 `{unavailable:[…], probedAt, account}` 一个键。探测「目录里列着、这个
+    // 号实际打不通」的模型（上游回 81004/81009），结论由 `advertise_models` 用来
+    // 默认隐藏它们。属于「其它零散状态」——不是配置项，配置写入绝不能动它
+    // （否则每次改配置都让隐藏集合清零、客户端又照着一个一个试）。
+    "officeaceModelProbe",
+    // models.dev 模型元数据的刷新结果（core::model_meta::snapshot）：整份
+    // 「上次成功拉到的精简索引」一个键（文件形态与内嵌快照逐字相同，生成口径见
+    // `scripts/sync-modelsdev.mjs`）。**不是**配置项 —— 配置写入绝不能动它，
+    // 否则用户改一次 API Key 就退回发版时那份更旧的内嵌快照。
+    // 与上面的 `modelCatalogCache` 是两码事：那个存各家上游的**模型清单**，
+    // 这个存模型的**元数据**（能力位 / 思考档位），刷新链路与失效语义各不同。
+    "modelsDevCatalog",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
@@ -214,7 +231,18 @@ pub fn is_reserved(key: &str) -> bool {
 /// 退役后查询按账号各自到期触发，一行一账号才能逐条更新、逐条被选路读取
 /// （kv 整份读改写撑不住这个粒度）。旧快照的数据由 `core::usage_records`
 /// 启动时导入，升级后余额列不会变空白。
-pub const SCHEMA_VERSION: i64 = 10;
+/// ── 版本 11：checkin_records 表（签到记录的每账号明细台账）───────
+/// 见 [`V11_SCHEMA`]。与 v3 / v8 同一形态（新表，`CREATE TABLE IF NOT EXISTS`）。
+/// 它是签到中心「签到记录」页的数据源：每执行一次签到，每个账号一行
+/// （领成功 / 已领过 / 失败及其错误原文 / 收益文案），补上改造前「只有
+/// config.json 里一条聚合同 lastResult」看不见的明细。写入方是
+/// `core::checkin_records`（记账点唯一：`core::billing::checkin::run_checkin`）。
+///
+/// ── 版本 12：两线 v10 的收敛（`requests.route` + `requests.credit`）──
+/// 见 [`apply_v10`]。上游与本地各自把 v10 用作一列（上游 `route`、本地
+/// `credit`），从任一线升上来的库都缺对方那一列，而迁移从 `current + 1`
+/// 开始跑、跳不到那一版 —— 本版本重跑同一份幂等加列，两条线在此收敛。
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -620,30 +648,43 @@ const V9_SCHEMA: &str = "
 CREATE INDEX IF NOT EXISTS idx_requests_account_ts ON requests(account_id, ts);
 ";
 
-/// 版本 10：`requests` 补一列 `credit` —— 本次请求消耗的积分。
+/// 版本 10 / 12：`requests` 补两列 —— 上游的**选路决策快照** `route` 与
+/// 本地的**本次消耗积分** `credit`。
 ///
-/// ── 存什么 ──────────────────────────────────────────────────
+/// ── 为什么两列在同一处 ───────────────────────────────────────
+/// 上游与本地各自把 v10 用作一列（上游 `route`、本地 `credit`），合并后两列
+/// 都必须存在。从任一线升上来的存量库在 `user_version = 10`（或 11）上，
+/// 迁移从 `current + 1` 开始跑，**会跳过对方那一列** —— 所以本函数在 v10 与
+/// v12 两处都被调用：v10 服务「升到 10 的库」，v12 服务「已经是 10 / 11 的
+/// 库」，两边都收敛到同一份表结构。函数本身幂等（查列存在性），重跑无副作用。
+///
+/// ── `route` 存什么 ──────────────────────────────────────────
+/// 整个决策 JSON 的原文（`{strategy, sticky, stickyHit, picked, ordered[],
+/// blocked[]}`，采集侧已截断到各有界条数）。DEFAULT NULL：旧行与「没走到
+/// 选路」的请求都是「没有决策」—— 展示层对两者不渲染同一段，与
+/// `attempt_details` 的 `'[]'` 不同（那表达「空表」是有意的信息，这里 NULL
+/// 就是「没这回事」，不必造一种空形态）。
+///
+/// ── `credit` 存什么 ────────────────────────────────────────
 /// 上游在对话响应的 usage 块里随 token 一起回传的 `credit`（WorkBuddy 逆向
 /// 实测，与 `prompt_cache_hit_tokens` 同块；见 `core::upstream::usage::
 /// extract_usage` 与 `providers::workbuddy::normalize` 的说明）。请求日志的
 /// 「消耗」列读它，回答「这次请求到底扣了多少积分、是哪个模型扣的」。
 ///
-/// ── 为什么是可空 REAL 而不是 NOT NULL DEFAULT 0 ─────────────
-/// 「上游没报这个字段」与「上游报了 0」是两回事：后者是真实读数（WorkBuddy
-/// 的限时免费档 `x0.00` 每次就是扣 0），前者只该显示成「-」。用 `DEFAULT 0`
-/// 会让旧行与不报积分的那几家全部伪装成「消耗 0」，把「这家不报积分」这件
-/// 事从数据里抹掉。所以列可空、旧行读出来是 NULL。
-///
+/// 为什么是**可空 REAL** 而不是 `NOT NULL DEFAULT 0`：「上游没报这个字段」与
+/// 「上游报了 0」是两回事 —— 后者是真实读数（WorkBuddy 的限时免费档 `x0.00`
+/// 每次就是扣 0），前者只该显示成「-」。用 `DEFAULT 0` 会让旧行与不报积分的
+/// 那几家全部伪装成「消耗 0」，把「这家不报积分」这件事从数据里抹掉。
 /// 用 REAL 而不是 INTEGER：积分是小数（实测 `0.34` / `0.02`），整数列会把
-/// 小数截断成 0。SQLite 的 REAL 是 8 字节 IEEE 双精度，与本项目的 `f64`
-/// 一一对应。
+/// 小数截断成 0；SQLite 的 REAL 是 8 字节 IEEE 双精度，与 `f64` 一一对应。
 ///
 /// ── 为什么这一版是函数分支而不是纯 DDL 常量 ──────────────────
 /// SQLite 的 `ALTER TABLE ADD COLUMN` 没有 IF NOT EXISTS。本分支要同时兼容
-/// 三种存量库：v9 之前升上来的（没有列，要加）、跑过旧版本地 v9 的
-/// （已有列，跳过）、以及 v10 之后手工改库的（也可能已有列）。所以先查
-/// `pragma_table_info('requests')` 再决定跑不跑 ALTER —— 幂等靠列存在性
-/// 检查，而不是版本号（版本号只保证「正常路径」每个版本跑一次）。
+/// 四种存量库：v9 之前升上来的（两列都没有，要都加）、跑过旧版本地 v9 的
+/// （已有 credit，跳过）、跑过上游 v10 的（已有 route，跳过）、以及手工改库的
+/// （也可能已有列）。所以先查 `pragma_table_info('requests')` 再决定跑不跑
+/// ALTER —— 幂等靠列存在性检查，而不是版本号（版本号只保证「正常路径」每个
+/// 版本跑一次）。
 ///
 /// ── 为什么要顺手重放 v9 的索引 DDL ───────────────────────────
 /// 本地版一度把 v9 用作 credit 列（官方同一版本号用作索引，合并后让位给
@@ -658,14 +699,65 @@ fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_requests_account_ts ON requests(account_id, ts);",
     )?;
-    let has_credit: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('requests') WHERE name = 'credit'")?
-        .exists([])?;
-    if has_credit {
-        return Ok(());
+    let has_column = |name: &str| -> rusqlite::Result<bool> {
+        conn.prepare("SELECT 1 FROM pragma_table_info('requests') WHERE name = ?1")?
+            .exists([name])
+    };
+    if !has_column("route")? {
+        conn.execute_batch("ALTER TABLE requests ADD COLUMN route TEXT;")?;
     }
-    conn.execute_batch("ALTER TABLE requests ADD COLUMN credit REAL;")
+    if !has_column("credit")? {
+        conn.execute_batch("ALTER TABLE requests ADD COLUMN credit REAL;")?;
+    }
+    Ok(())
 }
+
+/// 版本 11：checkin_records 表 —— 签到记录的**每账号明细台账**。
+///
+/// 存什么：每执行一次签到（定时条目轮次 / 启动补签 / 手动批量 / 单账号 /
+/// 国际版活动领取），每个账号落一行。列的口径：
+///   - `ts`：记账时刻（毫秒，`logging::now_ms` 同口径；排序与翻页游标）；
+///   - `date`：北京时间 `YYYY-MM-DD`（上游自然日，`core::beijing` 的日期键 ——
+///     「哪天的签到」按它算，跟机器时区无关，与调度判定同一份口径）；
+///   - `source`：触发来源 `schedule / startup / manual / single / activity`
+///     （见 `core::checkin_records` 的模块头），界面显示为「来源」列；
+///   - `reason`：给日志看的那句（「到点触发（08:00）」「手动签到」…），原样存；
+///   - `account_id` / `account_name` / `provider`：账号三件套（结果行里就有，
+///     原样复制；账号删除后历史行仍然可读）；
+///   - `outcome`：`success / already / pending / failed`（判定复用签到执行体的
+///     同一对判据，判据只此一份，见 `core::checkin_records::classify`）；
+///   - `ok`：`success|already → 1` 的布尔投影（「今日已完成」口径的 SQL 过滤列，
+///     免得每个读点都写 `(outcome='success' OR outcome='already')`）；
+///   - `message`：claim.msg 原文（「今日积分 +100」等**收益就在这里**）；
+///   - `error`：执行错误原文（失败行的原因）；
+///   - `kept_active`：国际版保活成功（`activity.pokeSucceeded`）标记。
+///
+/// 为什么 row_id 用 AUTOINCREMENT：与 `requests` 同一理由 —— 它当翻页游标，
+/// 复用 rowid 会让「翻页漏行 / 重行」。
+///
+/// 索引三个（ts / outcome / provider），对应记录页固定的三种过滤维度，
+/// 刻意不做复合索引（与 logs 表同一取舍：组合多、量级小，让 SQLite 自己挑）。
+const V11_SCHEMA: &str = "
+-- ── checkin_records：签到记录的每账号明细台账（schema v11）────
+CREATE TABLE IF NOT EXISTS checkin_records (
+  row_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts           INTEGER NOT NULL,
+  date         TEXT NOT NULL DEFAULT '',
+  source       TEXT NOT NULL DEFAULT '',
+  reason       TEXT NOT NULL DEFAULT '',
+  account_id   TEXT NOT NULL DEFAULT '',
+  account_name TEXT NOT NULL DEFAULT '',
+  provider     TEXT NOT NULL DEFAULT '',
+  outcome      TEXT NOT NULL DEFAULT '',
+  ok           INTEGER NOT NULL DEFAULT 0,
+  message      TEXT,
+  error        TEXT,
+  kept_active  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_ts ON checkin_records(ts);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_outcome ON checkin_records(outcome);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_provider ON checkin_records(provider);
+";
 
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
@@ -732,9 +824,14 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         8 => conn.execute_batch(V8_SCHEMA),
         // v9：requests 补按账号聚合的索引（限制器的 Token 周期消耗聚合，见 V9_SCHEMA）
         9 => conn.execute_batch(V9_SCHEMA),
-        // v10：requests 补「本次消耗积分」一列（上游 usage.credit，见 apply_v10；
-        // 带存量库的列检查，幂等）
+        // v10：requests 补两列 —— 上游的选路决策快照 `route` 与本地
+        // 的消耗积分 `credit`（带存量库的列检查，幂等，见 apply_v10）
         10 => apply_v10(conn),
+        // v11：checkin_records 签到记录明细台账（签到记录页的数据源，见 V11_SCHEMA）
+        11 => conn.execute_batch(V11_SCHEMA),
+        // v12：两线 v10 的收敛 —— 重跑同一份幂等加列，让「上游的库」补上
+        // credit、「本地的库」补上 route（见 SCHEMA_VERSION 与 apply_v10）
+        12 => apply_v10(conn),
         _ => Ok(()),
     }
 }

@@ -2248,7 +2248,9 @@ mod tests {
         frames.extend(machine.finish());
         let stream = futures::stream::iter(frames.into_iter().map(Ok::<_, std::io::Error>));
         let result = aggregate_frame_stream(
-            Box::pin(stream), std::sync::Arc::new(RequestTelemetry::new()), None,
+            Box::pin(stream),
+            std::sync::Arc::new(RequestTelemetry::new()),
+            crate::server::core::upstream::sse::FramePolicy::with_rewrite(None),
         ).await;
         let error = match result {
             Err(error) => error,
@@ -2561,7 +2563,11 @@ mod tests {
         assert_eq!(streamed_telemetry.snapshot().cache_read_tokens, 4096);
         let telemetry = std::sync::Arc::new(RequestTelemetry::new());
         let input = futures::stream::iter(frames.into_iter().map(Ok::<_, std::io::Error>));
-        let out = aggregate_frame_stream(Box::pin(input), telemetry.clone(), None).await.unwrap();
+        let out = aggregate_frame_stream(
+            Box::pin(input),
+            telemetry.clone(),
+            crate::server::core::upstream::sse::FramePolicy::with_rewrite(None),
+        ).await.unwrap();
         assert_eq!(out.body["usage"]["prompt_tokens"], 4610);
         assert_eq!(out.body["usage"]["prompt_tokens_details"]["cached_tokens"], 4096);
         assert_eq!(out.body["usage"]["cache_creation_input_tokens"], 512);

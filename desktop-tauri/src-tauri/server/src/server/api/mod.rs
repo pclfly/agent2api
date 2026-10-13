@@ -38,6 +38,9 @@ pub mod accounts;
 // `/api/accounts/usage` 的查询与结果组装（从 accounts.rs 拆出：余额能力从
 // 「只服务 workbuddy」扩到四家混查时新增，见该文件模块头）
 pub mod accounts_usage;
+// 整库备份 / 恢复（设置页「整库备份 / 恢复」，SQL 文本形态；核心在
+// `db::backup`，替换语义与账号 JSON 导入的 merge 是两条独立通道）
+pub mod backup_api;
 pub mod auto_checkin;
 pub mod billing;
 pub mod captcha;
@@ -45,9 +48,18 @@ pub mod chat;
 // 签到中心的聚合快照（GET /api/checkin-center）：分组口径在后端唯一化，
 // 资格类状态由前端按需惰性查询，见该文件模块头
 pub mod checkin_center;
+// 签到记录明细台账（GET/DELETE /api/checkin-records）：每账号一行的成败与
+// 收益明细，记账点在 `core::billing::checkin::run_checkin`，见该文件模块头
+pub mod checkin_records;
+// 定时签到的**条目**（GET/POST /api/checkin-schedules + {id}/delete|run）：
+// 总开关仍在 /api/auto-checkin，条目 CRUD 在这里，见该文件模块头
+pub mod checkin_schedules;
 pub mod cline_headers;
 pub mod codearts_welfare;
 pub mod config_api;
+// WorkBuddy 成长任务（查询 / 执行 / 开学季 / 猫猫旅行）：从参考项目
+// workbuddy2api 的 task_runner.py 移植，见该文件模块头
+pub mod growth;
 // 网关面（`/v1/*`）跨域访问开关：`GET/PUT /api/cors`（与 `/api/sanitize`
 // 同形的单开关端点，见该文件模块头）
 pub mod cors;
@@ -64,8 +76,14 @@ pub mod health;
 // `core::import_ccswitch`）
 pub mod import_sources;
 pub mod keys_api;
+/// 保活换行丢弃开关（`/api/keepalive-strip`）：与 `/api/sanitize`、`/api/debug`
+/// 同形的单开关端点，独立成文件而不是塞进 config_api —— 理由见该模块头。
+pub mod keepalive;
 pub mod logs_api;
 pub mod model_manage;
+// models.dev 模型元数据（开关 / 状态 / 立即刷新）：与「逐家上游目录」的
+// /api/models/refresh 分开，理由见该文件模块头
+pub mod model_meta;
 // 模型测试（模型管理页操作列的「测试」）：挂管理面、走真实转发链路，
 // 只把候选收窄到「这一家 × 这一个账号」并把流量标成测试，见该文件模块头
 pub mod model_test;
@@ -80,14 +98,18 @@ pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
 pub mod retry_api;
+pub mod routing_api;
 pub mod sanitize;
 pub mod scheduled_tasks;
 pub mod session;
 pub mod stats_api;
 pub mod storage_api;
+pub mod subscriptions;
 pub mod timeouts_api;
 pub mod update;
 pub mod upgrade_api;
 // 活动套餐通道的人机验证令牌池（界面铸造 → 网关消费），见该文件模块头
 pub mod zcode_captcha;
+// 令牌池的**补货节奏**设置（目标 / 轮询间隔 / 单轮上限），见该文件模块头
+pub mod zcode_captcha_pool;
 pub mod zcode_claim;

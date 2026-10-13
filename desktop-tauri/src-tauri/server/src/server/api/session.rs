@@ -292,6 +292,30 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task_state, "authUrl": auth_url,
             "edition": task_edition, "provider": "trae" }));
     }
+    // OfficeAce（华为云果办 / OfficeClaw）：**服务端中介的轮询登录**（与 ZCode
+    // 同一形态，见 `core::login::officeace` 的模块头）—— 授权地址由本进程现造
+    // （先向云端要 state），用户在浏览器里登完，后台任务**轮询云端**取授权码，
+    // **不需要壳侧开回调监听**（OfficeAce 的回调页在云端、不往本机跳）。
+    // 响应形状与另外几条登录链一致（`{state, authUrl, edition, provider}`）。
+    if kind == crate::server::core::providers::ProviderKind::OfficeAce {
+        let handle = match state.login().start_officeace_login() {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let (task_state, auth_url, task_edition) = match state
+            .login()
+            .wait_for_auth_url(&handle, Duration::from_millis(AUTH_URL_WAIT_MS))
+            .await
+        {
+            Ok(values) => values,
+            Err(error) => {
+                logging::log("[Login]", &format!("❌ 发起 OfficeAce 登录失败: {error}"));
+                return management_error(502, error);
+            }
+        };
+        return ok_json(json!({ "state": task_state, "authUrl": auth_url,
+            "edition": task_edition, "provider": "officeace" }));
+    }
     // LobsterAI：**网页登录 + 本机回调监听**（授权地址由本进程现造：先绑
     // 回调端口，再拼 portal URL，见 `core::login::lobsterai`）。响应形状与
     // 另外几条登录链一致（`{state, authUrl, edition, provider}`）。

@@ -119,6 +119,26 @@ pub const KEY_CLINE_UPSTREAM_HEADERS: &str = "clineUpstreamHeaders";
 /// （见 `http::panel_router` 与 `http::cors`）。
 pub const KEY_CORS_ENABLED: &str = "corsEnabled";
 
+/// 「丢弃保活换行分片」开关的键（详见 `core::upstream::sse::is_newline_keepalive`）。
+///
+/// 打开后，**声明了该能力位的**提供商（目前只有 WorkBuddy 与 AutoClaw）在下发
+/// SSE 帧时丢掉「整片只由换行组成」的 content 分片 —— 那是那两条上游的保活节拍
+/// （同一个流里 `: heartbeat` 注释行也在发），客户端按 markdown 渲染就被排成
+/// 一行一个词。两天 58 发 WorkBuddy 200 请求里 20 发带这类分片（34.5%），
+/// 脏请求里它们占正文分片中位 13.4%（区间 1.2%–30.8%）。
+///
+/// **默认关闭**，与适配器那位 `sse_strip_newline_chunks()` 是**与**的关系：
+/// 能力位回答「这家的上游会不会发这种东西」，这个开关回答「本机要不要为它改写
+/// 下发帧」。默认关的理由不是怀疑判据，而是取舍的方向性 —— 开了之后，模型真
+/// 有一个「单独成片」的换行也会被一起吃掉；那是一处**看得见的外观损失**，
+/// 而它换掉的是一整屏断句。留一个不改代码就能开关的口子，是为了让这件事能在
+/// 真流量上验证与随时撤回（见 `api::keepalive` 的 `/api/keepalive-strip`）。
+///
+/// 部署级兜底：配置里没有这个键时读环境变量 `AGENT2API_STRIP_NEWLINE_KEEPALIVE`
+/// （`1` / `true` / `on` 才算开启，其余含空值都算关，见 `parse::env_strip_newline_keepalive`）
+/// —— Docker 部署想从第一次启动就打开的，不必先进面板点一次。
+pub const KEY_STRIP_NEWLINE_KEEPALIVE: &str = "stripNewlineKeepalive";
+
 /// 机器人校验开关的键（config.json 键，ALTCHA proof-of-work，见 `server::altcha`）。
 ///
 /// **默认开启**：登录 / 注册是公开的认证边界，脚本可以无限打（暴破密码、
@@ -132,6 +152,18 @@ pub const KEY_CORS_ENABLED: &str = "corsEnabled";
 /// 在 compose / `.env` 里设它即可；设置页改过一次之后以库里的值为准
 /// （优先级「配置里的值 > 环境变量」）。
 pub const KEY_CAPTCHA_ENABLED: &str = "captchaEnabled";
+
+/// models.dev 模型元数据开关的键（config.json 键，见 `core::model_meta`）。
+///
+/// **默认开启**：它是「上游没声明的那几个能力键由社区库补上」这条链路的总闸
+/// ——关掉只影响**联网刷新**（内嵌快照仍生效，模型清单照常工作），所以默认开
+/// 的代价只是定时任务里多一次几 MB 的公网请求；而默认关的代价是「这个功能对
+/// 绝大多数用户等于不存在」（没人会去设置里找一个不知道自己需要的开关）。
+///
+/// 关闭后：`core::model_meta::refresh` 直接返回 skipped（不打网络），已经装载
+/// 的索引继续用（内存里的那份 + 库里的那份都不会被清掉）——「关掉」的语义是
+/// 「别再联网拉了」，不是「把已有数据扔掉」。
+pub const KEY_MODELS_DEV_ENABLED: &str = "modelsDevEnabled";
 
 /// 系统提示词模式的键（config.json 键，对应 workbuddy2api 的 `prompt.mode`）。
 ///
@@ -815,4 +847,227 @@ impl Default for QueueSettings {
 pub struct QueuePatch {
     pub max_waits: Option<i64>,
     pub wait_seconds: Option<i64>,
+}
+
+// ─── ZCode 验证码令牌池（活动套餐通道的补货节奏，见 api/zcode_captcha）──
+
+/// 令牌池的库存目标（`zcodeCaptchaPoolTarget`）：库存低于它前端铸造器才补铸。
+pub const KEY_CAPTCHA_POOL_TARGET: &str = "zcodeCaptchaPoolTarget";
+/// 铸造器轮询库存的间隔毫秒（`zcodeCaptchaPoolPollMs`）。
+pub const KEY_CAPTCHA_POOL_POLL_MS: &str = "zcodeCaptchaPoolPollMs";
+/// 铸造器一轮最多铸几个（`zcodeCaptchaPoolMaxPerRound`）。
+pub const KEY_CAPTCHA_POOL_MAX_PER_ROUND: &str = "zcodeCaptchaPoolMaxPerRound";
+
+/// 默认库存目标：3 个（原 `POOL_TARGET` 硬编码值）。一个够「下一条请求立刻
+/// 有得用」，又不至于铸一堆在 120 秒 TTL 内用不掉的（白白烧阿里云风控配额）。
+pub const DEFAULT_CAPTCHA_POOL_TARGET: i64 = 3;
+/// 默认轮询间隔：2500 毫秒（原 `POLL_MS` 硬编码值），「库存见底到补上」的平滑窗口。
+pub const DEFAULT_CAPTCHA_POOL_POLL_MS: i64 = 2_500;
+/// 默认单轮铸造上限：1 个（原 `MAX_PER_ROUND` 硬编码值）。SDK 同一实例连着
+/// 铸会互相干扰，默认一轮一个最稳。
+pub const DEFAULT_CAPTCHA_POOL_MAX_PER_ROUND: i64 = 1;
+
+/// 库存目标的合法范围 1~10：上限取「吸收突发」够用的量级 —— 目标越大，
+/// 无流量时过期作废的令牌越多（120 秒 TTL），烧的是阿里云风控配额。
+pub const CAPTCHA_POOL_MIN_TARGET: i64 = 1;
+pub const CAPTCHA_POOL_MAX_TARGET: i64 = 10;
+/// 轮询间隔的合法范围 1000~30000 毫秒：下限以下纯浪费本地往返，上限以上
+/// 「缺货到补上」的窗口会长到失去意义。轮询只读库存不铸造，太快不会多铸。
+pub const CAPTCHA_POOL_MIN_POLL_MS: i64 = 1_000;
+pub const CAPTCHA_POOL_MAX_POLL_MS: i64 = 30_000;
+/// 单轮铸造上限的合法范围 1~5：连铸之间固定隔 500ms，5 个已是一轮连铸
+/// 半分多钟都不到的量；再大单轮触发上游风控的风险显著上升。
+pub const CAPTCHA_POOL_MIN_MAX_PER_ROUND: i64 = 1;
+pub const CAPTCHA_POOL_MAX_MAX_PER_ROUND: i64 = 5;
+
+/// ZCode 验证码令牌池的补货节奏（设置页「网关 → 验证码令牌池」区域）。
+///
+/// 与 `QueueSettings` 同一取舍：铸造器每轮轮询 stats、转发层每条活动套餐
+/// 请求都要判一次「库存够不够」，取一份 `Copy` 快照即可。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptchaPoolSettings {
+    /// 库存目标（低于它前端才补铸）
+    pub target: i64,
+    /// 铸造器轮询间隔（毫秒）
+    pub poll_ms: i64,
+    /// 铸造器一轮最多铸几个
+    pub max_per_round: i64,
+}
+
+impl Default for CaptchaPoolSettings {
+    fn default() -> Self {
+        Self {
+            target: DEFAULT_CAPTCHA_POOL_TARGET,
+            poll_ms: DEFAULT_CAPTCHA_POOL_POLL_MS,
+            max_per_round: DEFAULT_CAPTCHA_POOL_MAX_PER_ROUND,
+        }
+    }
+}
+
+/// 验证码令牌池的**部分**更新入参（`None` = 该项不动）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CaptchaPoolPatch {
+    pub target: Option<i64>,
+    pub poll_ms: Option<i64>,
+    pub max_per_round: Option<i64>,
+}
+
+// ─── 账号路由（策略 / 会话粘性 / 失败退避 / 限流垫底 / 熔断）─────────
+
+/// 路由策略：候选账号怎么排序（`routingStrategy`）。
+///
+///   - `Order`：队列位次（优先级数字）就是一切 —— 现状行为；
+///   - `Rotate`：每条请求轮换到下一位（新会话的起点由位次决定），均摊用量；
+///   - `Usage`：用量占比最低的先用（没有读数的账号按位次排在有读数的后面）。
+///
+/// 智能按窗口重置、手动固定两档讨论后**不做**（用户拍板：只留三种）。
+pub const KEY_ROUTING_STRATEGY: &str = "routingStrategy";
+/// 会话粘性：同一会话尽量跟住答过它的账号（`routingSticky`）。
+///
+///   - `Auto`：跟住，直到上游缓存不值得续（约 5 分钟无往来）；
+///   - `Session`：跟住更久（6 小时内同会话同账号）；
+///   - `Turn`：只在单条请求内不换号（与转发既有行为一致，跨请求不粘）；
+///   - `Off`：每条请求独立选。
+pub const KEY_ROUTING_STICKY: &str = "routingSticky";
+/// 失败退避：转发失败的账号休息一会儿再回来（`routingFailoverBackoff`，默认开）
+pub const KEY_ROUTING_FAILOVER_BACKOFF: &str = "routingFailoverBackoff";
+/// 限流垫底（Sink）：还有额度时被 429 的账号排到队尾，轮一圈才回来
+/// （`routingSink`，默认开）
+pub const KEY_ROUTING_SINK: &str = "routingSink";
+/// 熔断开关（`routingBreakerEnabled`，默认关）
+pub const KEY_ROUTING_BREAKER_ENABLED: &str = "routingBreakerEnabled";
+/// 熔断阈值：连续失败多少次后熔断（`routingBreakerThreshold`）
+pub const KEY_ROUTING_BREAKER_THRESHOLD: &str = "routingBreakerThreshold";
+/// 熔断时长（秒）：熔断后过多久放行试一次（`routingBreakerTimeoutSeconds`）
+pub const KEY_ROUTING_BREAKER_TIMEOUT: &str = "routingBreakerTimeoutSeconds";
+/// 恢复阈值：熔断放行后要连续成功几次才算恢复（`routingBreakerSuccessThreshold`）
+pub const KEY_ROUTING_BREAKER_SUCCESS: &str = "routingBreakerSuccessThreshold";
+
+pub const ROUTING_STRATEGY_ORDER: &str = "order";
+pub const ROUTING_STRATEGY_ROTATE: &str = "rotate";
+
+pub const STICKY_OFF: &str = "off";
+pub const STICKY_TURN: &str = "turn";
+pub const STICKY_SESSION: &str = "session";
+pub const STICKY_AUTO: &str = "auto";
+
+/// 熔断阈值合法范围：1~20 次
+pub const ROUTING_BREAKER_MIN_THRESHOLD: i64 = 1;
+pub const ROUTING_BREAKER_MAX_THRESHOLD: i64 = 20;
+/// 熔断时长合法范围：10~600 秒
+pub const ROUTING_BREAKER_MIN_TIMEOUT: i64 = 10;
+pub const ROUTING_BREAKER_MAX_TIMEOUT: i64 = 600;
+/// 恢复阈值合法范围：1~10 次
+pub const ROUTING_BREAKER_MIN_SUCCESS: i64 = 1;
+pub const ROUTING_BREAKER_MAX_SUCCESS: i64 = 10;
+
+/// 路由策略（`RouteStrategy` 的 Rust 形态；配置里存 `as_str`）
+///
+/// 两档：顺序优先（队列第 1 位接走所有请求）与负载均衡（逐请求轮换）。
+/// 「余额优先（usage）」已下线（2026-10，按用户要求移除）—— 见 `from_id` 的兜底说明。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteStrategy {
+    Order,
+    Rotate,
+}
+
+impl RouteStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Order => ROUTING_STRATEGY_ORDER,
+            Self::Rotate => ROUTING_STRATEGY_ROTATE,
+        }
+    }
+
+    /// 配置值 → 策略。**未知值一律回落顺序优先**（与旧行为一致）。
+    ///
+    /// 已下线的 `"usage"`（余额优先）单独归到**负载均衡**而不是默认档：那种配置是
+    /// 用户当初显式选的「谁空谁上」，语义上最接近的是「把负载摊开」（rotate），
+    /// 静默退回「排第 1 的接走所有请求」会与他的本意相反。
+    pub fn from_id(value: &str) -> Self {
+        match value {
+            ROUTING_STRATEGY_ROTATE | "usage" => Self::Rotate,
+            _ => Self::Order,
+        }
+    }
+}
+
+/// 会话粘性档位（`StickyMode`）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StickyMode {
+    Off,
+    Turn,
+    Session,
+    Auto,
+}
+
+impl StickyMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => STICKY_OFF,
+            Self::Turn => STICKY_TURN,
+            Self::Session => STICKY_SESSION,
+            Self::Auto => STICKY_AUTO,
+        }
+    }
+
+    pub fn from_id(value: &str) -> Self {
+        match value {
+            STICKY_SESSION => Self::Session,
+            STICKY_TURN => Self::Turn,
+            STICKY_OFF => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+
+    /// 粘性记录的存活时长（毫秒）；`None` = 不粘（Off / Turn）
+    pub fn ttl_ms(&self) -> Option<i64> {
+        match self {
+            Self::Auto => Some(5 * 60 * 1000),
+            Self::Session => Some(6 * 60 * 60 * 1000),
+            Self::Off | Self::Turn => None,
+        }
+    }
+}
+
+/// 账号路由设置（账号页「路由」区域）。转发层逐请求取一次快照
+/// （`Copy`），改完设置下一个请求立即生效 —— 与超时 / 重试同一模式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoutingSettings {
+    pub strategy: RouteStrategy,
+    pub sticky: StickyMode,
+    pub failover_backoff: bool,
+    pub sink: bool,
+    pub breaker_enabled: bool,
+    pub breaker_threshold: i64,
+    pub breaker_timeout_seconds: i64,
+    pub breaker_success_threshold: i64,
+}
+
+impl Default for RoutingSettings {
+    fn default() -> Self {
+        Self {
+            strategy: RouteStrategy::Order,
+            sticky: StickyMode::Auto,
+            failover_backoff: true,
+            sink: true,
+            breaker_enabled: false,
+            breaker_threshold: 5,
+            breaker_timeout_seconds: 60,
+            breaker_success_threshold: 2,
+        }
+    }
+}
+
+/// 路由设置的**部分**更新入参（`None` = 该项不动）
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RoutingPatch {
+    pub strategy: Option<RouteStrategy>,
+    pub sticky: Option<StickyMode>,
+    pub failover_backoff: Option<bool>,
+    pub sink: Option<bool>,
+    pub breaker_enabled: Option<bool>,
+    pub breaker_threshold: Option<i64>,
+    pub breaker_timeout_seconds: Option<i64>,
+    pub breaker_success_threshold: Option<i64>,
 }

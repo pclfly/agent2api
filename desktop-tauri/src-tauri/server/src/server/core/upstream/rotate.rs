@@ -43,7 +43,9 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
+use crate::server::config;
 use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::providers::readiness;
 use crate::server::core::routing;
 use crate::server::errors::{self, GatewayError};
 use crate::server::logging;
@@ -86,13 +88,18 @@ pub(super) async fn session_for(
 
 /// 本次请求使用的账号（对照 Node 的 selectTargetAccount，三级顺序）。
 ///
-///   1. 按**全局**优先级选（跳过禁用、余额不足、限额冷却中与已达并发上限的
-///      账号），逐个向前找——跳过没有可用凭证的记录（避免选到空账号）；
+///   1. 按设置页选定的**路由策略**排一份候选清单（`routing::plan_route`：
+///      顺序优先 = 位次；负载均衡 = 每条请求轮换），
+///      跳过禁用、余额不足、限额冷却中与已达并发上限的账号，逐个
+///      向前找——跳过没有可用凭证的记录（避免选到空账号）；
 ///   2. 剩下的启用账号都在限额冷却期 / 已达并发上限 → 先在「未达并发上限」
 ///      的账号里挑恢复最早的一个试一次；一个都没有（全部达到并发上限）→
 ///      按**余量**挤占账号强塞（取舍见下方代码处的说明），
 ///      把上游真实的 429（含恢复时间）返回给客户端；
 ///   3. 全部禁用（或全部余额不足）→ 明确报 503，绝不回退到已禁用 / 欠费账号。
+///
+/// 会话粘性（`settings.sticky` ≠ off 且 `conv_key` 非空）在第一级之前生效：
+/// 命中的账号可用时直接置顶（`plan_route` 已把它排到首位并写明原因）。
 ///
 /// 候选集合 = `providers` 里各家的全部账号（见模块头）。`providers` 非空。
 ///
@@ -100,25 +107,29 @@ pub(super) async fn session_for(
 /// `routing::CooldownKeys`）—— 传请求名会让别名请求的冷却查不到、已限额的
 /// 账号被反复选中。第三级「恢复最早的那个」同样按真名读 `resetAt`。
 ///
-/// `session_key` 是会话粘性键（`upstream::session_affinity::derive_affinity_key`
-/// 从请求体派生；没有 messages 时为 None）：同一对话固定同一账号（prompt cache
-/// 命中），不同对话之间**轮询**分摊（见 `routing::pick_account_for_session`）。
-///
 /// `pinned` 是「这一轮只准用这个账号」（模型测试专用，见
 /// [`super::ForwardRequest::pinned_account`]）：候选池先被它收窄成一个账号，
 /// 上面那三级顺序对**那一个账号**照常生效 —— 它在限额冷却期时仍会被选中发一次，
 /// 这正是测试要的（把上游真实的 429 与恢复时间带回来，而不是换别人跑一遍）。
 ///
-/// `model` 用于**按版本收窄候选池**（WorkBuddy 的版本独有模型，见
+/// `model` 用于**按版本收窄候选池**（WorkBuddy / Qoder 的版本独有模型，见
 /// [`accounts_for_model`]）：拆家后两个地区是两家 provider，收窄退化为
 /// 「按显式版本后缀点名一家」，两版都有的模型不收窄。
+///
+/// `conv_key` 是会话粘性键（`route_state::conversation_key` 的产物；空串 =
+/// 不粘）。粘性命中会刷新该键的最近使用时刻 —— 「缓存还在值上」的计时就在
+/// 这一步续。
+///
+/// 返回的 `RouteTarget::decision` 是本次选路的**决策快照**（排序 + 每位原因 +
+/// 被跳过者），由调用方挂进 telemetry 落请求日志 ——「上一个请求为什么走它」
+/// 的数据源。
 pub(super) async fn select_target_account(
     service: &UpstreamService,
     providers: &[&str],
     keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
-    session_key: Option<&str>,
     pinned: Option<&str>,
+    conv_key: &str,
     model: &str,
 ) -> Result<RouteTarget, GatewayError> {
     let accounts = accounts_for_model(service, providers, pinned, model);
@@ -131,6 +142,7 @@ pub(super) async fn select_target_account(
             proxy: None,
             priority: None,
             proxy_notice: None,
+            decision: None,
         });
     }
 
@@ -141,27 +153,48 @@ pub(super) async fn select_target_account(
     // 在途计数快照取一次（锁是纳秒级的内存操作，见 connections.rs）：
     // 第一级与第二级共用同一份，两级看到的「谁在忙」是同一时刻的事实。
     let counts = connection_counts(service);
-    let mut excluded: Vec<String> = tried_ids.to_vec();
     let now = logging::now_ms();
-    loop {
-        let picked = routing::pick_account_for_session(
-            &candidates,
-            keys,
-            &counts,
-            &excluded,
-            now,
-            session_key,
-        );
-        let Some(picked) = picked else {
-            break;
-        };
-        let Some(id) = routing::account_id(&picked).map(str::to_string) else {
-            break;
-        };
-        if let Some(entry) = service.store.get_session_by_id(&id) {
-            return Ok(with_proxy_notice(picked, entry.proxy, entry.proxy_error, id));
+    // ── 策略与运行期状态快照（route_state.rs 的那份内存，读不改写）────
+    // 粘性查找在这里顺手续了最近使用时刻 —— 「auto 档 5 分钟没往来就放手」
+    // 的计时由它维持。
+    let settings = config::routing_settings();
+    let ttl = routing::sticky_ttl_ms(settings.sticky);
+    let snap = service.route.snapshot(conv_key, now, ttl);
+    // 轮转游标只在「本请求的第一次选路」前进：429 顺延的后续选路沿用同一
+    // 起点往后走，否则一条请求会连跳好几位。粘性命中的轮次不前进 —— 会话
+    // 一直粘着同一个账号时，轮转的「下一棒」留给新会话。
+    let cursor = if settings.strategy == config::RouteStrategy::Rotate
+        && tried_ids.is_empty()
+        && pinned.is_none()
+        && snap.sticky_hit.is_none()
+    {
+        Some(service.route.rotate_take(keys.request_model(), candidates.len()))
+    } else {
+        None
+    };
+    let meta = routing::PlanMeta {
+        strategy: settings.strategy,
+        sunk: &snap.sunk,
+        resting: &snap.resting,
+        open: &snap.open,
+        limiter_blocked: &balance_blocked_ids,
+        cursor,
+        sticky_account: snap.sticky_hit.as_deref(),
+    };
+    let plan = routing::plan_route(&candidates, keys, &counts, tried_ids, now, &meta);
+    let decision = decision_json(&plan, &settings, now);
+    let mut excluded: Vec<String> = tried_ids.to_vec();
+    for entry in &plan.ordered {
+        if let Some(picked_session) = service.store.get_session_by_id(&entry.id) {
+            return Ok(with_proxy_notice(
+                entry.account.clone(),
+                picked_session.proxy,
+                picked_session.proxy_error,
+                entry.id.clone(),
+                Some(decision),
+            ));
         }
-        excluded.push(id);
+        excluded.push(entry.id.clone());
     }
 
     let enabled: Vec<Value> = candidates
@@ -233,7 +266,13 @@ pub(super) async fn select_target_account(
         if let Some(account) = squeeze_by_headroom(&enabled, &counts, tried_ids, keys, now) {
             if let Some(id) = routing::account_id(&account).map(str::to_string) {
                 if let Some(entry) = service.store.get_session_by_id(&id) {
-                    return Ok(with_proxy_notice(account, entry.proxy, entry.proxy_error, id));
+                    return Ok(with_proxy_notice(
+                        account,
+                        entry.proxy,
+                        entry.proxy_error,
+                        id,
+                        Some(decision),
+                    ));
                 }
             }
         }
@@ -241,7 +280,13 @@ pub(super) async fn select_target_account(
     if let Some(account) = best_effort {
         if let Some(id) = routing::account_id(&account).map(str::to_string) {
             if let Some(entry) = service.store.get_session_by_id(&id) {
-                return Ok(with_proxy_notice(account, entry.proxy, entry.proxy_error, id));
+                return Ok(with_proxy_notice(
+                    account,
+                    entry.proxy,
+                    entry.proxy_error,
+                    id,
+                    Some(decision),
+                ));
             }
         }
     }
@@ -252,6 +297,7 @@ pub(super) async fn select_target_account(
         proxy: None,
         priority: None,
         proxy_notice: None,
+        decision: Some(decision),
     })
 }
 
@@ -278,20 +324,41 @@ pub(super) use crate::server::core::routing::CooldownKeys;
 /// 收窄只做「过滤」，不报错也不回退：钉住的账号不在这几家（账号被删了、
 /// 或认错了家）时得到的是空池 —— 上游那条路径会照常给出「这些家都没有账号」
 /// 的既有语义，不会静默换一个账号去跑。
+///
+/// ── 本地就绪闸门也在这里摘人 ────────────────────────────
+/// 被 `readiness` 挡住的 provider 整个不进候选池（判据与理由见那个模块的模块头：
+/// 那是一条**还没出本机就注定失败**的通道，比如 ZCode 活动套餐在 headless 上没有
+/// 验证码令牌）。摘在这里而不是摘在 `pick_account_by_priority` 里，是因为三级选路
+/// （正常挑 → 恢复最早 → 按余量挤占）读的都是这一份池子 —— 写在下游任一级的话，
+/// 闸门挡不住另外两级，而第二、三级恰恰是「明知可能失败也要再试一次」的地方。
+///
+/// **全被挡住时照旧返回原池**：闸门是优化，不是准入。如果 `providers` 里每一家
+/// 都被挡住（或这次只点名了被挡的那一家），宁可让请求照原路走一遍、把错误如实
+/// 落在这条通道上，也不要在候选池层面伪装成「这家没有账号」—— 那会让第三级的
+/// 文案说出不存在的事实，用户会去查一个本来有账号的账号页。
 pub(super) fn accounts_in_providers(
     service: &UpstreamService,
     providers: &[&str],
     pinned: Option<&str>,
 ) -> Vec<Value> {
     let snapshot = service.store.list_accounts();
-    routing::accounts_of(&snapshot)
+    let accounts: Vec<Value> = routing::accounts_of(&snapshot)
         .into_iter()
         .filter(|account| providers.contains(&provider_of(account)))
         .filter(|account| match pinned {
             Some(id) => routing::account_id(account) == Some(id),
             None => true,
         })
-        .collect()
+        .collect();
+    let routable: Vec<Value> = accounts
+        .iter()
+        .filter(|account| !readiness::gated(provider_of(account)))
+        .cloned()
+        .collect();
+    if routable.is_empty() {
+        return accounts;
+    }
+    routable
 }
 
 /// 候选账号池 + **按模型所属版本收窄**（WorkBuddy / Qoder 的地区亲和）。
@@ -395,6 +462,7 @@ pub(super) fn with_proxy_notice(
     proxy: Value,
     proxy_error: Option<String>,
     account_id: String,
+    decision: Option<Value>,
 ) -> RouteTarget {
     let mut notice = proxy_error.map(|error| {
         format!(
@@ -418,6 +486,7 @@ pub(super) fn with_proxy_notice(
         account: Some(account),
         proxy: resolved,
         proxy_notice: notice,
+        decision,
     }
 }
 
@@ -551,8 +620,10 @@ pub(super) fn connection_counts(service: &UpstreamService) -> HashMap<String, us
 /// 下一个可用账号（全局队列，限定在 `providers` 各家的账号里，跳过已尝试的）。
 ///
 /// `keys` 见 [`select_target_account`]：冷却按各家真名判定。
-/// 走与第一级选路同一个 `pick_account_by_priority`，并发上限的过滤
-/// （与软上限口径）由此自动获得 —— 换号顺延不会把请求塞回一个已达上限的账号。
+/// 排序走与第一级选路**同一个** `routing::plan_route`（同一策略、同一份运行期
+/// 状态快照，只是不做粘性查找、不前进轮转游标）—— 429 降级 / 失败顺延接的
+/// 「下一个」与队列面板画的顺序因此一致；并发上限的过滤由此自动获得，
+/// 换号顺延不会把请求塞回一个已达上限的账号。
 ///
 /// `pinned` 见 [`select_target_account`]：钉住账号时，候选池里只有那一个账号、
 /// 它已经在 `tried_ids` 里 —— 本函数因此必然返回 None，也就是「不顺延」。
@@ -568,9 +639,54 @@ pub(super) fn pick_next_account(
     let accounts = accounts_for_model(service, providers, pinned, model);
     // 换号顺延与第一级选路同一份候选剔除：被限制器拦下的账号不会在 429 之后
     // 被当作「下一个」重新塞进来
-    let (candidates, _balance_blocked) = filter_limiter_blocked(&accounts, pinned);
+    let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, pinned);
     let counts = connection_counts(service);
-    routing::pick_account_by_priority(&candidates, keys, &counts, tried_ids, logging::now_ms())
+    let now = logging::now_ms();
+    let settings = config::routing_settings();
+    // 顺延不走粘性（粘住的是「答对了的账号」，刚失败的那个不该被粘回来）；
+    // 空会话键使 sticky_lookup 直接返回 None，其余快照（垫底 / 休息 / 熔断）
+    // 照常参与排序
+    let snap = service.route.snapshot("", now, 0);
+    let meta = routing::PlanMeta {
+        strategy: settings.strategy,
+        sunk: &snap.sunk,
+        resting: &snap.resting,
+        open: &snap.open,
+        limiter_blocked: &balance_blocked_ids,
+        cursor: None,
+        sticky_account: None,
+    };
+    let plan = routing::plan_route(&candidates, keys, &counts, tried_ids, now, &meta);
+    plan.ordered.into_iter().next().map(|entry| entry.account)
+}
+
+/// 选路决策快照（请求日志「路由回放」的数据源）。
+///
+/// 有界：排序清单与被跳过者各最多带 12 条 —— 账号几十个时全部带上只会
+/// 让每条请求日志膨胀，而前 12 位已足以回答「为什么是它、为什么不是那个」。
+fn decision_json(
+    plan: &routing::RoutePlan,
+    settings: &config::RoutingSettings,
+    now: i64,
+) -> Value {
+    let _ = now;
+    let entry_json = |entry: &routing::PlanEntry| {
+        json!({
+            "id": entry.id,
+            "name": entry.name,
+            "provider": entry.provider,
+            "state": entry.state,
+            "reason": entry.reason,
+        })
+    };
+    json!({
+        "strategy": settings.strategy.as_str(),
+        "sticky": settings.sticky.as_str(),
+        "stickyHit": plan.sticky_hit,
+        "picked": plan.ordered.first().map(|entry| entry.id.clone()).unwrap_or_default(),
+        "ordered": plan.ordered.iter().take(12).map(entry_json).collect::<Vec<_>>(),
+        "blocked": plan.blocked.iter().take(12).map(entry_json).collect::<Vec<_>>(),
+    })
 }
 
 /// 限制器软跳过的候选剔除：**余额不足**（限制器余额 skip 规则命中：最近读数

@@ -25,6 +25,7 @@ use axum::extract::State;
 use axum::response::Response;
 use serde_json::Value;
 
+use crate::server::config;
 use crate::server::core::providers::zcode;
 use crate::server::errors::management_error;
 use crate::server::http::{ok_json, parse_body};
@@ -32,13 +33,11 @@ use crate::server::logging;
 use crate::server::ServerState;
 use crate::server::core::providers::zcode::captcha;
 
-/// 界面希望维持的库存目标（低于它就该补货）。
-///
-/// 取 3：一个够「下一条请求立刻有得用」，又不至于铸一堆用不掉（令牌 2 分钟就
-/// 过期，铸太多纯属浪费风控配额 —— 阿里云对铸造频率有风控，参考实现为此专门
-/// 做了限速与熔断）。高并发场景下池子会短暂见底，那时的正确行为是让请求如实
-/// 失败并提示，而不是无节制地铸。
-const POOL_TARGET: usize = 3;
+/// 界面希望维持的库存目标（低于它就该补货）等**节奏设置**已改成可配置：
+/// 键与端点见 `zcode_captcha_pool_api`（设置页「网关 → 验证码令牌池」）。
+/// 原先这里硬编码 `POOL_TARGET = 3`——那是三项的出厂默认值（目标 / 轮询
+/// 间隔 / 单轮上限 = 3 / 2500 / 1），现在是 `config::CaptchaPoolSettings`
+/// 的默认，取值口径与含义都搬了过去，没有变。
 
 /// `GET /api/zcode/captcha` —— 池子概况 + 「界面该不该铸造」的判据
 fn stats_json(state: &ServerState) -> Value {
@@ -46,16 +45,29 @@ fn stats_json(state: &ServerState) -> Value {
     let (start_plan_accounts, account_id) = start_plan_accounts(state);
     // 先算好「库存够不够」（`body` 随后要被可变借用，读值得在借用之前取）
     let ready = body.get("ready").and_then(Value::as_u64).unwrap_or(0);
+    let pool = config::captcha_pool_settings();
     if let Some(object) = body.as_object_mut() {
-        object.insert("target".to_string(), Value::from(POOL_TARGET as u64));
+        object.insert("target".to_string(), Value::from(pool.target as u64));
         object.insert(
             "startPlanAccounts".to_string(),
             Value::from(start_plan_accounts as u64),
         );
-        // 铸造器唯一需要的那个布尔：有账号要走这条路、且库存不足目标
+        // 铸造器唯一需要的那个布尔：有账号要走这条路、库存不足目标、
+        // **且上游此刻确实要令牌**。第三个条件是新加的（`skip_model_request`）：
+        // 免码期还让界面每隔几秒去阿里云铸一枚，等于白烧风控配额 —— 那东西
+        // 撞上限之后是整段铸不出来（参考实现为此做过熔断），比多等一会儿严重。
         object.insert(
             "needsTokens".to_string(),
-            Value::Bool(start_plan_accounts > 0 && ready < POOL_TARGET as u64),
+            Value::Bool(
+                captcha::required() && start_plan_accounts > 0 && ready < pool.target as u64,
+            ),
+        );
+        // 顺手把铸造器的另外两个节奏参数一起下发：轮询间隔与单轮上限。
+        // 铸造器每轮都拉这份响应，改设置后下一轮就按新值跑（热生效）。
+        object.insert("pollMs".to_string(), Value::from(pool.poll_ms as u64));
+        object.insert(
+            "maxPerRound".to_string(),
+            Value::from(pool.max_per_round as u64),
         );
         // 顺手给一个**可用的账号 id**：铸造器还要拿它去问上游那份风控配置
         // （sceneId / prefix / region）。让界面自己去读账号列表会把「哪些账号
@@ -63,6 +75,14 @@ fn stats_json(state: &ServerState) -> Value {
         object.insert(
             "captchaAccountId".to_string(),
             account_id.map(Value::String).unwrap_or(Value::Null),
+        );
+        // **本地闸门**的当前状态（见 `providers::readiness`）：令牌池空过一次，
+        // 选路就会暂时绕开这一家。界面与排障都要能看见这件事 —— 否则「明明有
+        // 令牌了请求还是不打到这一家」与「这家坏了」在现象上完全一样。
+        // 数组为空 = 没有闸门挡着。
+        object.insert(
+            "localGates".to_string(),
+            Value::Array(crate::server::core::providers::readiness::snapshot()),
         );
     }
     body
@@ -151,7 +171,7 @@ pub async fn push_captcha(State(state): State<ServerState>, body: Bytes) -> Resp
             "🔐 人机验证令牌入池 {} 个（库存 {}，目标 {}）",
             accepted,
             captcha::ready(),
-            POOL_TARGET,
+            config::captcha_pool_settings().target,
         ),
     );
     let mut response = stats_json(&state);

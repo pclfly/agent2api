@@ -16,10 +16,15 @@
  * `wbAccountsFilters` / `wbAccountsGroups` 四个对象在页外无任何引用，已随本页合并
  * 进岛里不再挂 window —— 见最终报告）。
  *
- * ── 全局一条队列（优先级不再按 provider 分段）────────────────────
- * 优先级在后端是**全局唯一**的一条队列：四家账号混排，转发时按优先级从小到大逐个
- * 尝试，跳过禁用 / 不支持该模型 / 该模型限流中的账号（见 priority.rs 与 rotate.rs）。
- * 所以筛选与计数都按这一条队列算，positionMap 的序号就是整张表的行序。
+ * ── 全局一条队列 + 按家分组（2026-10 账号页分组化）───────────────
+ * 优先级在后端仍是**全局唯一**的一条队列：转发时按优先级从小到大逐个尝试，跳过
+ * 禁用 / 不支持该模型 / 该模型限流中的账号（见 priority.rs 与 rotate.rs）。
+ * 界面上按家分组显示（`accountGroups`），组顺位 = 各家最靠前的账号的先后 ——
+ * 两者能对上，靠的是队列不变量「同一家的账号连续」（后端新增/导入落在本组末尾、
+ * 拖拽由 `POST /api/accounts/reorder` 整队重编号，见 store_order.rs）。
+ * 于是旧的「全局第 N 位」（`positionMap`）不再直接显示在行上：行上是**组内序号**，
+ * 队列的先后由「组顺位 + 组内序号」共同表达。positionMap 保留给需要绝对位置的地方
+ * （模型测试的候选清单、⋯ 菜单的「已在第一位」判定）。
  */
 
 import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type LimiterRule, type RateLimitInfo, type TokenReading, type UsageEntry } from './accounts-shared'
@@ -67,6 +72,20 @@ type ProviderFeatures = {
    */
   usageDetail?: boolean
   /**
+   * 余额格的读数旁边要不要挂「积分明细」入口（逐份积分包：面额 / 已用 / 剩余 +
+   * 领取 → 到期）—— 只有 WorkBuddy 两家与 Trae。
+   *
+   * 与 `usageDetail` 的差别是**动不动排版**：那个会把这格换成「套餐徽标 + 读数
+   * 按钮」的整套两行形态（CodeArts 的余额是两台网关的加总，一行分不出权益差别，
+   * 所以值得换）；这两家的读数本身（WorkBuddy 的「可用 N」、Trae 的套餐名 +
+   * 进度条 + 剩 x / 共 y）已经回答了用户最常问的那句，明细是**加一层**而不是
+   * 换一层 —— 换过去 Trae 那格会丢掉进度条。
+   *
+   * 判据同样按能力位而不是形状探测：后端 `credits[]` 是这两家（以及以后愿意
+   * 照这个行形状出数据的家）的**承诺** —— 点开一定有逐份读数，不是点开一个空框。
+   */
+  creditDetail?: boolean
+  /**
    * 这一家「并发上限」的默认值（>0 = 本家**没有**「不限」这一档）。
    * CodeArts 的 3 是上游硬顶（超过直接回 HTTP 400，且那是账号级冲突、不降级换号），
    * 所以那一家把 `0` 解释成「按默认 3」而不是「不做并发过滤」；后端同一口径写在两处
@@ -92,12 +111,17 @@ type ProviderFeatures = {
  * 用户才有「去配置」的入口。
  */
 const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
-  workbuddy: { usage: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 余额格读数旁边挂「积分明细」：后端 `query_usage` 在既有
+  //   积分简报之外还出 `credits[]`（逐份积分包的面额 / 已用 / 剩余 / 领取 / 到期，
+  //   见 providers::workbuddy::adapter 的 query_usage）。两地区能力一致，
+  //   两项都要登记（漏一个那一家就掉进 GENERIC_FEATURES）。
+  //   enterprise 账号没有资源包、后端不挂 `credits`，界面按空数组自然退回原样。
+  workbuddy: { usage: true, creditDetail: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
   // WorkBuddy 国际版（拆家后的第二家，见 providers::workbuddy::region）：
   //   `edition: false` 是因为注册名「WorkBuddy 国际版」自带地区，再拼一次会
   //   得到「WorkBuddy 国际版 国际版」（`editionSuffix` 虽有「名字已含就不拼」
   //   的兜底，这里直接写 false 更清楚，与 `zcode-intl` 同款）。
-  'workbuddy-intl': { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  'workbuddy-intl': { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
   raccoon: { usage: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
   catpaw: { usage: true, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
   // AutoClaw 两个地区能力完全一致，差别只在域名；两项都必须登记 —— 漏了哪一项，
@@ -150,7 +174,11 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 而不是一个地区的两种拼法，国际版将来接入时另立 provider id，不把它做成账号字段。
   // `usage: true` 对应 providers::trae::usage（上游两份账：ide_user_ent_usage 的权益包/
   // 积分池 + ide_user_pay_status 的快请求与 SOLO 并发）。
-  trae: { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 同一份 ent_usage 里还读得到**逐份权益包**的
+  //   `start_time` / `expire_time`（领取 → 到期），后端摊成 `credits[]`
+  //   （见 providers::trae::usage 的 credit_rows）。签到发的包会按天堆起来，
+  //   哪一份先作废只有这份清单答得上来。
+  trae: { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
   // Loomy（讯飞）。各位各有出处：
   // `usage: true` 对应 providers::loomy::balance —— 余额是**双账户**（永久积分 +
   //   每日赠送积分，读 `GET /api/v2/points/records` 的摘要字段），界面上两张卡都列。
@@ -174,6 +202,19 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // MiniMax Code（中国版）：积分可查（credit/details），标识取账号 id
   // （token 非 JWT、没有稳定用户字段）。
   minimax: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  // OfficeAce（华为云果办 / OfficeClaw）。各位各有出处：
+  // `usage: true` —— 额度/积分要**控制面签名**（V11-HMAC-SHA256 打 `/v1/subscription`），
+  //   那条链已经实现（`officeace/balance.rs` + 适配器 `query_usage`），所以余额按钮与
+  //   积分列都开。⚠️ 只导入网关 Basic 那一对、没有控制面凭据的账号查不到余额，
+  //   服务端回 400 `usage_not_configured`，界面按「未配置查询」如实显示（不是报错）。
+  // `edition: false` —— 单一入口（自助 OAuth 浏览器登录 / 粘贴网关 Basic 凭据），
+  //   没有国际版。
+  // `expiry: 'expiresAt'` —— 控制面临时凭据约 2 小时到期；只导入网关 Basic
+  //   凭据时没有这个字段，界面不渲染「有效期」（那一半本来也不过期）。
+  // `identifier: 'id'` —— 账号标识渲染的是**账号 id**（`officeace-<hash>`，
+  //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
+  //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
+  officeace: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
 }
 
 /**
@@ -749,6 +790,16 @@ export function supportsUsageDetail(account: AccountRecord | null | undefined): 
 }
 
 /**
+ * 余额格的读数旁边要不要挂「积分明细」入口（见 ProviderFeatures.creditDetail）。
+ *
+ * 与 `supportsUsageDetail` 是两件事：那个是**整套两行形态**（会替掉读数本来的
+ * 排版），这个是**只加一个入口**（读数末尾的小箭头）。所以判据也不能共用。
+ */
+export function supportsCreditDetail(account: AccountRecord | null | undefined): boolean {
+  return Boolean(providerFeatures(providerOf(account)).creditDetail)
+}
+
+/**
  * 上游套餐名是否为免费版（`^free$`，不区分大小写）。
  *
  * 判定必须比**上游原始名**（后端 `plan_name` 取 `package_name_en`，现网给过 `Free`），
@@ -842,9 +893,13 @@ export function welfareTodoTitle(state: WelfareState): string {
   return t('{tried}探测并领取官方每日登录赠送的套餐积分（到账进套餐积分，不增加福利模型 token 池）', { tried })
 }
 
-/* ─── 筛选维度（provider / enabled / limit 三维各自独立）───── */
+/* ─── 筛选维度（provider / enabled / limit / q 四维各自独立）───
+   `provider` 是工具条最前那颗下拉（'all' = 不限）：分组之后「哪一家」虽然由页面
+   结构本身表达，但「只看某一家」仍是常用动作 —— 分组带收起得掉一家，却收不掉
+   其余那几家；账号多了之后，把别家整体请出视野正是筛选该干的事。
+   `q` 是搜索框（账号名 / 备注 / 邮箱 / 标识），与另外三维共用同一条可见性口径。 */
 
-export type AccountFilter = { provider: string; enabled: string; limit: string }
+export type AccountFilter = { provider: string; enabled: string; limit: string; q: string }
 
 /** 余额读数的查找口（账号 → `usageEntryOf` 的结果）；不传视作「都没有读数」 */
 export type UsageLookup = (account: AccountRecord) => UsageEntry | undefined
@@ -873,6 +928,24 @@ export function isLimitedNow(
     || tokenBlockedOf(account, tokenReadings)
 }
 
+/** 搜索词是否命中这条账号：账号名 / 备注名 / 邮箱 / 厂商标识 / id 任一含它就留下。
+ *  大小写不敏感（英文邮箱与 id 常见大小写混写）。空词命中一切。 */
+export function matchQuery(account: AccountRecord, filter: AccountFilter): boolean {
+  const q = String(filter.q || '').trim().toLowerCase()
+  if (!q) return true
+  const haystack = [
+    displayNameOf(account),
+    account?.name,
+    account?.nickname,
+    account?.email,
+    identifierOf(account),
+    account?.id,
+  ]
+  return haystack.some(value => String(value || '').toLowerCase().includes(q))
+}
+
+/** 提供商维度：'all' 不限；其余按 provider id 精确相等（与 `providerOf` 同一口径 ——
+ *  字段缺失的老记录归默认家，不会因为筛选而漏掉） */
 export function matchProvider(account: AccountRecord, filter: AccountFilter): boolean {
   return filter.provider === 'all' || providerOf(account) === filter.provider
 }
@@ -895,54 +968,58 @@ export function matchLimit(
   return filter.limit === 'limited' ? limited : !limited
 }
 
-/** 当前筛选条件下的可见账号（三个维度同时生效） */
+/** 单条账号是否通过当前筛选（四个维度的合取）。`visibleAccounts` 就是它在列表上的 filter */
+export function matchesFilter(
+  account: AccountRecord,
+  filter: AccountFilter,
+  usageOf?: UsageLookup,
+  tokenUsageOf?: TokenUsageLookup,
+): boolean {
+  return matchProvider(account, filter)
+    && matchEnabled(account, filter)
+    && matchLimit(account, filter, usageOf, tokenUsageOf)
+    && matchQuery(account, filter)
+}
+
+/** 当前筛选条件下的可见账号（四个维度同时生效） */
 export function visibleAccounts(
   all: AccountRecord[] | null | undefined,
   filter: AccountFilter,
   usageOf?: UsageLookup,
   tokenUsageOf?: TokenUsageLookup,
 ): AccountRecord[] {
-  return (all || []).filter(account => matchProvider(account, filter)
-    && matchEnabled(account, filter)
-    && matchLimit(account, filter, usageOf, tokenUsageOf))
+  return (all || []).filter(account => matchesFilter(account, filter, usageOf, tokenUsageOf))
 }
 
 /**
  * 分段计数：某分段显示的数字 = 「其余维度保持当前选择、本维度取该值」的账号数。
  * 「可见列表」与「分段计数」共用这一份口径 —— 否则徽标数字与点进去看到的结果会各算各的。
+ * 提供商那一维不给自己算分段（它是下拉，数字直接写在选项里，见 accounts-page），
+ * 但**要进其余分段的取景框**：切了家之后，状态 / 限额徽标就该跟着只数这一家。
  */
 export function filterCounts(
   all: AccountRecord[] | null | undefined,
   filter: AccountFilter,
-  summaries: Array<{ id: string }> | null | undefined,
   usageOf?: UsageLookup,
   tokenUsageOf?: TokenUsageLookup,
 ): Record<string, number> {
   const list = all || []
-  const scope = (except: 'provider' | 'enabled' | 'limit') => list.filter(account =>
-    (except === 'provider' || matchProvider(account, filter))
+  const scope = (except: 'enabled' | 'limit') => list.filter(account =>
+    matchProvider(account, filter)
     && (except === 'enabled' || matchEnabled(account, filter))
-    && (except === 'limit' || matchLimit(account, filter, usageOf, tokenUsageOf)))
+    && (except === 'limit' || matchLimit(account, filter, usageOf, tokenUsageOf))
+    && matchQuery(account, filter))
 
   const forEnabled = scope('enabled')
   const forLimit = scope('limit')
-  const forProvider = scope('provider')
-  const counts: Record<string, number> = {
+  return {
     enabledAll: forEnabled.length,
     enabled: forEnabled.filter(isEnabled).length,
     disabled: forEnabled.filter(a => !isEnabled(a)).length,
     limitAll: forLimit.length,
     normal: forLimit.filter(a => isEnabled(a) && !isLimitedNow(a, usageOf?.(a), tokenUsageOf?.(a))).length,
     limited: forLimit.filter(a => isEnabled(a) && isLimitedNow(a, usageOf?.(a), tokenUsageOf?.(a))).length,
-    providerAll: forProvider.length,
   }
-  // 摘要里每一家都要有键（没有账号的家显示 0 并置灰），否则它的徽标会停在旧数字上
-  ;(summaries || []).forEach(item => { counts[`p-${item.id}`] = 0 })
-  forProvider.forEach(account => {
-    const key = `p-${providerOf(account)}`
-    counts[key] = (counts[key] || 0) + 1
-  })
-  return counts
 }
 
 /**
@@ -972,6 +1049,69 @@ export function positionMap(all: AccountRecord[] | null | undefined): Map<string
   const map = new Map<string, { position: number; total: number }>()
   ordered.forEach((account, index) => map.set(account.id, { position: index + 1, total: ordered.length }))
   return map
+}
+
+/* ─── 分组（账号页的显示口径）────────────────── */
+
+export type AccountGroup = {
+  /** 这一组的家（provider id） */
+  provider: string
+  /** 家名（后端注册表的 label，取不到回落 id） */
+  label: string
+  /** 组顺位（1 起）：拖动整组改变的就是它 */
+  rank: number
+  /** 组内**全部**账号（按组内优先级升序，不受筛选影响）：组内序号、统计、以及
+   *  「整队重排」时拼队列都用它 —— 折叠起来的组在 DOM 里没有行，只有这里留着全量 */
+  members: AccountRecord[]
+  /** 组内**可见**的账号（members 里通过筛选的那些，顺序同上）：渲染用它 */
+  accounts: AccountRecord[]
+  enabled: number
+  disabled: number
+  limited: number
+}
+
+/**
+ * 按家分组：组序 = 各家**最靠前**那个账号的先后（组内按优先级升序，并列按加入时间）。
+ *
+ * 与后端 `priority::grouped_queue_order` 是同一份规则的同构实现（渲染层拿不到 Rust，
+ * 只能两处各写一遍 —— 改一处必须同步另一处）。两边的顺序之所以总是一致，靠的是
+ * 队列不变量「同一家的账号连续」：组序因此就等于真实队列里的先后。
+ * 拖完一次由后端按拖出来的顺序整队重编号，不变量继续成立。
+ *
+ * `keep` 是可见性谓词（筛选 / 搜索），**只过滤组内的行、不参与定组序**：筛选时
+ * 组序不跳动，被筛掉的行也不会让整组消失（组头还在，只是组内空了）。
+ */
+export function accountGroups(
+  all: AccountRecord[] | null | undefined,
+  keep?: ((account: AccountRecord) => boolean) | null,
+  usageOf?: UsageLookup,
+  tokenUsageOf?: TokenUsageLookup,
+): AccountGroup[] {
+  const ordered = (all || []).slice().sort(byPriorityOrder)
+  const providers: string[] = []
+  const members = new Map<string, AccountRecord[]>()
+  for (const account of ordered) {
+    const provider = providerOf(account)
+    if (!members.has(provider)) {
+      members.set(provider, [])
+      providers.push(provider)
+    }
+    members.get(provider)!.push(account)
+  }
+  return providers.map((provider, index) => {
+    const list = members.get(provider) || []
+    return {
+      provider,
+      label: shared().wbProviders?.labelOf?.(provider) || provider,
+      rank: index + 1,
+      members: list,
+      accounts: keep ? list.filter(keep) : list,
+      enabled: list.filter(isEnabled).length,
+      disabled: list.filter(account => !isEnabled(account)).length,
+      limited: list.filter(account =>
+        isEnabled(account) && isLimitedNow(account, usageOf?.(account), tokenUsageOf?.(account))).length,
+    }
+  })
 }
 
 /* ─── 展示派生 ─────────────────────────────── */

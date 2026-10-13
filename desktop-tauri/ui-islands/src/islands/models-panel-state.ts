@@ -53,7 +53,7 @@ export type CustomModelContext = { provider: string; locked: boolean }
  */
 export type CapabilityContext = { provider: string; id: string }
 
-type Filters = { provider: string; state: string; search: string }
+type Filters = { provider: string; state: string; search: string; sort: string }
 
 /** 表格现造的绑定（默认绑定 alias == target 由模型行合成，不在 mappings 里另占一格） */
 export type Binding = {
@@ -182,6 +182,23 @@ export const MODEL_STATE_OPTIONS: readonly SegmentedControlOption<string>[] = MO
 }))
 
 /**
+ * 排序档位（issue #161：按倍率排序，便于挑便宜的模型）。
+ *
+ * `default` 是「不做额外排序」—— 组内仍按后端清单原序（只把禁用的沉到组末尾，
+ * 见 models-page 的组内排序说明），与加这个档位之前**逐字一致**。
+ *
+ * 倍率取自清单上的 `credits` 文本（如 `x0.7 credits`），解析不出的一律排在最后：
+ * 「查不到倍率」与「倍率是 0」是两件事，按 0 参与排序会把未知的顶到最前面。
+ */
+const MODEL_SORTS: readonly string[] = ['default', 'rate-asc', 'rate-desc']
+const MODEL_SORT_LABEL: Record<string, string> = {
+  default: t('默认'), 'rate-asc': t('倍率升序'), 'rate-desc': t('倍率降序'),
+}
+export const MODEL_SORT_OPTIONS: readonly SegmentedControlOption<string>[] = MODEL_SORTS.map(value => ({
+  value, label: MODEL_SORT_LABEL[value],
+}))
+
+/**
  * 列的 key 用表格里既有的 `data-col`（index.html 的 `<col class="c-xxx" data-col="xxx">`、
  * 表头 th、table-columns.js 的列宽登记三处同名，键名只有一套）。顺序即默认渲染顺序。
  */
@@ -210,7 +227,7 @@ const CUSTOM_HIDDEN_COLUMNS: ReadonlySet<string> = new Set(['rate', 'source'])
 
 const EMPTY_VIEW: ManageView = { models: [], mappings: [] }
 
-const DEFAULT_FILTERS: Filters = { provider: 'all', state: 'all', search: '' }
+const DEFAULT_FILTERS: Filters = { provider: 'all', state: 'all', search: '', sort: 'default' }
 
 /* ─── 共享快照（外部 store）──────────────────── */
 
@@ -219,6 +236,8 @@ export type PanelState = {
   provider: string
   stateFilter: string
   search: string
+  /** 排序档位（默认 / 倍率升序 / 倍率降序），见 MODEL_SORTS */
+  sort: string
   /** 内置家的 manage 视图（null = 还没拉到） */
   data: ManageView | null
   /** 已展开全部行的提供商集合 */
@@ -248,6 +267,8 @@ function readSavedFilters(): Filters {
     // 存坏的状态档位回落「全部」（原生 select 赋一个不存在的值也是这个结果）
     state: MODEL_STATES.includes(saved.state) ? saved.state : 'all',
     search: String(saved.search || ''),
+    // 存坏的排序档位回落「默认」（与状态档位同一口径）
+    sort: MODEL_SORTS.includes(saved.sort) ? saved.sort : 'default',
   }
 }
 
@@ -261,6 +282,7 @@ let snapshot: PanelState = {
   provider: initialFilters.provider,
   stateFilter: initialFilters.state,
   search: initialFilters.search,
+  sort: initialFilters.sort,
   data: null,
   expanded: new Set<string>(),
   pending: new Set<string>(),
@@ -314,7 +336,8 @@ export function restoreSavedFilters(): void {
   if (filtersRestored || filtersTouched || !shared().wbFilterMemory) return
   filtersRestored = true
   const saved = readSavedFilters()
-  if (saved.provider !== snapshot.provider || saved.state !== snapshot.stateFilter || saved.search !== snapshot.search) {
+  if (saved.provider !== snapshot.provider || saved.state !== snapshot.stateFilter
+    || saved.search !== snapshot.search || saved.sort !== snapshot.sort) {
     patch(saved)
   }
 }
@@ -760,6 +783,15 @@ export function setStateFilter(next: string): void {
   saveFilters({ state: value })
 }
 
+/** 排序档位（与状态筛选同一套落盘口径：换档即写，重开面板原样恢复） */
+export function setSort(next: string): void {
+  const value = MODEL_SORTS.includes(next) ? next : 'default'
+  if (value === snapshot.sort) return
+  filtersTouched = true
+  patch({ sort: value })
+  saveFilters({ sort: value })
+}
+
 export function setSearch(next: string): void {
   filtersTouched = true
   patch({ search: next })
@@ -935,4 +967,38 @@ export function levelOf(alias: unknown, target: unknown, provider: unknown): str
  */
 export function setTableEl(el: HTMLTableElement | null): void {
   tableEl = el
+}
+
+/**
+ * 摘掉表格里**不属于 React 树**的节点（修复 #195，由视图层每次提交后调用）。
+ *
+ * `<table>` 的直接子级只该有 colgroup / thead / tbody#models 三样，行全部由
+ * React 渲染。但 React **不会**清理外部插进表格的节点：注入实验确认，手工塞进
+ * tbody 的行、或塞进 table 的独立 tbody，之后 render() / load() 都不会把它们
+ * 摘掉，会一直留在表里。issue #195 的现场正是这样一行：不属于当前数据、不计入
+ * 标题统计，且它所在的那个 tbody 让它下面少了一条分隔线（tbody 最后一行没有
+ * 下边框）。
+ *
+ * 判据是 React 给每个渲染元素挂的 fiber 标记（`__reactFiber$…` / 旧版
+ * `__reactInternalInstance$…`）：外部插入的节点没有这两个键。摘的全是「不属于
+ * React」的节点，所以清理本身不会与 React 的 diff 打架，正常渲染一个都不会碰。
+ */
+export function pruneForeignTableNodes(): void {
+  const table = tableEl
+  if (!table) return
+  const owned = (el: Element): boolean => Object.keys(el).some(
+    key => key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$'))
+  for (const child of [...table.children]) {
+    if (child.tagName === 'TBODY') {
+      if (child.id !== 'models') child.remove()
+    } else if (child.tagName === 'TR' && !owned(child)) {
+      // 直接落在 table 下的 tr 会被浏览器按「匿名 tbody」渲染成一行，同样要清
+      child.remove()
+    }
+  }
+  const tbody = table.querySelector('tbody#models')
+  if (!tbody) return
+  for (const row of [...tbody.children]) {
+    if (!owned(row)) row.remove()
+  }
 }

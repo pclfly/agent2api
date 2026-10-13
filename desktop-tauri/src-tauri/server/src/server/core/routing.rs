@@ -38,7 +38,6 @@ use serde_json::{json, Value};
 
 use crate::server::core::account_store::priority::{by_priority_order, normalize_priority};
 use crate::server::core::account_store::store_util::js_truthy;
-use crate::server::core::upstream::session_affinity;
 
 /// 「请求名 → 各家上游真名」的解析缓存：限额冷却键的解析器。
 ///
@@ -82,6 +81,11 @@ pub struct CooldownKeys<'a> {
 impl<'a> CooldownKeys<'a> {
     pub fn new(requested: &'a str) -> Self {
         Self { requested, resolved: Mutex::new(HashMap::new()) }
+    }
+
+    /// 请求名原文（轮转游标按它分键：不同模型的候选集合不同，各轮各的）
+    pub fn request_model(&self) -> &'a str {
+        self.requested
     }
 
     /// 该家实际收到的上游模型名 —— 也就是它的冷却键。
@@ -236,22 +240,6 @@ pub fn pick_account_by_priority(
     exclude_ids: &[String],
     now: i64,
 ) -> Option<Value> {
-    usable_candidates(accounts, keys, counts, exclude_ids, now)
-        .into_iter()
-        .next()
-}
-
-/// 本次可用的候选账号（过滤 + 按优先级排序）。
-///
-/// 过滤三道（顺序即语义）：未尝试过（`exclude_ids`）→ 可用（启用 + 未限流）
-/// → 未达并发上限。排序按全局优先级（唯一，写入侧保证）。
-fn usable_candidates(
-    accounts: &[Value],
-    keys: &CooldownKeys<'_>,
-    counts: &HashMap<String, usize>,
-    exclude_ids: &[String],
-    now: i64,
-) -> Vec<Value> {
     let mut candidates: Vec<Value> = accounts
         .iter()
         .filter(|account| {
@@ -268,74 +256,11 @@ fn usable_candidates(
         })
         .cloned()
         .collect();
-    candidates.sort_by(compare_by_priority);
-    candidates
-}
-
-/// 按「**会话粘性 + 轮询**」挑选本次请求使用的账号（2026-10 新增；转发路径用）。
-///
-/// 与 [`pick_account_by_priority`]（严格优先级）的差别：
-///   1. **粘性命中**：`session_key` 有绑定且绑定账号仍可用（未排除 / 未冷却 /
-///      未达并发上限）→ 直接返回它。同一对话固定同一账号，prompt cache 才能
-///      命中（上游缓存是账号级的，实测见 `session_affinity` 模块头）；
-///      绑定失效（被排除 / 冷却 / 并发满 / 账号消失）→ 解绑，回落轮询。
-///   2. **轮询**：无粘性时，在按优先级排序后的候选列表上从「上次选中的账号」
-///      的**下一个**开始取（到尾部循环回头部）。优先级仍是顺序（谁排前面谁
-///      先被轮到），轮询负责把请求分摊到多个账号 —— 与 hub 的
-///      `AccountPool.pick`（纯轮询）同一意图，只是叠加在优先级序上。
-///   3. 选中后**绑定**会话键 + 记录轮询位置（下次接着往后轮）。
-///
-/// 无 `session_key`（没有 messages 的请求）时退化为纯轮询 —— 不再每次都用
-/// 队首账号。
-pub fn pick_account_for_session(
-    accounts: &[Value],
-    keys: &CooldownKeys<'_>,
-    counts: &HashMap<String, usize>,
-    exclude_ids: &[String],
-    now: i64,
-    session_key: Option<&str>,
-) -> Option<Value> {
-    let session_key = session_key.filter(|key| !key.is_empty());
-    // ── 1. 粘性命中 ──
-    if let Some(key) = session_key {
-        if let Some(bound_id) = session_affinity::affinity_get(key) {
-            let bound = accounts.iter().find(|account| {
-                account_id(account) == Some(bound_id.as_str())
-            });
-            let usable = bound.filter(|account| {
-                !exclude_ids.iter().any(|excluded| excluded == &bound_id)
-                    && account_usability(account, keys, now).usable
-                    && !at_concurrency_limit(account, &bound_id, counts)
-            });
-            if let Some(account) = usable {
-                return Some(account.clone());
-            }
-            // 绑定失效：解绑后走轮询（避免每轮都白查一次失效绑定）
-            session_affinity::affinity_unbind(key);
-        }
-    }
-    // ── 2. 轮询选择 ──
-    let candidates = usable_candidates(accounts, keys, counts, exclude_ids, now);
     if candidates.is_empty() {
         return None;
     }
-    let length = candidates.len();
-    let start = session_affinity::last_picked()
-        .and_then(|last| {
-            candidates
-                .iter()
-                .position(|account| account_id(account) == Some(last.as_str()))
-        })
-        .map(|index| (index + 1) % length)
-        .unwrap_or(0);
-    let picked = candidates[start].clone();
-    if let Some(id) = account_id(&picked).map(str::to_string) {
-        session_affinity::note_picked(&id);
-        if let Some(key) = session_key {
-            session_affinity::affinity_bind(key, &id);
-        }
-    }
-    Some(picked)
+    candidates.sort_by(compare_by_priority);
+    candidates.into_iter().next()
 }
 
 /// 该账号的在途请求数是否已达并发上限（`maxConcurrent == 0` = 不限，恒 false）。
@@ -531,3 +456,258 @@ fn js_number(value: &Value) -> Option<f64> {
         _ => None,
     }
 }
+
+// ─── 策略路由（plan_route）────────────────────────────────────
+//
+// 两种策略（顺序优先 / 负载均衡）与三种排序修饰
+// （垫底 / 休息 / 熔断）都落在这里：输入一张**快照**，输出一份**带原因的
+// 排序清单**。转发选路（rotate.rs）按清单从头往后找人；队列端点
+// （api::routing）把整张清单原样画给用户。两条路调的是同一个函数，
+// 「界面标的顺序」与「转发实际走的顺序」因此不可能分叉。
+
+use crate::server::config::{RouteStrategy, StickyMode};
+
+/// 一条候选在计划里的样子（转发用 `account`，界面用其余字段）。
+#[derive(Clone, Debug)]
+pub struct PlanEntry {
+    pub account: Value,
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    /// 状态码：`usable` / `tried` / `disabled` / `cooldown` / `concurrency` /
+    /// `limiter` / `no-credentials`
+    pub state: &'static str,
+    /// 一句「为什么排这 / 为什么跳过」（队列面板与请求详情直接展示）
+    pub reason: String,
+    /// 限额恢复时刻（毫秒；0 = 未限流）
+    pub reset_at: i64,
+}
+
+/// 一份选路计划：可用候选（排好序）+ 被跳过的候选（各带原因）。
+pub struct RoutePlan {
+    pub ordered: Vec<PlanEntry>,
+    pub blocked: Vec<PlanEntry>,
+    /// 粘性命中的账号是否真的参与了排序（它可用且未被排除）
+    pub sticky_hit: bool,
+}
+
+/// 策略排序要读的**全部外部事实**（一次快照，纯函数不写任何状态）。
+pub struct PlanMeta<'a> {
+    pub strategy: RouteStrategy,
+    /// 沉底账号 → 沉底时刻（限流垫底）
+    pub sunk: &'a HashMap<String, i64>,
+    /// 休息中的账号 → 休息截止时刻（失败退避）
+    pub resting: &'a HashMap<String, i64>,
+    /// 熔断打开的账号
+    pub open: &'a std::collections::HashSet<String>,
+    /// 被限制器软跳过的账号（余额不足 / Token 限额，调用方判好传入）
+    pub limiter_blocked: &'a std::collections::HashSet<String>,
+    /// 轮转起始位（`None` = 不轮转 —— 顺序优先策略）
+    pub cursor: Option<usize>,
+    /// 粘性命中的账号 id（`None` = 无命中）
+    pub sticky_account: Option<&'a str>,
+}
+
+/// 时间戳 → 「HH:MM」短文案（原因句里用，按**操作者本机时区** —— 与请求
+/// 统计的切日同一口径：用户看的是「我这里几点恢复」）。跨天时补「明天」前缀。
+fn clock_text(reset_at: i64, now: i64) -> String {
+    use chrono::{TimeZone, Timelike};
+    let Some(secs) = reset_at.checked_div(1000) else {
+        return String::new();
+    };
+    let Some(time) = chrono::Local.timestamp_opt(secs, 0).single() else {
+        return String::new();
+    };
+    let days_ahead = (reset_at - now).max(0) / (24 * 3600 * 1000);
+    let prefix = match days_ahead {
+        0 => String::new(),
+        1 => "明天 ".to_string(),
+        _ => format!("{days_ahead} 天后 "),
+    };
+    format!("{prefix}{:02}:{:02}", time.hour(), time.minute())
+}
+
+/// 把可用候选按策略排出先后（不处理垫底 / 休息 / 熔断那三层修饰）。
+fn base_order(candidates: &[Value], strategy: RouteStrategy, meta: &PlanMeta<'_>) -> Vec<Value> {
+    let mut sorted: Vec<Value> = candidates.to_vec();
+    sorted.sort_by(compare_by_priority);
+    match strategy {
+        RouteStrategy::Order => sorted,
+        RouteStrategy::Rotate => {
+            let len = sorted.len();
+            if len <= 1 {
+                return sorted;
+            }
+            let start = meta.cursor.unwrap_or(0) % len;
+            (0..len)
+                .map(|offset| sorted[(start + offset) % len].clone())
+                .collect()
+        }
+    }
+}
+
+/// 生成一份完整的选路计划（转发选路与队列端点共用的**唯一**排序实现）。
+///
+/// `excluded` 是本轮已试过的账号（429 降级 / 失败顺延），它们进 `blocked`
+/// （state = `tried`）——「这条请求不会再碰它」本来就是排障时要看的答案。
+pub fn plan_route(
+    accounts: &[Value],
+    keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
+    excluded: &[String],
+    now: i64,
+    meta: &PlanMeta<'_>,
+) -> RoutePlan {
+    let mut ordered: Vec<Value> = Vec::new();
+    let mut blocked: Vec<PlanEntry> = Vec::new();
+    for account in accounts {
+        let Some(id) = account_id(account) else { continue };
+        let id = id.to_string();
+        let name = account_name(account, &id);
+        let provider = provider_of(account).to_string();
+        let entry = |state: &'static str, reason: String| PlanEntry {
+            account: account.clone(),
+            id: id.clone(),
+            name: name.clone(),
+            provider: provider.clone(),
+            state,
+            reason,
+            reset_at: rate_limit_reset_at(account, keys, now),
+        };
+        if excluded.iter().any(|tried| tried == &id) {
+            blocked.push(entry("tried", "本轮已试过，不再回试".to_string()));
+            continue;
+        }
+        if matches!(account.get("enabled"), Some(Value::Bool(false))) {
+            blocked.push(entry("disabled", "已禁用，不参与转发".to_string()));
+            continue;
+        }
+        if meta.limiter_blocked.contains(&id) {
+            blocked.push(entry(
+                "limiter",
+                "被限制器拦下（余额不足或 Token 周期用量到顶），自动恢复后回来".to_string(),
+            ));
+            continue;
+        }
+        let reset_at = rate_limit_reset_at(account, keys, now);
+        if reset_at > 0 {
+            blocked.push(entry(
+                "cooldown",
+                format!(
+                    "对该模型限流冷却中，{} 恢复（恢复后自动回来）",
+                    clock_text(reset_at, now)
+                ),
+            ));
+            continue;
+        }
+        if at_concurrency_limit(account, &id, counts) {
+            blocked.push(entry(
+                "concurrency",
+                format!(
+                    "并发已满（{}/上限），等一个在途回落再参与",
+                    counts.get(&id).copied().unwrap_or(0)
+                ),
+            ));
+            continue;
+        }
+        if matches!(account.get("hasCredentials"), Some(Value::Bool(false))) {
+            blocked.push(entry("no-credentials", "没有可用凭证，登录后才能接请求".to_string()));
+            continue;
+        }
+        ordered.push(account.clone());
+    }
+
+    // 粘性命中的可用账号提到最前（它可用，请求就会走它 —— 排序必须如实反映）
+    let mut sticky_hit = false;
+    if let Some(hit) = meta.sticky_account {
+        if let Some(index) = ordered
+            .iter()
+            .position(|account| account_id(account) == Some(hit))
+        {
+            let hit_account = ordered.remove(index);
+            ordered.insert(0, hit_account);
+            sticky_hit = true;
+        }
+    }
+
+    // 基础序（策略）→ 稳定修饰：没沉底的在前 → 没休息的在前 → 没熔断的在前
+    // 三个修饰**跨策略**生效：垫底（Sink）解决的是「每次回到第 1 位再撞一次
+    // 429」，退避解决的是「反复失败反复撞」—— 它们在顺序优先下同样成立；
+    // 若只对负载均衡生效，默认策略下这两个开关就是摆设。稳定排序保证
+    // 同档内的先后仍由策略的基础序决定（顺序优先下 = 位次）。
+    let mut arranged = base_order(&ordered, meta.strategy, meta);
+    let rank_of = |account: &Value, table: &HashMap<String, i64>| -> bool {
+        account_id(account)
+            .and_then(|id| table.get(id))
+            .map(|until| *until > 0)
+            .unwrap_or(false)
+    };
+    arranged.sort_by_key(|account| rank_of(account, meta.sunk));
+    arranged.sort_by_key(|account| rank_of(account, meta.resting));
+    // 熔断的账号放在队尾（所有策略一致）：只有全场都打不开时才轮到它试一次
+    arranged.sort_by_key(|account| {
+        account_id(account)
+            .map(|id| meta.open.contains(id))
+            .unwrap_or(false)
+    });
+
+    let ordered_entries: Vec<PlanEntry> = arranged
+        .into_iter()
+        .enumerate()
+        .map(|(index, account)| {
+            let id = account_id(&account).unwrap_or("").to_string();
+            let position = index + 1;
+            let mut reason = if sticky_hit && Some(id.as_str()) == meta.sticky_account {
+                "会话粘住：这个会话上一轮是它答的，本轮继续用它".to_string()
+            } else {
+                match meta.strategy {
+                    RouteStrategy::Order => {
+                        if position == 1 {
+                            "队列第 1 位：顺序优先下它接走所有请求，直到不能答".to_string()
+                        } else {
+                            format!("队列第 {position} 位：前面的都可用时轮不到它")
+                        }
+                    }
+                    RouteStrategy::Rotate => {
+                        if position == 1 {
+                            "本轮轮到它：轮流均摊下每条请求换下一位".to_string()
+                        } else {
+                            format!("排在第 {position} 位：等前面的轮完或失败才到它")
+                        }
+                    }
+                }
+            };
+            if meta.sunk.contains_key(&id) {
+                reason.push_str("；曾还有额度时被 429（垫底中，轮一圈才回来）");
+            }
+            if let Some(until) = meta.resting.get(&id) {
+                reason.push_str(&format!("；转发失败休息至 {}", clock_text(*until, now)));
+            }
+            if meta.open.contains(id.as_str()) {
+                reason.push_str("；熔断打开中（连续失败到阈值），到点放行试一次");
+            }
+            PlanEntry {
+                name: account_name(&account, &id),
+                provider: provider_of(&account).to_string(),
+                account,
+                id,
+                state: "usable",
+                reason,
+                reset_at: 0,
+            }
+        })
+        .collect();
+
+    RoutePlan {
+        ordered: ordered_entries,
+        blocked,
+        sticky_hit,
+    }
+}
+
+/// 粘性 TTL（毫秒）：转发选路与队列端点共用的换算（StickyMode → 时长）。
+pub fn sticky_ttl_ms(mode: StickyMode) -> i64 {
+    mode.ttl_ms().unwrap_or(0)
+}
+
+

@@ -111,6 +111,8 @@ type RequestRow = {
   accountName?: unknown
   attemptDetails?: AttemptDetail[]
   sensitiveHits?: SensitiveHit[]
+  /** 选路决策快照（后端 `route` 列；旧行 / 没走到选路的行是 null） */
+  route?: unknown
   /** 模型测试发起的请求（后端 `is_test` 透传到列表行；老行没有这个键） */
   isTest?: boolean
 } & ProviderFields
@@ -225,6 +227,30 @@ function fmtFirstResponse(ms: unknown): string {
   const value = Number(ms)
   if (!Number.isFinite(value) || value <= 0) return '-'
   return fmtDuration(value)
+}
+
+/** 生成速度（tok/s）的悬停说明（与列表 SPEED_TIP 同一份文案，改口径时一起改） */
+const SPEED_TIP = t('生成速度：输出 token ÷ 流式段用时（总用时 − 首响）；流式段不足总用时一半时按总用时计')
+
+/**
+ * 生成速度（tok/s）：输出 token ÷ 流式段用时（总用时 − 首响）。
+ *
+ * 与列表 requests-page 的 tokensPerSecond 逐字同源（那边是唯一实现，这里是详情
+ * 弹窗的镜像，两边注释互相指认，改口径时一起改）。护栏两条，不满足回落按总用时
+ * 计：流式段 ≥ 500ms（非流式响应 duration ≈ 首响，分母趋零）、流式段 ≥ 总用时
+ * 的一半（静默思考的上游把 token 攒到首帧后的小窗口里一股脑下发，短尾窗口
+ * 除出来是「下发速度」不是「生成速度」，能到 800+ tok/s 的假读数）。
+ * 输出 / 总用时为 0（失败行 token 清零、旧行）给空串 —— 调用方据此省掉这一段。
+ */
+function fmtTokensPerSecond(row: RequestRow): string {
+  const tokens = Number(row.completionTokens) || 0
+  const duration = Number(row.durationMs) || 0
+  if (tokens <= 0 || duration <= 0) return ''
+  const first = Number(row.firstResponseMs)
+  const streamMs = Number.isFinite(first) && first > 0 && first < duration ? duration - first : 0
+  const streaming = streamMs >= 500 && streamMs * 2 >= duration
+  const rate = tokens / ((streaming ? streamMs : duration) / 1000)
+  return `${rate >= 100 ? Math.round(rate) : rate.toFixed(1)} tok/s`
 }
 
 /** 令牌读数：量级词与分档交给 units.js 的 formatTokens（与列表 / 报表页同一口径，
@@ -467,6 +493,61 @@ function AttemptsTable({ row }: { row: RequestRow }) {
     </Table>
   )
 }
+/**
+ * 路由回放：这条请求转发时，候选账号按当时的策略怎么排、为什么是它先上。
+ * 数据是选路层落库的决策快照（`route` 列），与「尝试明细」互补 —— 那边回答
+ * 「试了谁、成没成」，这边回答「当时为什么这么排」。旧行 / 转发前就失败的
+ * 请求没有快照（null），不渲染这一段。
+ */
+function RouteReplay({ row }: { row: RequestRow }) {
+  const route = row.route && typeof row.route === 'object' && !Array.isArray(row.route)
+    ? row.route as Record<string, unknown>
+    : null
+  if (!route) return null
+  const strategy = String(route.strategy || '')
+  const sticky = String(route.sticky || '')
+  // 只有两档（顺序优先 / 负载均衡）；历史记录里可能留着已下线的 'usage'，
+  // 按它的替代者「负载均衡」显示（后端 RouteStrategy::from_id 也是这么归的）
+  const strategyLabel = strategy === 'rotate' || strategy === 'usage' ? t('负载均衡')
+    : strategy === 'order' ? t('顺序优先') : strategy
+  const stickyLabel = sticky === 'auto' ? t('自动') : sticky === 'session' ? t('会话内')
+    : sticky === 'turn' ? t('每轮') : sticky === 'off' ? t('关闭') : sticky
+  const ordered = Array.isArray(route.ordered) ? route.ordered as Array<Record<string, unknown>> : []
+  const blocked = Array.isArray(route.blocked) ? route.blocked as Array<Record<string, unknown>> : []
+  const picked = String(route.picked || '')
+  return (
+    <div className='text-[11.5px] leading-relaxed'>
+      <div className='mb-1 text-muted-foreground'>
+        {t('策略 {strategy} · 会话粘性 {sticky}{hit}', {
+          strategy: strategyLabel, sticky: stickyLabel,
+          hit: route.stickyHit === true ? t(' · 会话粘住') : '',
+        })}
+      </div>
+      {ordered.length ? (
+        <ol className='m-0 list-none p-0'>
+          {ordered.map((entry, index) => (
+            <li key={String(entry.id ?? index)} className='py-0.5'>
+              <b>{index + 1}. {String(entry.name || entry.id || '—')}</b>
+              <span className='text-muted-foreground'>　{String(entry.reason || '')}</span>
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      {blocked.length ? (
+        <div className='mt-1 text-muted-foreground'>
+          {t('被跳过：')}
+          {blocked.map(entry => String(entry.name || entry.id || '')).join('、')}
+        </div>
+      ) : null}
+      {picked ? (
+        <div className='mt-1'>
+          {t('最终承载：{picked}', { picked: picked })}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 /* ─── 标签 ①：请求详情（数据全部来自 row）────── */
 
 function DetailPane({ row }: { row: RequestRow | null }) {
@@ -474,6 +555,7 @@ function DetailPane({ row }: { row: RequestRow | null }) {
   // 没有可显示的数据 —— 说清原因让用户关掉重开，比一片空字段诚实
   if (!row) return <Empty text={t('列表数据已刷新，请重试（关闭后重新打开这条详情）')} />
   const account = String(row.accountName ?? '').trim()
+  const speed = fmtTokensPerSecond(row)
   return (
     // 值列基色打在 table 上靠继承（继承永远输给元素上的直接声明），格内的错误红 / 成功绿不会被压住
     <Table className='text-[12.5px] text-subtle [&_tr:last-child>td]:border-b-0 [&_tr:last-child>th]:border-b-0'>
@@ -488,9 +570,9 @@ function DetailPane({ row }: { row: RequestRow | null }) {
               <span className='text-[11.5px] text-muted-foreground'>{t('（请求仍在转发中）')}</span>
             </>
           ) : (
-            <>{t('{duration} / 首帧 {first}', {
+            t('{duration} / 首帧 {first}', {
               duration: fmtDuration(row.durationMs), first: fmtFirstResponse(row.firstResponseMs),
-            })}</>
+            })
           )}
         </Field>
         <Field label={t('重试次数')}>{String(Number(row.attempts) || 1)}</Field>
@@ -506,6 +588,9 @@ function DetailPane({ row }: { row: RequestRow | null }) {
             total: fmtTokens(row.totalTokens),
             cache: fmtTokens(row.cacheReadTokens),
           })}
+          {/* 生成速度跟在缓存读后面（与列表用量列的落点同一语义）；失败行 token
+              清零，fmtTokensPerSecond 给空串，自动省掉 */}
+          {speed ? <span title={SPEED_TIP}> · {speed}</span> : null}
         </Field>
         {/* 测试发起的请求**按需多一行**：它是这一条明细的性质（走的是真实转发链路、但不进报表），
             正常转发的行不必为此多读一行「正常转发」 —— 那种字段每个租户都有时等于没有 */}
@@ -521,6 +606,7 @@ function DetailPane({ row }: { row: RequestRow | null }) {
           {row.error ? <span className='text-destructive'>{String(row.error)}</span> : '—'}
         </Field>
         <Field label={t('尝试明细')}><AttemptsTable row={row} /></Field>
+        {row.route ? <Field label={t('路由回放')}><RouteReplay row={row} /></Field> : null}
         <Field label={t('敏感词')}>
           {/* 命中标签（与列表「敏」标签同一套紫，这里展开写词与次数） */}
           {Array.isArray(row.sensitiveHits) && row.sensitiveHits.length ? (

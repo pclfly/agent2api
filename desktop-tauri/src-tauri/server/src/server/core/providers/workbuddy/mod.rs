@@ -11,6 +11,10 @@
 //! identity.rs 出站身份（WB / VSC / CLI）：三种客户端指纹与配额通道，
 //!             按账号的 `product` 字段选择（与 `region` 正交）
 //! keepalive.rs 国际版每日活跃保活的请求构造（免费模型链缺省值 + 最小流式 body）
+//! growth/     成长任务域（国内版）：任务列表 / accept / 点亮上报 / 领奖 /
+//!             领养 / 开学季活动 + 幸运转盘 / 猫猫旅行 ——从参考项目
+//!             workbuddy2api 的 scripts/task_runner.py 与 school_open_day_2026.py
+//!             移植，见 growth/mod.rs 的模块头
 //! ```
 //!
 //! ── 为什么是一个目录而不是单文件 ─────────────────────────────
@@ -26,6 +30,8 @@
 //! 照抄的范本。
 
 pub mod adapter;
+/// 成长任务（开学季 / 猫猫旅行等）：任务清单与领奖请求构造。
+pub mod growth;
 /// 出站身份（WB / VSC / CLI）：三种客户端指纹与配额通道。
 /// 见 `identity` 模块头的对照表。
 pub mod identity;

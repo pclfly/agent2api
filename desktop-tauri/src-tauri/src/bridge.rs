@@ -321,6 +321,13 @@ const BRIDGE_JS: &str = r#"
     refreshAccountToken: id => call('POST', '/api/accounts/refresh', id ? { id } : {}),
     removeAccount: id => call('DELETE', '/api/accounts/' + encodeURIComponent(id)),
     updateAccount: (id, patch) => call('PATCH', '/api/accounts/' + encodeURIComponent(id), patch),
+    // 整队重排（账号页分组模式）：账号拖完组 / 拖完行之后，把**新队列整条**交上来
+    // （从队首到队尾的 id 数组）。后端按顺序把全局 priority 编成 0、1、2…，所以
+    // 「组顺位 + 组内顺位」一次落库，不存在逐条 PATCH 的中间态。
+    reorderAccounts: queue =>
+      call('POST', '/api/accounts/reorder', {
+        queue: Array.isArray(queue) ? queue.map(item => String(item)) : [],
+      }),
     moveAccount: (id, direction) =>
       call('POST', '/api/accounts/' + encodeURIComponent(id) + '/move', {
         direction: direction === 'down' ? 'down' : 'up',
@@ -329,12 +336,21 @@ const BRIDGE_JS: &str = r#"
     clearRateLimits: (id, model) =>
       call('POST', '/api/accounts/' + encodeURIComponent(id) + '/rate-limits/clear',
         model ? { model } : {}),
+    // ── 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断 + 队列可见化）──
+    getRoutingConfig: () => call('GET', '/api/routing'),
+    setRoutingConfig: patch => call('PUT', '/api/routing', patch || {}),
+    // 候选队列可见化（账号页「路由」面板的数据源）：model 缺省 = 不限模型的全局队列
+    getRoutingQueue: model =>
+      call('GET', '/api/routing/queue' + (model ? '?model=' + encodeURIComponent(model) : '')),
     batchAccounts: payload =>
       call('POST', '/api/accounts/batch', {
         action: String((payload && payload.action) || ''),
         ids: Array.isArray(payload && payload.ids) ? payload.ids : [],
         ...(payload && Object.prototype.hasOwnProperty.call(payload, 'proxy')
           ? { proxy: payload.proxy }
+          : {}),
+        ...(payload && Object.prototype.hasOwnProperty.call(payload, 'maxConcurrent')
+          ? { maxConcurrent: payload.maxConcurrent }
           : {}),
       }),
 
@@ -372,6 +388,31 @@ const BRIDGE_JS: &str = r#"
     testProxyPoolItem: id => call('POST', '/api/proxies/pool/test', { id: String(id || '') }),
     syncClashToProxyPool: () => call('POST', '/api/proxies/pool/sync-clash', {}),
 
+    // ── 订阅（「网络代理」页的订阅区块）──
+    // 与 web_shim.rs 的同名方法成对存在（教训同上）。契约（详见
+    // `api::subscriptions` 的模块头）：
+    //   · getSubscriptions        列表 `{items, kernel}`；item 带 nodeCount，
+    //                             kernel 是内核状态（下载进度 / 运行状态）
+    //   · add/save/remove         写操作都返回同一份列表 + kernel（就地替换）；
+    //                             后端投一条内核命令（异步），节点数与运行状态
+    //                             由轮询 kernel 看结果
+    //   · refreshSubscription     强制拉取一条订阅的内容（节点变了后端自动
+    //                             重启内核）
+    //   · getKernelStatus         单独读内核状态（下载进度的轮询走它）
+    //   · downloadKernel          开始下载内核（后台任务，state=downloading →
+    //                             done/error）；下载完有启用的订阅会自动拉起
+    //   · restartKernel           手动启动 / 重启内核（重建配置）
+    //   · decodeQrImage           从图片解二维码 `{imageBase64}` → `{url}`
+    getSubscriptions: () => call('GET', '/api/subscriptions'),
+    addSubscription: payload => call('POST', '/api/subscriptions/add', payload || {}),
+    saveSubscription: payload => call('POST', '/api/subscriptions/save', payload || {}),
+    refreshSubscription: id => call('POST', '/api/subscriptions/refresh', { id: String(id || '') }),
+    removeSubscription: id => call('POST', '/api/subscriptions/remove', { id: String(id || '') }),
+    decodeQrImage: payload => call('POST', '/api/subscriptions/decode-qr', payload || {}),
+    getKernelStatus: () => call('GET', '/api/subscriptions/kernel'),
+    downloadKernel: () => call('POST', '/api/subscriptions/kernel/download', {}),
+    restartKernel: () => call('POST', '/api/subscriptions/kernel/restart', {}),
+
     // ── 积分 / 签到 ──
     getUsage: () => call('GET', '/api/usage'),
     getCheckinStatus: () => call('GET', '/api/checkin/status'),
@@ -401,6 +442,24 @@ const BRIDGE_JS: &str = r#"
         + (refresh ? '?refresh=1' : '')),
     claimOnboardingTasks: id =>
       call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding/claim', {}),
+    // ── WorkBuddy 成长任务（国内版：盘点 / 单任务执行 / 开学季 / 猫猫旅行）──
+    // 从参考项目 workbuddy2api 的 task_runner.py 与 school_open_day_2026.py 移植，
+    // 见 server 的 api::growth 模块头。与 `server/src/web_shim.rs` 的同名方法
+    // **必须成对维护**（headless 面板同一份界面，缺一边会在那一形态下静默失效）。
+    //
+    // `getGrowthStatus` 是只读盘点（任务 / 能量 / 旅行 / 开学季四块）；执行拆成
+    // **单任务**端点（runGrowthTask）—— 全量逐条留 1s+ 写间隔会超过管理 API 的
+    // 60 秒转发超时，界面的「一键完成」在本地循环逐条调用并逐条显示进度。
+    getGrowthStatus: id =>
+      call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/growth'),
+    runGrowthTask: (id, code, mode) =>
+      call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/growth/task',
+        { code: code, mode: mode || 'full' }),
+    runGrowthSchool: (id, lottery) =>
+      call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/growth/school',
+        { lottery: lottery === true }),
+    runGrowthTravel: id =>
+      call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/growth/travel', {}),
 
     // ── 手机验证码登录（AutoClaw 两地区 / Loomy）──
     // 与网页登录那条链（开窗口、等回调）不同：上游没有授权页，就是「发码 →
@@ -475,6 +534,13 @@ const BRIDGE_JS: &str = r#"
     getAutoCheckin: () => call('GET', '/api/auto-checkin'),
     saveAutoCheckin: patch => call('POST', '/api/auto-checkin', patch),
     runAutoCheckinNow: () => call('POST', '/api/auto-checkin/run', {}),
+    // 定时签到的**条目**（签到中心「定时签到」页）：列表 / 保存一条 / 删除 / 立即执行
+    getCheckinSchedules: () => call('GET', '/api/checkin-schedules'),
+    saveCheckinSchedule: patch => call('POST', '/api/checkin-schedules', patch),
+    deleteCheckinSchedule: id =>
+      call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/delete', {}),
+    runCheckinSchedule: id =>
+      call('POST', '/api/checkin-schedules/' + encodeURIComponent(String(id || '')) + '/run', {}),
     // WorkBuddy 国际版日活保活的模型链（读 / 存；与 web_shim.rs 的同名方法成对）
     getCheckinKeepalive: () => call('GET', '/api/checkin-keepalive'),
     saveCheckinKeepalive: models => call('POST', '/api/checkin-keepalive', { models }),
@@ -483,6 +549,24 @@ const BRIDGE_JS: &str = r#"
     // 签到中心的聚合快照（每日签到分组 / 自动签到设置 / 签到历史 / 一次性项入口），
     // 见 api::checkin_center 的模块头 —— 页面打开只打这一条
     getCheckinCenter: () => call('GET', '/api/checkin-center'),
+    // 签到记录明细台账（签到记录页）：查询（limit/offset/outcome/provider/keyword/start/end）
+    // 与清空（全清必须显式 all=1，护栏见 api::checkin_records 的模块头）
+    getCheckinRecords: params => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(params || {})) {
+        if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+      }
+      const text = query.toString();
+      return call('GET', '/api/checkin-records' + (text ? '?' + text : ''));
+    },
+    clearCheckinRecords: params => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(params || {})) {
+        if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+      }
+      const text = query.toString();
+      return call('DELETE', '/api/checkin-records' + (text ? '?' + text : ''));
+    },
 
     // ── 间隔型定时任务（凭证自动维护 / 定时查询积分 / 模型刷新 / 两个前端自动刷新）──
     // 改一条任务用 PATCH（后端同时受理 POST 作别名：CORS 允许方法里没有 PATCH，
@@ -536,6 +620,15 @@ const BRIDGE_JS: &str = r#"
     // 于是设置页读不到值，卡在「未能读取网关跨域访问设置」。
     getCors: () => call('GET', '/api/cors'),
     saveCors: enabled => call('PUT', '/api/cors', { corsEnabled: enabled === true }),
+
+    // ── models.dev 模型元数据（能力位与逐模型思考档位）──
+    // 与 web_shim.rs 的同名方法逐字同形（桌面壳走 Tauri IPC，网页端走同源
+    // fetch，两边接口名与签名必须一致 —— 漏一侧的症状见上面 getCors 那段）。
+    // GET 读开关 + 索引状态；refresh 真打公网，返回结果行与刷新后的状态。
+    getModelsDev: () => call('GET', '/api/models/metadata'),
+    saveModelsDev: enabled =>
+      call('PUT', '/api/models/metadata', { modelsDevEnabled: enabled === true }),
+    refreshModelsDev: () => call('POST', '/api/models/metadata/refresh'),
 
     // ── 系统提示词与内容拦截降级 ──
     // 与 getRetry / saveRetry 同形：GET 读、PUT 写（允许部分字段），响应体是
@@ -630,6 +723,12 @@ const BRIDGE_JS: &str = r#"
     // 次数 / 单次秒数，存配置（/api/queue）。契约同 saveTimeouts。
     getQueue: () => call('GET', '/api/queue'),
     saveQueue: patch => call('PUT', '/api/queue', patch),
+
+    // ── 验证码令牌池（设置页「网关 → 验证码令牌池」）──
+    // ZCode 活动套餐通道令牌池的补货节奏（目标 / 轮询间隔 / 单轮上限），
+    // 存配置（/api/zcode/captcha-pool）。契约同 saveTimeouts。
+    getCaptchaPool: () => call('GET', '/api/zcode/captcha-pool'),
+    saveCaptchaPool: patch => call('PUT', '/api/zcode/captcha-pool', patch),
 
     // ── 调试模式（设置页「通用 → 调试模式」）──
     // 开关存配置（debugMode）：开启后转发层把上游原始报文（凭据类头已脱敏）
@@ -730,6 +829,11 @@ const BRIDGE_JS: &str = r#"
     saveAppSettings: patch => invoke('save_app_settings', { patch }),
     exportAccounts: () => invoke('export_accounts'),
     importAccounts: () => invoke('import_accounts'),
+    // ── 整库备份 / 恢复（设置页「整库备份 / 恢复」）──
+    // 文件由后端按壳选的路径直读直写（见 api/backup_api.rs），壳只负责
+    // 系统对话框；参数名 includeLogs 必须与 Rust 侧 export_database 的形参一致
+    exportDatabase: includeLogs => invoke('export_database', { includeLogs }),
+    importDatabase: () => invoke('import_database'),
   };
 })();
 "#;

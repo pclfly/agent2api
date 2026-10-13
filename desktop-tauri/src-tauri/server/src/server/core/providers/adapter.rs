@@ -26,7 +26,7 @@
 //! 用 `OnceLock<HashMap<…>>` 反而要处理「注册表还没装好时被调用」的路径，
 //! 而那条路径在 panic=abort 的 release 里只能 panic —— 得不偿失。
 //!
-//! ── 契约之外的十处扩展（都是带默认实现的加法，不改 §4.2 的方法）──
+//! ── 契约之外的十一处扩展（都是带默认实现的加法，不改 §4.2 的方法）──
 //!   1. `retry_advice`：识别「可退避重试的错误」并给出间隔与日志文案。
 //!      §4.3 要求「11128 退避逻辑保持在转发层」——**循环**留在编排层，
 //!      但「哪个码要退避、退多久」是 provider 知识（11128 是 workbuddy 的
@@ -103,6 +103,17 @@
 //!      编排层（`upstream::payload`）只负责在正确的时机问一次、按结果改写 body。
 //!      **默认实现是「不接」**（返回 `NotSupported`）—— 理由见那个方法的文档：
 //!      接一家要有一家的证据，没证据就注入等于把未知参数推给上游。
+//!  11. `sse_strip_newline_chunks`（下发帧丢掉「整片只有换行」的 content 分片）：
+//!      WorkBuddy 与 AutoClaw 的上游会在相邻正文分片之间插一帧纯换行的 content
+//!      （那是它们的保活节拍，两天样本里 34.5% 的请求带、脏请求中位占正文分片
+//!      13.4%，见 `upstream::sse` 模块头）。丢不丢是 provider 知识 —— 同样的帧在别家
+//!      可能真是模型写的换行，所以由适配器回答，执行落在 `upstream::sse` 这个
+//!      SSE 逐行解析的唯一出口（与 `sse_model_rewrite` 同一分工、同一位置）。
+//!      **默认 false**：没声明的 provider 下发帧逐字节不变。
+//!      声明了也不等于会丢 —— 还要 `stripNewlineKeepalive` 这个**部署开关**开着
+//!      （默认关，见 `config::KEY_STRIP_NEWLINE_KEEPALIVE`）：能力位回答"这家的
+//!      上游会不会发"，开关回答"这台机器要不要为它改字节"，两者相与，且开关只能
+//!      收窄不能扩张（见 `upstream::sse::FramePolicy::assembled`）。
 //!
 //! ── 未注册的 provider 怎么办 ────────────────────────────────
 //! 各家 provider 在 [`adapter_for`] 里各自接上真身，那个 match 是穷举的：
@@ -710,6 +721,31 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// 哪些 `finish_reason` 表示**上游拒答**（HTTP 200 的假成功），默认空 = 不认。
+    ///
+    /// ── 为什么需要它（本家独有的上游形态）────────────────────────
+    /// 有些上游（实测 OfficeAce / 华为 AgentArts 网关）把内容审核拒绝包装成一次
+    /// 正常答复：`HTTP 200`、SSE 干净收尾，但正文是一句固定拒绝话术，终帧
+    /// `choices[].finish_reason = content_filter`。只看 HTTP 状态这就是**假成功**
+    /// —— 编排层不换家，客户端把套话当答案（真实现象：ZCode 的 agentic 请求打到
+    /// 本家条条如此，见 `upstream::refusal` 模块头）。
+    ///
+    /// 判定由编排层执行：一旦置了本家的 `UpstreamResponse`/流式门控，就会把
+    /// 该 `finish_reason` 视为一次**可轮换失败** —— 队列里还有别的账号/家就换，
+    /// 只剩这一家时给客户端一句**可读错误**（而不是那句上游套话）。
+    ///
+    /// ── 为什么默认空、以及代价 ──────────────────────────────────
+    /// 默认空 = **不认任何 `finish_reason`**，别家逐字节不变。声明是加法的：
+    /// 一旦声明，本家所有流式请求会先在**有界**的头部缓冲里拉一小段以判定
+    /// （见 `upstream::refusal`，上限 32 KiB）—— 真答案因此被推迟最多一节首字节。
+    /// 这个代价只在声明的家上发生，且拒绝话术远在缓冲上限之内 ⇒ 对拒绝必中。
+    ///
+    /// ⚠️ 别把这里的值写成「上游偶发会回的任意值」：`length`（预算截断）是**正常**
+    /// 收尾，不该换家；只有「上游明确不给你这次答复」的取值才属于本表。
+    fn stream_refusal_finishes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// 本 provider 是否支持**主动**刷新凭证（模块头扩展 5）。
     ///
     /// 默认 false = 这家没有续期手段（没有 refreshToken、上游也没有刷新接口）。
@@ -822,6 +858,18 @@ pub trait ProviderAdapter: Send + Sync {
     /// 的内部名，因此它的适配器覆盖成 true —— 见 `upstream::sse` 的
     /// `model_rewrite` 参数与 `raccoon::mod` 的说明。
     fn sse_model_rewrite(&self) -> bool {
+        false
+    }
+
+    /// SSE 下发帧要不要丢掉「整片只有换行」的 content 分片（模块头扩展 11）。
+    ///
+    /// 默认 false（帧的字节逐字不变）。目前声明 true 的只有 WorkBuddy 与
+    /// AutoClaw —— 那两家的上游会在正文分片之间插纯换行的帧作为
+    /// 保活节拍，客户端按 markdown 渲染就被排成一行一个词。
+    /// 判据与实测口径见 [`crate::server::core::upstream::sse::is_newline_keepalive`]；
+    /// **执行不在这里**：本方法只回答「要不要」，丢帧动作落在 `upstream::sse`
+    /// 这个 SSE 逐行解析的唯一出口，与 [`Self::sse_model_rewrite`] 同一分工。
+    fn sse_strip_newline_chunks(&self) -> bool {
         false
     }
 
@@ -1117,6 +1165,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 全部已接通（转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层，
         // 见 `antigravity/mod.rs` 与 `antigravity/adapter.rs`）
         ProviderKind::Antigravity => &super::antigravity::ANTIGRAVITY_ADAPTER,
+        // OfficeAce（华为云果办 / OfficeClaw）：无状态 OpenAI 兼容转发
+        // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
+        // `officeace/mod.rs` 的模块头）
+        ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
     }
 }
 
@@ -1214,6 +1266,9 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 循环不会问它。转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层
         // （Gemini v1internal 信封 + SSE），`build_chat_request` 已接真身。
         ProviderKind::Antigravity,
+        // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
+        // 进本列表才会被后台目录刷新调度
+        ProviderKind::OfficeAce,
     ]
 }
 

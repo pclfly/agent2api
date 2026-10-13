@@ -110,6 +110,16 @@ pub struct RuntimeConfig {
     /// 与 timeouts 同一理由：走排队制的适配器**每次遇到排队**都要取它
     /// （改完设置下一个请求就用新值，不重启进程），解析一次存下来最省事。
     queue: QueueSettings,
+    /// ZCode 验证码令牌池的补货节奏（设置页「网关 → 验证码令牌池」区域）。
+    ///
+    /// 与 queue 同一理由：stats 端点**每次被铸造器轮询**都要取它（改完设置
+    /// 下一轮就生效，不重启进程），解析一次存下来最省事。
+    captcha_pool: CaptchaPoolSettings,
+    /// 账号路由的策略 / 粘性 / 退避 / 垫底 / 熔断（账号页「路由」区域）。
+    ///
+    /// 与 timeouts 同一理由：转发层**每次选路**都要取它（改完设置下一个
+    /// 请求就生效，不重启进程），解析一次存下来最省事。
+    routing: RoutingSettings,
     /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
     /// 低频字段（启动 + 设置页读写），不值得为它发明解析层，存原始值即可。
     log_dir: Option<String>,
@@ -143,12 +153,25 @@ pub struct RuntimeConfig {
     /// 生效，不重启进程），解析一次存下来最省事。默认 `false`，见 `KEY_CORS_ENABLED`。
     /// 只作用于网关面，面板路由不受它影响。
     cors_enabled: bool,
+    /// 「丢弃保活换行分片」开关（`/api/keepalive-strip`，默认关）。
+    ///
+    /// 与 `sanitize_fingerprints` 同一理由：装配下发策略时每轮都要问一次，
+    /// 解析一次存下来最省事。**它不替代能力位**：真正丢不漏是
+    /// 「适配器声明 × 本开关」两者相与（见
+    /// [`crate::server::core::upstream::sse::FramePolicy::assembled`]）。
+    strip_newline_keepalive: bool,
     /// 面板机器人校验开关（设置页「通用 → 机器人校验」，ALTCHA proof-of-work）。
     ///
     /// 与 `debug_mode` 同一理由：登录 / 注册端点逐请求判一次（改完开关下一个
     /// 请求就生效），解析一次存下来最省事。默认 `true`，见 `KEY_CAPTCHA_ENABLED`；
     /// 配置项缺失时可由环境变量 `AGENT2API_CAPTCHA_ENABLED` 兜底（默认 1 开、0 关）。
     captcha_enabled: bool,
+    /// models.dev 模型元数据开关（设置页「通用 → models.dev 模型元数据」）。
+    ///
+    /// 它是「这个模型的能力/档位能不能由社区库补」的**联网**总闸，默认 `true`
+    /// （见 `KEY_MODELS_DEV_ENABLED`）。低频读取（只在模型元数据刷新发起时问
+    /// 一次），与 `captcha_enabled` 同一模式解析一次存下来。
+    models_dev_enabled: bool,
     /// 系统提示词设置（设置页「通用 → 系统提示词」）。
     ///
     /// 与 `sanitize_fingerprints` 同一理由（转发层逐请求取一次，改完下一个请求
@@ -214,9 +237,19 @@ impl RuntimeConfig {
         self.cors_enabled
     }
 
+    /// 「丢弃保活换行分片」开关（与能力位相与后才生效，见字段说明）
+    pub fn strip_newline_keepalive(&self) -> bool {
+        self.strip_newline_keepalive
+    }
+
     /// 面板机器人校验开关（登录 / 注册端点逐请求判一次）。
     pub fn captcha_enabled(&self) -> bool {
         self.captcha_enabled
+    }
+
+    /// models.dev 模型元数据的**联网刷新**开关（`core::model_meta::refresh` 读）。
+    pub fn models_dev_enabled(&self) -> bool {
+        self.models_dev_enabled
     }
 
     /// 系统提示词设置（界面 / 日志用；转发层要的是下面的借用视图）
@@ -400,6 +433,8 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let retry = retry_from(&raw);
     let timeouts = timeouts_from(&raw);
     let queue = queue_from(&raw);
+    let captcha_pool = captcha_pool_from(&raw);
+    let routing = routing_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）
         api_key: string_field(&raw, "apiKey").or_else(env_api_key),
@@ -413,6 +448,8 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         retry,
         timeouts,
         queue,
+        captcha_pool,
+        routing,
         log_dir: string_field(&raw, KEY_LOG_DIR),
         request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
         debug_dir: string_field(&raw, KEY_DEBUG_DIR),
@@ -437,6 +474,15 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .get(KEY_CORS_ENABLED)
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // 只有字面 `true` 算开启：**默认关**。与 debug_mode 同一取向（两者的
+        // 代价都是「多做了一件界面没说清的事」），而与 sanitize_fingerprints
+        // 相反（那个默认关会让新用户一上来就撞 400）。这里默认关的理由见
+        // KEY_STRIP_NEWLINE_KEEPALIVE 的文档：它会吃掉「单独成片的真换行」。
+        // 配置项缺失时环境变量兜底（Docker 部署第一次启动就能开）。
+        strip_newline_keepalive: raw
+            .get(KEY_STRIP_NEWLINE_KEEPALIVE)
+            .and_then(Value::as_bool)
+            .unwrap_or_else(env_strip_newline_keepalive),
         // 只有字面 `false` 算关闭：**默认开**。登录 / 注册的暴破与抢注防护
         // 宁可多一道不可少一道（见 KEY_CAPTCHA_ENABLED 的说明）。配置项缺失
         // 时环境变量兜底：登录页人机验证组件环境变量，默认为1开启，0为关闭
@@ -445,6 +491,13 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .get(KEY_CAPTCHA_ENABLED)
             .and_then(Value::as_bool)
             .unwrap_or_else(env_captcha_enabled),
+        // 只有字面 `false` 算关闭：**默认开**（理由见 KEY_MODELS_DEV_ENABLED）。
+        // 没有环境变量兜底：它不是「部署时才知道要不要开」的东西（Docker 与
+        // 桌面端都一样，内嵌快照保证功能在离线时也有内容）。
+        models_dev_enabled: raw
+            .get(KEY_MODELS_DEV_ENABLED)
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         // 系统提示词：模式非法/缺失 → passthrough（默认），文件读不到 → 内置默认
         // + 一条原因（见 `prompt_from`）
         prompt: prompt_from(&raw),
@@ -863,6 +916,37 @@ pub fn gateway_prompt_text(
     None
 }
 
+/// 只取「丢弃保活换行分片」开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retention_settings()` 同一取舍：它在**每次装配下发策略**时读
+/// （`upstream::provider_loop::frame_policy_of`，流式与非流式各一处），而
+/// `current()` 每调一次就克隆整个 `raw` Map —— 热路径上没必要。
+/// 未初始化（启动极早期 / 单元测试里没装配过配置）时退回环境变量，与 `current()`
+/// 在同样情形下 `build(空)` 的口径一致；两边都是**默认关**：没有明确开启
+/// 就不改写别人的字节。
+pub fn strip_newline_keepalive() -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.strip_newline_keepalive;
+        }
+    }
+    env_strip_newline_keepalive()
+}
+
+/// 只取 models.dev 元数据开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `strip_newline_keepalive` 同一取舍：`core::model_meta::refresh` 每轮问一次，
+/// 而 `current()` 每调一次就克隆整个 `raw` Map。未初始化时给 `true` —— 与
+/// `build(空)` 的口径一致（这个开关**默认开**，见 `KEY_MODELS_DEV_ENABLED`）。
+pub fn models_dev_enabled() -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.models_dev_enabled;
+        }
+    }
+    true
+}
+
 /// 只取定时任务设置的轻量读取（**不克隆整份 raw**）。
 ///
 /// 与 `retention_settings()` 同一取舍：凭证维护与模型刷新的循环**每一轮**都要
@@ -1258,6 +1342,122 @@ pub fn set_queue(patch: QueuePatch) -> bool {
     })
 }
 
+// ─── ZCode 验证码令牌池（zcodeCaptchaPoolTarget / PollMs / MaxPerRound）──
+
+/// 只取令牌池的三项（**不克隆整份 raw**）。
+///
+/// 与 `queue_settings()` 同一取舍：stats 端点每次被铸造器轮询都要取一次，
+/// 读锁取一份 `Copy` 快照即可。未初始化时给默认值。
+pub fn captcha_pool_settings() -> CaptchaPoolSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.captcha_pool;
+        }
+    }
+    CaptchaPoolSettings::default()
+}
+
+/// 更新令牌池节奏（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`zcode_captcha_pool_api::put_captcha_pool`）**必须先校验范围**：
+/// 本函数按「已合法」处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃。
+/// 与 `set_queue` 同一模式：内存快照与 raw 底稿一起改。
+pub fn set_captcha_pool(patch: CaptchaPoolPatch) -> bool {
+    update(|config| {
+        let mut next = config.captcha_pool;
+        if let Some(target) = patch.target {
+            config
+                .raw
+                .insert(KEY_CAPTCHA_POOL_TARGET.to_string(), Value::from(target));
+            next.target = target;
+        }
+        if let Some(poll_ms) = patch.poll_ms {
+            config
+                .raw
+                .insert(KEY_CAPTCHA_POOL_POLL_MS.to_string(), Value::from(poll_ms));
+            next.poll_ms = poll_ms;
+        }
+        if let Some(max_per_round) = patch.max_per_round {
+            config.raw.insert(
+                KEY_CAPTCHA_POOL_MAX_PER_ROUND.to_string(),
+                Value::from(max_per_round),
+            );
+            next.max_per_round = max_per_round;
+        }
+        config.captcha_pool = next;
+    })
+}
+
+// ─── 账号路由（routingStrategy / routingSticky / 退避 / 垫底 / 熔断）──
+
+/// 只取路由设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `timeout_settings()` 同一取舍：转发层每次选路都要取一次，读锁取一份
+/// `Copy` 快照即可。未初始化时给默认值。
+pub fn routing_settings() -> RoutingSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.routing;
+        }
+    }
+    RoutingSettings::default()
+}
+
+/// 更新路由设置（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`routing_api::put_routing`）**必须先校验范围**：本函数按「已合法」
+/// 处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃。与 `set_timeouts`
+/// 同一模式：内存快照与 raw 底稿一起改。
+pub fn set_routing(patch: RoutingPatch) -> bool {
+    update(|config| {
+        let mut next = config.routing;
+        if let Some(strategy) = patch.strategy {
+            config
+                .raw
+                .insert(KEY_ROUTING_STRATEGY.to_string(), Value::from(strategy.as_str()));
+            next.strategy = strategy;
+        }
+        if let Some(sticky) = patch.sticky {
+            config
+                .raw
+                .insert(KEY_ROUTING_STICKY.to_string(), Value::from(sticky.as_str()));
+            next.sticky = sticky;
+        }
+        let mut write_bool = |key: &str, value: bool, slot: &mut bool| {
+            config.raw.insert(key.to_string(), Value::Bool(value));
+            *slot = value;
+        };
+        if let Some(enabled) = patch.failover_backoff {
+            write_bool(KEY_ROUTING_FAILOVER_BACKOFF, enabled, &mut next.failover_backoff);
+        }
+        if let Some(enabled) = patch.sink {
+            write_bool(KEY_ROUTING_SINK, enabled, &mut next.sink);
+        }
+        if let Some(enabled) = patch.breaker_enabled {
+            write_bool(KEY_ROUTING_BREAKER_ENABLED, enabled, &mut next.breaker_enabled);
+        }
+        if let Some(count) = patch.breaker_threshold {
+            config
+                .raw
+                .insert(KEY_ROUTING_BREAKER_THRESHOLD.to_string(), Value::from(count));
+            next.breaker_threshold = count;
+        }
+        if let Some(seconds) = patch.breaker_timeout_seconds {
+            config
+                .raw
+                .insert(KEY_ROUTING_BREAKER_TIMEOUT.to_string(), Value::from(seconds));
+            next.breaker_timeout_seconds = seconds;
+        }
+        if let Some(count) = patch.breaker_success_threshold {
+            config
+                .raw
+                .insert(KEY_ROUTING_BREAKER_SUCCESS.to_string(), Value::from(count));
+            next.breaker_success_threshold = count;
+        }
+        config.routing = next;
+    })
+}
+
 // ─── 调试模式（debugMode）────────────────────────────────────
 
 /// 写入调试模式开关。
@@ -1329,6 +1529,23 @@ pub fn set_cors_enabled(enabled: bool) -> bool {
     })
 }
 
+// ─── 保活换行丢弃（stripNewlineKeepalive）───────────────────
+
+/// 写入「丢弃保活换行分片」开关。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式：内存快照立即生效（下一个请求的
+/// 策略装配就用新值），raw 底稿一起改保证写盘不吃掉其它键。开与关都记一条
+/// 事件日志（见调用点）—— 开的那一刻起，下发帧不再是上游原样的字节，
+/// 这件事必须在日志里查得到。
+pub fn set_strip_newline_keepalive(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_STRIP_NEWLINE_KEEPALIVE.to_string(), Value::Bool(enabled));
+        config.strip_newline_keepalive = enabled;
+    })
+}
+
 /// 写入机器人校验开关（设置页「通用 → 机器人校验」）。
 ///
 /// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（登录 / 注册端点
@@ -1339,6 +1556,20 @@ pub fn set_captcha_enabled(enabled: bool) -> bool {
             .raw
             .insert(KEY_CAPTCHA_ENABLED.to_string(), Value::Bool(enabled));
         config.captcha_enabled = enabled;
+    })
+}
+
+/// 写入 models.dev 模型元数据开关（设置页「通用 → models.dev 模型元数据」）。
+///
+/// 与 `set_captcha_enabled` 同一模式：内存立即生效（下次刷新发起时读它），
+/// 写盘时不吃掉 config.json 里的其它字段。**不清理已装载的索引**：关闭的含义是
+/// 「别再联网拉了」，不是「把已经拿到的元数据扔掉」（见 `KEY_MODELS_DEV_ENABLED`）。
+pub fn set_models_dev_enabled(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_MODELS_DEV_ENABLED.to_string(), Value::Bool(enabled));
+        config.models_dev_enabled = enabled;
     })
 }
 

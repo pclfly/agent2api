@@ -271,6 +271,14 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/queue",
             get(api::queue_api::get_queue).put(api::queue_api::put_queue),
         )
+        // 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断）：GET 读、PUT（部分字段）
+        // 更新，保存后对下一个请求立即生效；queue 是候选队列的可见化端点
+        // （账号页「路由」面板的数据源，排序实现与转发选路同一个函数）。
+        .route(
+            "/api/routing",
+            get(api::routing_api::get_routing).put(api::routing_api::put_routing),
+        )
+        .route("/api/routing/queue", get(api::routing_api::get_routing_queue))
         // ── 调试模式（设置页「通用 → 调试模式」）──
         // GET/PUT 开关；traffic 是按 id 取原始报文的详情端点（列表接口不返回
         // 报文，见 debug_api 的模块头）。挂 protected：报文含上游 URL 与请求体。
@@ -291,6 +299,12 @@ pub fn panel_router(state: ServerState) -> Router {
         // 全部业务表（账号、日志、统计、配置），与 /api/config 同级敏感。
         .route("/api/upgrade", get(api::upgrade_api::get_upgrade))
         .route("/api/upgrade/run", post(api::upgrade_api::run_upgrade))
+        // ── 整库备份 / 恢复（设置页，SQL 文本形态）──
+        // 挂 protected：导出把全部凭证写进指定路径，导入整体替换数据库，
+        // 都是 /api/config 级别敏感；文件由后端按壳选的路径直读直写
+        // （大文件不过 HTTP，见 api::backup_api 的模块头）。
+        .route("/api/backup/export", post(api::backup_api::export_backup))
+        .route("/api/backup/import", post(api::backup_api::import_backup))
         // ── 账号管理（对照 workbuddy-account-routes.mjs）──
         // 用 any(...) 注册两条入口（无尾段 + 通配尾段），方法/路径的判定交给
         // api::accounts::dispatch —— 这是为了复刻 Node 版 tryHandle 的判定顺序
@@ -314,6 +328,20 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/proxies/pool/remove", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/test", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/sync-clash", any(api::accounts::proxies_entry))
+        // ── 订阅（「网络代理」页的订阅区块：机场订阅 → 内核本地监听器）──
+        // 固定路径 + api::subscriptions::entry 按 (方法, 剩余段) 分发（理由同上：
+        // 通配段与 404 兜底互相干扰）。内核命令是异步的（重启 / 拉订阅要几秒
+        // 到几十秒），写操作立即返回列表 + 内核快照，前端轮询看结果 ——
+        // 契约详见 api::subscriptions 的模块头。
+        .route("/api/subscriptions", any(api::subscriptions::entry))
+        .route("/api/subscriptions/add", any(api::subscriptions::entry))
+        .route("/api/subscriptions/save", any(api::subscriptions::entry))
+        .route("/api/subscriptions/refresh", any(api::subscriptions::entry))
+        .route("/api/subscriptions/remove", any(api::subscriptions::entry))
+        .route("/api/subscriptions/decode-qr", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/download", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/restart", any(api::subscriptions::entry))
         // ── 积分 / 签到 / 运营活动（对照 server.mjs 871-911 行）──
         // 六条都挂在 protected（Node 版每条都调了 checkApiKey），
         // 失败时的 body 是 OpenAI 风格（那几条在 server.mjs 的大 try 里）
@@ -406,6 +434,14 @@ pub fn panel_router(state: ServerState) -> Router {
         // 能力位覆盖（纠正对下游声明的那五个字段；只服务内置家，自定义家
         // 走 /api/custom-providers/models 的整表保存，见该 handler 的说明）
         .route("/api/models/capabilities", post(api::model_manage::set_capabilities))
+        // models.dev 模型元数据（上游没声明的能力位与逐模型思考档位由它补齐）：
+        // 开关 / 状态挂在设置页，刷新那条会**真打公网**（models.dev 的两份 JSON），
+        // 所以与 /api/models/refresh 同级挂 protected。
+        .route(
+            "/api/models/metadata",
+            get(api::model_meta::get_metadata).put(api::model_meta::put_metadata),
+        )
+        .route("/api/models/metadata/refresh", post(api::model_meta::refresh_metadata))
         // 模型测试（模型管理页操作列的「测试」）：会**真打上游、消耗额度**，
         // 与 /v1/chat/completions 同一量级的接口，必须挂 protected。
         // 结论失败也返回 2xx（上游的错误放在响应体的 status / error 里，
@@ -475,6 +511,16 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/cors",
             get(api::cors::get_cors).put(api::cors::put_cors),
         )
+        // ── 保活换行丢弃开关 ──
+        // 与 /api/sanitize、/api/debug 同形的单开关端点（GET 读 / PUT 写），挂
+        // protected：它决定「声明了该能力位的提供商」的下发帧要不要丢掉只含换行
+        // 的 content 分片 —— 改的是客户端看到的字节，敏感度与那两者同级。
+        // 默认关（见 config::KEY_STRIP_NEWLINE_KEEPALIVE 的取舍说明）；在线可切是
+        // 为了让「在真流量上验一次、不对立刻撤回」不需要重新构建镜像。
+        .route(
+            "/api/keepalive-strip",
+            get(api::keepalive::get_keepalive_strip).put(api::keepalive::put_keepalive_strip),
+        )
         // ── 机器人校验开关 ──
         // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：
         // 它决定登录 / 注册是否要求 ALTCHA proof-of-work，敏感度同级。
@@ -490,6 +536,14 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/zcode/captcha",
             get(api::zcode_captcha::get_captcha).post(api::zcode_captcha::push_captcha),
+        )
+        // 令牌池的补货节奏设置（目标 / 轮询间隔 / 单轮上限）：与上面那条的
+        // 分工见 `api::zcode_captcha_pool` 的模块头。stats 响应会把这三项
+        // 带给铸造器，保存后下一轮轮询就生效。同样挂 protected。
+        .route(
+            "/api/zcode/captcha-pool",
+            get(api::zcode_captcha_pool::get_captcha_pool)
+                .put(api::zcode_captcha_pool::put_captcha_pool),
         )
         // ── 系统提示词与内容拦截降级 ──
         // 与 /api/sanitize 同为「出站内容处理」的开关，但形状不同（枚举 + 文件
@@ -510,6 +564,27 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::auto_checkin::get_state).post(api::auto_checkin::configure),
         )
         .route("/api/auto-checkin/run", post(api::auto_checkin::run_now))
+        // ── 定时签到的条目 ──
+        // 总开关走上面的老接口；条目 CRUD / 立即执行在这里（分组理由见
+        // api::checkin_schedules 的模块头）。挂 protected：写配置 + 触发真签到，
+        // 敏感度与 /api/auto-checkin 同级。三条入口 any(...) 手工分发，
+        // 与 /api/scheduled-tasks 同一取舍（统一 404，不落到 405 兜底）。
+        .route("/api/checkin-schedules", any(api::checkin_schedules::entry))
+        .route("/api/checkin-schedules/", any(api::checkin_schedules::entry))
+        .route(
+            "/api/checkin-schedules/{*rest}",
+            any(api::checkin_schedules::entry),
+        )
+        // ── 签到记录明细台账 ──
+        // GET 查询 / DELETE 清空（全清护栏 all=1，照 logs 的规则；筛选删除与
+        // 查询共用同一份过滤链）。挂 protected：明细里有账号名与收益文案，
+        // 敏感度与 /api/logs 一致。
+        .route(
+            "/api/checkin-records",
+            get(api::checkin_records::query_records).delete(api::checkin_records::clear_records),
+        )
+        .route("/api/checkin-records/", any(api::logs_api::not_found))
+        .route("/api/checkin-records/{*rest}", any(api::logs_api::not_found))
         // ── 签到中心的聚合快照 ──
         // 只读一条：分组与「今日已签」的判定复用批量签到同一对判据
         // （CHECKIN_PROVIDERS ∩ supports_checkin），见 api::checkin_center 的模块头。

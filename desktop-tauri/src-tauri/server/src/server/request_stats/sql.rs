@@ -56,6 +56,7 @@
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection};
+use serde_json::Value;
 
 use super::record::{AttemptDetail, RequestEntry, RequestQuery, RunningProgress, SensitiveHit};
 use super::report::normalize_status_filter;
@@ -70,7 +71,7 @@ use super::report::normalize_status_filter;
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, credit";
+     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, credit";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -122,10 +123,18 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         // SQLite 没有布尔类型，按 INTEGER 读再判非零 —— 不依赖驱动对 bool 的
         // 隐式转换（手改过的库里写成 2 也照样算「是测试」）
         is_test: row.get::<_, i64>(23)? != 0,
-        // 末列是 schema v9 加的（本次消耗积分，REAL 可空）；旧行 NULL → None，
-        // 与「上游没报」在写入侧收敛成同一个值（见 `RequestEntry::credit`）。
+        // 第 25 列是 schema v10 加的（选路决策快照）；旧行 / 没走到选路的行是
+        // NULL —— 读成 Null，展示层不渲染那一段。rusqlite 未开 serde_json
+        // feature，Value 不能直接 FromSql：读 TEXT 再解析，坏值退 Null
+        // （与 decode_json_list 的「坏值退化」同一取向）
+        route: row
+            .get::<_, Option<String>>(24)?
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(Value::Null),
+        // 末列是 schema v10 / v12 加的（本次消耗积分，REAL 可空）；旧行 NULL →
+        // None，与「上游没报」在写入侧收敛成同一个值（见 `RequestEntry::credit`）。
         // 读成 Option<f64>：NULL 原样给 None，不替旧行编一个 0
-        credit: row.get(24)?,
+        credit: row.get(25)?,
     })
 }
 
@@ -144,6 +153,16 @@ fn decode_json_list<T: serde::de::DeserializeOwned>(text: &str) -> Vec<T> {
 /// 于是「这一列没有数据」在库里只有一种表示）。
 fn encode_json_list<T: serde::Serialize>(items: &[T]) -> String {
     serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// `Value` → JSON 文本列（`Null` 写成 SQL NULL —— 「没有决策」与旧行同形态，
+/// 与 `encode_json_list` 的 `'[]'` 不同：那里空表是有意的信息，这里 NULL 才是）。
+fn encode_optional_json(value: &serde_json::Value) -> SqlValue {
+    if value.is_null() {
+        SqlValue::Null
+    } else {
+        SqlValue::Text(value.to_string())
+    }
 }
 
 // ─── 过滤条件 → SQL ─────────────────────────────────────────
@@ -605,7 +624,7 @@ pub(super) fn update_running_request(
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
-         is_test = ?22, credit = ?23 \
+         is_test = ?22, route = ?23, credit = ?24 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -632,6 +651,7 @@ pub(super) fn update_running_request(
             // 来源标记收尾时**再写一次**（而不是只在首发时写）：这条 UPDATE 是
             // 无进行中行时的兜底之外的主路径，写一次保证两条插入路径口径一致
             entry.is_test as i64,
+            encode_optional_json(&entry.route),
             entry.credit,
         ],
     )
@@ -650,9 +670,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits, client_reasoning, upstream_reasoning, is_test, credit) \
+         sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, credit) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23)",
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             entry.id,
             entry.ts,
@@ -676,6 +696,7 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.client_reasoning,
             entry.upstream_reasoning,
             entry.is_test as i64,
+            encode_optional_json(&entry.route),
             entry.credit,
         ],
     )?;
@@ -890,13 +911,14 @@ mod tests {
             phase: String::new(),
             phase_started_at: None,
             is_test: false,
+            route: Value::Null,
         }
     }
 
     /// credit 的落库 → 读回往返：三种形态（小数 / 0 / 缺失）必须**逐字保留**。
     ///
-    /// 这是最易碎的一环：`credit` 排在 `REQUEST_COLUMNS` 末尾（序号 24），
-    /// 中间插列或漏读都会静默取错值；而「缺失」与「0」在 SQLite 里分别是 NULL
+    /// 这是最易碎的一环：`credit` 排在 `REQUEST_COLUMNS` 末尾（序号 25，
+    /// 前面一位是上游的 `route`），中间插列或漏读都会静默取错值；而「缺失」与「0」在 SQLite 里分别是 NULL
     /// 与 0.0，读侧必须靠 `Option<f64>` 分得开（见 `RequestEntry::credit`）。
     #[test]
     fn credit_round_trips_through_insert_and_select() {
