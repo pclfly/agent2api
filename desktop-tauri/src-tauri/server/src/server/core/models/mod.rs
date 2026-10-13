@@ -427,7 +427,7 @@ pub const EDITION_SUFFIX_CN: &str = "-cn";
 /// 不带后缀 → `(原样, None)`；后缀不构成有效模型名时也不拆（避免把
 /// `gpt-4-cn` 这种本来就以 `-cn` 结尾的**真名**误剥 —— 判据是「剥完还剩东西」）。
 /// 路由解析（`catalog::routing::entry_id_in_manifest`）与选路
-/// （`upstream::rotate::restrict_workbuddy_edition`）共用这一处。
+/// （`upstream::rotate::restrict_edition_candidates`）共用这一处。
 pub fn split_edition_suffix(model: &str) -> (String, Option<&'static str>) {
     let trimmed = model.trim();
     let lower = trimmed.to_lowercase();

@@ -56,6 +56,8 @@ import {
   type PromptPatch,
 } from './settings-model'
 import { t } from '../i18n'
+import { providerPatch } from './settings-prompt-patch'
+import { readPromptModelScope, type PromptModelScope } from './settings-prompt-models'
 
 /* ─── 快照类型 ─────────────────────────────── */
 
@@ -152,13 +154,14 @@ export type PromptState = {
   gateway: Record<string, boolean>
   /** **网关自带提示词的正文覆盖**：只含改过的家与段（缺的段 = 官方原文） */
   gatewayText: Record<string, GatewayBlocks>
-  /** 可配置的家（下拉用）：注册表全量，含网关自带提示词的说明、规模与正文模板 */
+  /** 可配置的家（下拉用）：内置及已登记自定义供应商，含可用的网关提示词模板 */
   options: ProviderPromptOption[]
 }
 
 /** 单一提供商的提示词覆盖（字段与全局那份同构，同一套渲染逻辑） */
 export type ProviderPromptState = {
   id: string
+  models: PromptModelScope
   mode: string
   file: string
   /** **生效正文**（同上；`passthrough` 下是空串） */
@@ -185,6 +188,7 @@ export type ProviderPromptState = {
  */
 export type ProviderPromptOption = {
   id: string
+  models: string[]
   label: string
   gatewayNote: string
   gatewayChars: number
@@ -1312,6 +1316,7 @@ function providerPrompts(raw: unknown, gateway: Record<string, boolean>): Provid
       const entry = value as Record<string, unknown>
       return {
         id,
+        models: readPromptModelScope(entry.promptModels),
         mode: String(entry.promptMode || 'passthrough'),
         file: String(entry.promptFile || ''),
         text: String(entry.promptText || ''),
@@ -1335,6 +1340,7 @@ function providerOptions(raw: unknown): ProviderPromptOption[] {
       const entry = item as Record<string, unknown>
       return {
         id: String(entry.id),
+        models: Array.isArray(entry.models) ? entry.models.filter((id): id is string => typeof id === 'string') : [],
         label: String(entry.label || entry.id),
         gatewayNote: String(entry.gatewayNote || ''),
         gatewayChars: Number(entry.gatewayChars) || 0,
@@ -1477,7 +1483,7 @@ export function promptProviderLabel(prompt: PromptState, id: string): string {
  * "null"** —— 那会被当成一家叫 `null` 的提供商发给后端，后端如实回一句
  * 「未知的提供商 id：null」，用户看到的就是一次莫名其妙的保存失败。
  * 这一层则保证：不管 id 从哪儿来（旧响应、手改的数据、以后新增的调用点），
- * 未登记的家**永远发不出去** —— 与后端 `is_known_provider_id` 同一口径。
+ * 未登记的家**永远发不出去** —— 与后端提示词专用供应商校验同一口径。
  */
 function knownProviderId(id: unknown): string {
   const text = id == null ? '' : String(id).trim()
@@ -1489,34 +1495,9 @@ function knownProviderId(id: unknown): string {
 async function saveProviderPrompt(
   label: string,
   id: string,
-  patch: { promptMode?: string; promptFile?: string; promptText?: string } | null,
+  patch: { promptMode?: string; promptFile?: string; promptText?: string; promptModels?: PromptModelScope } | null,
 ): Promise<boolean> {
   return savePromptField(label, { promptProviders: { [id]: patch } })
-}
-
-/**
- * 「这一行屏幕上显示的那几个值」→ 这一家自己的覆盖（**所见即所存**）。
- *
- * 模式与文件一起落：这一行可能原本「跟随全局」（界面上显示的是全局那份），只改
- * 一个值时，另一个若不带就落到「内置默认」—— 一次改动，两个后果，第二个还看不见
- * （`saveProviderPromptMode` 早先就为这件事这么做了）。
- *
- * **正文**只在一种情况下一起落：这一行原本跟随全局、且全局那份正文本身就是
- * 「界面里编辑的」。否则给空串（= 这一家没有自己的正文）：它自己的文件 / 内置默认
- * 接管，渲染出来的仍是屏幕上那段文本（文件路径刚被一起落下来了）。反过来，若无条件
- * 把屏幕上的文本落成这一家的正文，就会把**文件内容复制进配置** —— 之后改文件不再生效，
- * 而配置里多出几百行看不出缘由的文本。
- */
-function providerPatch(
-  prompt: PromptState,
-  item: ProviderPromptState,
-): { promptMode: string; promptFile: string; promptText: string } {
-  const followGlobal = !item.configured
-  return {
-    promptMode: item.mode,
-    promptFile: item.file,
-    promptText: followGlobal && prompt.source === 'inline' ? prompt.text : '',
-  }
 }
 
 /** 给这一家加一条覆盖（初始值 = 全局那份：屏幕上显示的几项都照抄当前的全局值） */
@@ -1538,6 +1519,14 @@ export async function addProviderPrompt(rawId: string): Promise<void> {
       gateway: prompt.gateway[id] ?? true,
       configured: false,
     }),
+  )
+}
+
+export async function saveProviderPromptModels(item: ProviderPromptState, models: PromptModelScope): Promise<boolean> {
+  const id = knownProviderId(item.id)
+  if (!id) return false
+  return saveProviderPrompt(
+    t('已保存'), id, { ...providerPatch(snapshot.prompt, item), promptModels: models },
   )
 }
 

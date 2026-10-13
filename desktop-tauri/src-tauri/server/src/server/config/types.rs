@@ -178,6 +178,9 @@ pub const KEY_PROMPT_TEXT: &str = "promptText";
 /// 逐家的差异写在这里。
 pub const KEY_PROMPT_PROVIDERS: &str = "promptProviders";
 
+/// 每家提示词适用的上游模型 ID：缺省/null=全部（含新增），[]=均不应用。
+pub const KEY_PROMPT_MODELS: &str = "promptModels";
+
 /// **网关自带提示词**的逐家开关（config.json 键）：`{"<providerId>": false}`。
 ///
 /// 上面那个键管的是**客户端 system 怎么处理**；这一项管的是**网关自己要不要装
@@ -226,6 +229,8 @@ pub struct ProviderPromptPatch {
     pub file: Option<String>,
     /// 界面里编辑的正文（`None` / 空白 = 没有这一份，回落文件 / 内置默认）
     pub inline: Option<String>,
+    /// None=全部；Some([])=全不选；其余为上游模型 ID 白名单。
+    pub models: Option<Vec<String>>,
 }
 
 /// 系统提示词设置（设置页「通用 → 系统提示词」）。
@@ -303,6 +308,8 @@ pub struct ProviderPrompt {
     pub source: crate::server::core::prompt::PromptSource,
     /// 指定了文件但读不到时的原因（`None` = 没这回事）
     pub file_error: Option<String>,
+    /// None=全部；Some([])=全不选。未选模型不回落全局提示词。
+    pub models: Option<Vec<String>>,
 }
 
 /// 三档保留天数的默认值（缺失时用它们）

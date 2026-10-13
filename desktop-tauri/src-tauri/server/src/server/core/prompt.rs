@@ -236,6 +236,30 @@ impl GatewayBlocks {
     }
 }
 
+/// 解析模型范围：保留显式空数组，去空白并按ID不区分ASCII大小写去重。
+/// 名字可暂不在目录中（如暂时停用/尚未加载），不能在保存其他字段时丢失。
+pub fn parse_model_scope(value: Option<&Value>) -> Result<Option<Vec<String>>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            if items.len() > 10000 {
+                return Err("模型范围最多包含 10000 项".to_string());
+            }
+            let mut out: Vec<String> = Vec::new();
+            for item in items {
+                let id = item.as_str().map(str::trim)
+                    .filter(|id| !id.is_empty() && id.chars().count() <= 2048)
+                    .ok_or_else(|| "模型范围必须是非空模型 ID 字符串数组（每项最多 2048 字符）".to_string())?;
+                if !out.iter().any(|known| known.eq_ignore_ascii_case(id)) {
+                    out.push(id.to_string());
+                }
+            }
+            Ok(Some(out))
+        }
+        _ => Err("模型范围必须是字符串数组或 null（null 表示全部模型）".to_string()),
+    }
+}
+
 /// 一次请求的提示词决定（全局默认 + 各家覆盖的**借用**视图）。
 ///
 /// 借用而不是克隆：本结构由 `upstream::forward` 从配置快照里取一次，随
@@ -270,6 +294,16 @@ impl<'a> PromptPlan<'a> {
         providers: &'a std::collections::BTreeMap<String, crate::server::config::ProviderPrompt>,
     ) -> Self {
         Self { default, providers }
+    }
+
+    /// 按实际目标模型取配置。未选模型返回 None，而非回落全局或触发降级。
+    pub fn for_model(&self, provider_id: &str, model: &str) -> Option<PromptChoice<'_>> {
+        if let Some(models) = self.providers.get(provider_id).and_then(|entry| entry.models.as_ref()) {
+            if !models.iter().any(|id| id.eq_ignore_ascii_case(model.trim())) {
+                return None;
+            }
+        }
+        Some(self.for_provider(provider_id))
     }
 
     /// 这一家实际要用的那一份（没单独配就走 `default`）。

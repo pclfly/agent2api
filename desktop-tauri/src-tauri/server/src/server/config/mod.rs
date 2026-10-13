@@ -613,6 +613,9 @@ fn providers_from(raw: &Map<String, Value>) -> std::collections::BTreeMap<String
                 text: choice.text,
                 source: choice.source,
                 file_error: choice.file_error,
+                // 损坏的范围不能扩大成全部；接口写侧会拒绝非法输入。
+                models: crate::server::core::prompt::parse_model_scope(entry.get(KEY_PROMPT_MODELS))
+                    .unwrap_or_else(|_| Some(Vec::new())),
             },
         );
     }
@@ -1495,6 +1498,9 @@ pub fn set_prompt_provider(provider_id: &str, patch: Option<ProviderPromptPatch>
             if let Some(text) = patch.inline.filter(|text| !text.trim().is_empty()) {
                 one.insert(KEY_PROMPT_TEXT.to_string(), Value::String(text));
             }
+            if let Some(models) = patch.models {
+                one.insert(KEY_PROMPT_MODELS.to_string(), serde_json::json!(models));
+            }
             entry.insert(id.clone(), Value::Object(one));
         }
         // 一家都不剩时把整个键删掉：配置里不留下没意义的空对象
@@ -1737,6 +1743,119 @@ pub fn storage_dirs() -> StorageDirs {
         log_dir,
         request_stats_dir,
         debug_dir,
+    }
+}
+
+#[cfg(test)]
+mod custom_provider_prompt_tests {
+    use super::*;
+    use crate::server::core::prompt::{PromptMode, PromptSource};
+    use serde_json::json;
+
+    fn snapshot(mode: &str) -> RuntimeConfig {
+        let raw = json!({
+            "promptMode": "append",
+            "promptText": "Global engineering instructions",
+            "promptProviders": {
+                "custom-bedrock": {
+                    "promptMode": mode,
+                    "promptText": "Provider-specific engineering instructions"
+                }
+            }
+        });
+        // 序列化后重载，验证 custom-* 覆盖不被配置读侧过滤。
+        let encoded = serde_json::to_vec(&raw).unwrap();
+        let decoded: Map<String, Value> = serde_json::from_slice(&encoded).unwrap();
+        build(decoded)
+    }
+
+    #[test]
+    fn custom_provider_prompt_survives_reload_and_is_scoped() {
+        let config = snapshot("custom");
+        let plan = config.prompt_plan();
+        let own = plan.for_provider("custom-bedrock");
+        assert_eq!(own.mode, PromptMode::Custom);
+        assert_eq!(own.source, PromptSource::Inline);
+        assert_eq!(own.text, "Provider-specific engineering instructions");
+        for id in ["custom-other", "workbuddy"] {
+            assert_eq!(plan.for_provider(id).mode, PromptMode::Append);
+            assert_eq!(plan.for_provider(id).text, "Global engineering instructions");
+        }
+    }
+
+    #[test]
+    fn custom_provider_prompt_replacement_reaches_bedrock_system() {
+        let config = snapshot("custom");
+        let input = json!({"messages":[
+            {"role":"system","content":"Original style guide"},
+            {"role":"developer","content":"Original formatting guide"},
+            {"role":"user","content":"Explain this function"}
+        ]});
+        let original = input.clone();
+        let rewritten = config.prompt_plan().for_provider("custom-bedrock")
+            .apply(&input, false).expect("替换应生成副本");
+        let wire = crate::server::core::protocol::bedrock_outbound::bedrock_request_from_chat(
+            &rewritten, "us.anthropic.claude-opus-5-5",
+        ).expect("Bedrock 转换应成功");
+        assert_eq!(wire["system"][0], json!({"text":"Provider-specific engineering instructions"}));
+        assert_eq!(wire["messages"][0]["content"][0]["text"], "Explain this function");
+        assert_eq!(input, original, "不得修改客户端原始请求");
+    }
+
+    #[test]
+    fn custom_provider_prompt_append_and_passthrough_keep_client_messages() {
+        let input = json!({"messages":[
+            {"role":"system","content":"Client style guide"},
+            {"role":"user","content":"Explain this function"}
+        ]});
+        let append = snapshot("append");
+        let out = append.prompt_plan().for_provider("custom-bedrock").apply(&input, false).unwrap();
+        assert_eq!(out["messages"][0], input["messages"][0]);
+        assert_eq!(out["messages"][1]["content"], "Provider-specific engineering instructions");
+        assert_eq!(out["messages"][2], input["messages"][1]);
+        let passthrough = snapshot("passthrough");
+        let plan = passthrough.prompt_plan();
+        assert!(plan.for_provider("custom-bedrock").apply(&input, false).is_none());
+        assert_eq!(plan.for_provider("custom-bedrock").text, "Provider-specific engineering instructions");
+    }
+
+    #[test]
+    fn prompt_model_scope_defaults_to_all_and_excludes_without_global_fallback() {
+        let config = snapshot("custom");
+        assert!(config.prompt_plan().for_model("custom-bedrock", "future-model").is_some());
+        for scope in [serde_json::Value::Null, json!([]), json!(["model-a"])] {
+            let mut raw = config.raw().clone();
+            raw.get_mut(KEY_PROMPT_PROVIDERS).unwrap()["custom-bedrock"][KEY_PROMPT_MODELS] = scope.clone();
+            let encoded = serde_json::to_vec(&raw).unwrap();
+            let loaded = build(serde_json::from_slice(&encoded).unwrap());
+            let plan = loaded.prompt_plan();
+            assert_eq!(plan.for_model("custom-bedrock", "model-b").is_some(), scope.is_null());
+            assert_eq!(plan.for_model("custom-bedrock", " MODEL-A ").is_some(), scope.is_null() || scope == json!(["model-a"]));
+            assert_eq!(plan.for_model("workbuddy", "model-b").unwrap().mode, PromptMode::Append);
+            if scope == json!([]) {
+                assert!(plan.for_model("custom-bedrock", "").is_none());
+                assert!(plan.for_model("custom-bedrock", "model-a").and_then(|choice| choice.apply(&json!({}), true)).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_model_scope_invalid_disk_value_fails_closed() {
+        let mut raw = snapshot("custom").raw().clone();
+        raw.get_mut(KEY_PROMPT_PROVIDERS).unwrap()["custom-bedrock"][KEY_PROMPT_MODELS] = json!("broken");
+        let loaded = build(raw);
+        assert!(loaded.prompt_plan().for_model("custom-bedrock", "model-a").is_none());
+    }
+
+    #[test]
+    fn custom_provider_prompt_removed_override_follows_global() {
+        let config = snapshot("custom");
+        let mut raw = config.raw().clone();
+        raw.get_mut(KEY_PROMPT_PROVIDERS).unwrap().as_object_mut().unwrap().remove("custom-bedrock");
+        let restored = build(raw);
+        let plan = restored.prompt_plan();
+        assert_eq!(plan.for_provider("custom-bedrock").mode, PromptMode::Append);
+        assert_eq!(plan.for_provider("custom-bedrock").text, "Global engineering instructions");
     }
 }
 

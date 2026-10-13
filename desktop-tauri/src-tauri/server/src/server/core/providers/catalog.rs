@@ -18,6 +18,7 @@ use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, PROVIDERS};
 
 use super::autoclaw::region::Region as AutoclawRegion;
+use super::qoder::endpoints::Region as QoderRegion;
 use super::workbuddy::Region as WorkBuddyRegion;
 
 pub use routing::{
@@ -41,6 +42,23 @@ fn manifest_for(kind: ProviderKind) -> Vec<Value> {
     models
 }
 
+/// 设置页使用的本地模型 ID 清单，不刷新网络、不要求账号可用，含停用模型。
+/// 模型别名不单列：提示词按实际目标模型选择，别名共用目标范围。
+pub fn prompt_model_ids(provider_id: &str) -> Vec<String> {
+    let entries = if let Some(kind) = kind_from_id(provider_id) {
+        manifest_for(kind)
+    } else {
+        crate::server::core::custom_providers::models_of(provider_id)
+    };
+    let mut ids: Vec<String> = entries.iter().map(|item| {
+        item.get("editionAliasOf").and_then(Value::as_str)
+            .map(str::to_string).unwrap_or_else(|| model_id(item))
+    }).filter(|id| !id.trim().is_empty()).collect();
+    ids.sort_by_key(|id| id.to_ascii_lowercase());
+    ids.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    ids
+}
+
 /// 内置家清单的两步后处理：用户自定义模型 + 能力位覆盖。
 ///
 /// 抽出来是因为 WorkBuddy 现在按版本出**两条**清单（见 [`manifests_for`]），
@@ -57,7 +75,7 @@ fn augment_manifest(kind: ProviderKind, models: &mut Vec<Value>) {
     model_rules::apply_capability_overrides(kind_id(kind), models);
 }
 
-/// 一家的清单（**WorkBuddy 的两个地区各出一条**）。
+/// 一家的清单（**WorkBuddy / Qoder 的两个地区各出一条**）。
 ///
 /// ── 为什么 WorkBuddy 要按地区拆开（2026-10，参考 workbuddy2api-hub）──
 /// 上游两个站点下发**两套清单**（国际版 29 个 / 国内版 55 个），交集里同名模型
@@ -75,38 +93,76 @@ fn augment_manifest(kind: ProviderKind, models: &mut Vec<Value>) {
 /// 两版都有的模型再补一条 `xxx-cn` / `xxx-intl` 后缀别名（见
 /// [`append_edition_alias`]）—— 那是「同名模型想指定打哪一站」的路由手段，
 /// 与拆家正交（对外名在两家之间本来就会撞，后缀让下游能点名单边）。
+///
+/// ── Qoder 同一条机制（2026-10 补）────────────────────────────
+/// Qoder 也是拆成两家的地区版（`qoder` 中国版 / `qoder-intl` 国际版），
+/// 两地上游各有一份目录、交集里同名模型（`Qwen3.8-Flash` / `Qwen3.8-Max` /
+/// `Auto` …）的倍率与上下文档位可以不同。本家不做 WorkBuddy 那样的「收窄」
+/// （没有 hub 白名单可对齐，上游目录本身就是给客户端的那份），其余完全同构：
+/// 本地区清单打 `edition` 标 + 给「两地都有」的名字补后缀别名，选路侧的
+/// 后缀收窄见 `upstream::rotate::restrict_edition_candidates`。
+/// `edition` 取值用 `region.edition()`（`"cn"` / `"intl"` 这个共享域），
+/// **不是** `region.id()` —— 国际版的 id 是 `"global"`，喂给后缀别名机制会
+/// 让国际版的别名整个消失（`append_edition_alias` 认的是 `EDITION_INTL`）。
 fn manifests_for(store: &AccountStore, kind: ProviderKind) -> Vec<Vec<Value>> {
-    let Some(region) = WorkBuddyRegion::from_kind(kind) else {
-        return vec![advertised_manifest_for(store, kind)];
-    };
-    let edition = region.id();
-    let other = match region {
-        WorkBuddyRegion::Cn => WorkBuddyRegion::Intl,
-        WorkBuddyRegion::Intl => WorkBuddyRegion::Cn,
-    };
-    // 两版各自先收窄（别名只给**留下**的模型生成，见下），再互相取 id 集：
-    // 别名只补「两版都有的真模型」。
-    let curated_of =
-        |region: WorkBuddyRegion| workbuddy_curated(workbuddy_catalog(region).list(), region.id());
-    let ids_of = |models: &[Value]| -> std::collections::HashSet<String> {
-        models
-            .iter()
-            .map(|item| model_id(item).to_lowercase())
-            .filter(|id| !id.is_empty())
-            .collect()
-    };
-    let other_ids = ids_of(&curated_of(other));
-    let mut models = curated_of(region);
-    augment_manifest(kind, &mut models);
+    if let Some(region) = WorkBuddyRegion::from_kind(kind) {
+        let edition = region.id();
+        let other = match region {
+            WorkBuddyRegion::Cn => WorkBuddyRegion::Intl,
+            WorkBuddyRegion::Intl => WorkBuddyRegion::Cn,
+        };
+        // 两版各自先收窄（别名只给**留下**的模型生成，见下），再互相取 id 集：
+        // 别名只补「两版都有的真模型」。
+        let curated_of = |region: WorkBuddyRegion| {
+            workbuddy_curated(workbuddy_catalog(region).list(), region.id())
+        };
+        let other_ids = model_id_set(&curated_of(other));
+        let mut models = curated_of(region);
+        augment_manifest(kind, &mut models);
+        models = stamp_region_manifest(models, &other_ids, edition);
+        return vec![adapter_for(kind).advertise_models(store, models)];
+    }
+    if let Some(region) = QoderRegion::from_kind(kind) {
+        return vec![qoder_manifest(store, kind, region)];
+    }
+    vec![advertised_manifest_for(store, kind)]
+}
+
+/// 一批清单条目的 id 集合（小写、去空）—— 跨地区求「两边都有」的交集判据用。
+fn model_id_set(models: &[Value]) -> std::collections::HashSet<String> {
+    models
+        .iter()
+        .map(|item| model_id(item).to_lowercase())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// 给清单打上本地区 `edition` 标，并为「两地区都有」的名字补后缀别名。
+/// （WorkBuddy 与 Qoder 两条拆家路径共用；别名规则的唯一出处是
+/// [`append_edition_alias`]，这里只补上「先打版本标」这一前置步骤。）
+fn stamp_region_manifest(
+    mut models: Vec<Value>,
+    other_ids: &std::collections::HashSet<String>,
+    edition: &str,
+) -> Vec<Value> {
     for item in models.iter_mut() {
         if let Some(object) = item.as_object_mut() {
             object.insert("edition".to_string(), Value::String(edition.to_string()));
         }
     }
-    // 两版都有的模型补一条**本版本**的后缀别名（各自的倍率/名称都对：
-    // 别名从本版清单的条目克隆，不是从另一版借的）
-    append_edition_alias(&mut models, &other_ids, edition);
-    vec![adapter_for(kind).advertise_models(store, models)]
+    append_edition_alias(&mut models, other_ids, edition);
+    models
+}
+
+/// Qoder 本地区的对外清单（与 WorkBuddy 同构的后缀别名机制，理由见
+/// [`manifests_for`] 的「Qoder 同一条机制」一段）。
+fn qoder_manifest(store: &AccountStore, kind: ProviderKind, region: QoderRegion) -> Vec<Value> {
+    let edition = region.edition();
+    // 另一地区的对外清单（同样带自定义模型与能力覆盖）：交集判据用它取
+    let other_ids = model_id_set(&manifest_for(region.other().kind()));
+    let mut models = manifest_for(kind);
+    models = stamp_region_manifest(models, &other_ids, edition);
+    adapter_for(kind).advertise_models(store, models)
 }
 
 // ─── WorkBuddy 清单收窄（与 workbuddy2api-hub 的 /v1/models 对齐）──────
@@ -644,5 +700,43 @@ mod tests {
         let mut intl = vec![model("glm-5.3", Some("x0.79"))];
         append_edition_alias(&mut intl, &shared, EDITION_INTL);
         assert_eq!(vec!["glm-5.3", "glm-5.3-intl"], ids(&intl));
+    }
+
+    /// 地区清单的统一入口（WorkBuddy 与 Qoder 共用）：本地区条目标 `edition`、
+    /// 「两地都有」的名字补后缀别名、独有名不加。喂真实的 Qoder 交集名
+    /// （`Qwen3.8-Flash` / `Auto`），并同时钉住**取值域**：`QoderRegion::edition()`
+    /// 必须落进 `cn` / `intl` 这个共享域 —— 国际版的 `region.id()` 是 `"global"`，
+    /// 哪天有人把它喂进来，`append_edition_alias` 的 intl 分支整个不触发，
+    /// 国际版别名会静默消失（`EDITION_SUFFIX_INTL` 只在 edition == "intl" 时生效）。
+    #[test]
+    fn region_manifest_stamps_edition_and_aliases_shared_qoder_models() {
+        assert_eq!(EDITION_CN, QoderRegion::Cn.edition());
+        assert_eq!(EDITION_INTL, QoderRegion::Global.edition());
+        let shared = model_id_set(&[model("Qwen3.8-Flash", None), model("Auto", None)]);
+        // 中国版：共有名补 `-cn`，独有名（GLM-5.3 只在兜底 cn 表里的构造情形）不加
+        let cn = stamp_region_manifest(
+            vec![model("Qwen3.8-Flash", None), model("GLM-5.3", None)],
+            &shared,
+            QoderRegion::Cn.edition(),
+        );
+        assert_eq!(vec!["Qwen3.8-Flash", "GLM-5.3", "Qwen3.8-Flash-cn"], ids(&cn));
+        assert_eq!(Some("cn"), cn[0].get("edition").and_then(Value::as_str));
+        assert_eq!(Some("cn"), cn[2].get("edition").and_then(Value::as_str));
+        assert_eq!(
+            Some("Qwen3.8-Flash"),
+            cn[2].get("editionAliasOf").and_then(Value::as_str)
+        );
+        // 国际版：同一条目补 `-intl`，别名克隆自本版（倍率/名称都是本版的）
+        let intl = stamp_region_manifest(
+            vec![model("Qwen3.8-Flash", Some("x0.00"))],
+            &shared,
+            QoderRegion::Global.edition(),
+        );
+        assert_eq!(vec!["Qwen3.8-Flash", "Qwen3.8-Flash-intl"], ids(&intl));
+        assert_eq!(Some("intl"), intl[1].get("edition").and_then(Value::as_str));
+        assert_eq!(
+            Some("Qwen3.8-Flash（国际版）"),
+            intl[1].get("name").and_then(Value::as_str)
+        );
     }
 }

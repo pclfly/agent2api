@@ -163,14 +163,19 @@
   }
 
   /**
-   * 协议下拉的三个选项：值与后端 custom_providers::PROTOCOLS 逐字一致，
+   * 协议下拉的选项：值与后端 custom_providers::PROTOCOLS 逐字一致，
    * 文案即添加表单与编辑弹窗共用的展示名。放在本文件（目录层）而不是让两个
    * 表单各写一份：新增一种协议时值与文案只有一处要改。
+   *
+   * Bedrock 的填写差异（表单提示里已注明）：API Key 栏填
+   * `AccessKeyId:SecretAccessKey`（可选第三段 region），Base URL 可留空
+   * （按 region 拼标准端点）或填 `https://bedrock-runtime.<region>.amazonaws.com`。
    */
   const PROTOCOL_OPTIONS = [
     { value: 'chat_completions', label: 'OpenAI - Chat Completions' },
     { value: 'responses', label: 'OpenAI - Responses' },
     { value: 'anthropic', label: 'Anthropic - Messages' },
+    { value: 'bedrock', label: 'AWS Bedrock - Converse' },
   ];
 
   /** 按 id 取展示名：空值给空串、查不到就原样回显 id（调用方自行决定占位符） */

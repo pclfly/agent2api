@@ -42,9 +42,9 @@ use serde_json::{json, Value};
 
 use crate::server::config::{
     self, PromptSettings, ProviderPromptPatch, KEY_PROMPT_FILE, KEY_PROMPT_GATEWAY,
-    KEY_PROMPT_GATEWAY_TEXT, KEY_PROMPT_MODE, KEY_PROMPT_PROVIDERS, KEY_PROMPT_TEXT,
+    KEY_PROMPT_GATEWAY_TEXT, KEY_PROMPT_MODE, KEY_PROMPT_MODELS, KEY_PROMPT_PROVIDERS, KEY_PROMPT_TEXT,
 };
-use crate::server::core::degrade;
+use crate::server::core::{custom_providers, degrade};
 use crate::server::core::prompt::{GatewayBlocks, PromptMode};
 use crate::server::core::providers;
 use crate::server::errors;
@@ -155,6 +155,8 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
     // 全部校验完再写：一条请求改三家、第三家写错时前两家也不该落盘 ——
     // 与上面全局项的「校验全部通过才写」是同一条口径。
     let mut provider_patches: Vec<(String, Option<ProviderPromptPatch>)> = Vec::new();
+    // 与设置页候选一致：允许已登记的自定义家（含暂停的家），不只凭 custom- 前缀放行。
+    let custom = custom_providers::list();
     match object.get(KEY_PROMPT_PROVIDERS) {
         None | Some(Value::Null) => {}
         Some(Value::Object(entries)) => {
@@ -163,7 +165,7 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
                 if id.is_empty() {
                     return errors::management_error(400, "提供商 id 不能为空串");
                 }
-                if !providers::is_known_provider_id(id) {
+                if !is_prompt_provider_id(id, &custom) {
                     return errors::management_error(
                         400,
                         format!("未知的提供商 id：{id}（只能配已登记的提供商）"),
@@ -252,12 +254,22 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
                         }
                     }
                 }
+                // 未给范围保持旧值；null=全部，[]明确表示全不选。
+                let entry_models = if entry.contains_key(KEY_PROMPT_MODELS) {
+                    match crate::server::core::prompt::parse_model_scope(entry.get(KEY_PROMPT_MODELS)) {
+                        Ok(models) => models,
+                        Err(message) => return errors::management_error(400, format!("{id}: {message}")),
+                    }
+                } else {
+                    previous.and_then(|item| item.models.clone())
+                };
                 provider_patches.push((
                     id.to_string(),
                     Some(ProviderPromptPatch {
                         mode: entry_mode,
                         file: entry_file,
                         inline: entry_inline,
+                        models: entry_models,
                     }),
                 ));
             }
@@ -549,6 +561,7 @@ fn providers_json(settings: &PromptSettings) -> Value {
                 KEY_PROMPT_MODE: entry.mode.as_str(),
                 KEY_PROMPT_FILE: entry.file.clone().unwrap_or_default(),
                 KEY_PROMPT_TEXT: entry.text,
+                KEY_PROMPT_MODELS: entry.models,
                 "promptSource": entry.source.as_str(),
                 "promptLines": entry.text.lines().count(),
                 "promptFileError": entry.file_error,
@@ -583,7 +596,7 @@ fn gateway_text_json(settings: &PromptSettings) -> Value {
     Value::Object(map)
 }
 
-/// 可配置的家：注册表全量
+/// 可配置的家：内置注册表 + 已登记自定义提供商（含暂停项，无需已有账号）
 /// （`[{id,label,gatewayNote,gatewayChars,gatewayBlocks}]`）。
 ///
 ///   · `gatewayNote` 非空 = 这家有一段**网关自带**的提示词（界面据此把这一家
@@ -592,21 +605,55 @@ fn gateway_text_json(settings: &PromptSettings) -> Value {
 ///   · `gatewayBlocks` = 那段装配的**正文模板**（三段；Environment 段带
 ///     `{cwd}` 这类占位符）。编辑器拿它当初始值与「恢复官方原文」的目标。
 fn provider_options() -> Value {
-    Value::Array(
-        providers::PROVIDERS
-            .iter()
-            .map(|meta| {
-                json!({
-                    "id": meta.id,
-                    "label": meta.label,
-                    "gatewayNote": providers::gateway_prompt_note(meta.id),
-                    "gatewayChars": providers::gateway_prompt_chars(meta.id),
-                    "gatewayBlocks": providers::gateway_prompt_blocks(meta.id)
-                        .map(|blocks| blocks_json(&blocks)),
-                })
+    let mut options = provider_options_for(&custom_providers::list());
+    if let Some(items) = options.as_array_mut() {
+        for item in items {
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+            let models = providers::catalog::prompt_model_ids(id);
+            item["models"] = json!(models);
+        }
+    }
+    options
+}
+
+/// 只拓宽普通提示词覆盖的范围；官方网关提示词与内置适配器的校验不变。
+fn is_prompt_provider_id(id: &str, custom: &[Value]) -> bool {
+    providers::is_known_provider_id(id)
+        || (id.starts_with("custom-")
+            && custom.iter().any(|item| item.get("id").and_then(Value::as_str) == Some(id)))
+}
+
+fn provider_options_for(custom: &[Value]) -> Value {
+    let mut options: Vec<Value> = providers::PROVIDERS
+        .iter()
+        .map(|meta| {
+            json!({
+                "id": meta.id,
+                "label": meta.label,
+                "gatewayNote": providers::gateway_prompt_note(meta.id),
+                "gatewayChars": providers::gateway_prompt_chars(meta.id),
+                "gatewayBlocks": providers::gateway_prompt_blocks(meta.id)
+                    .map(|blocks| blocks_json(&blocks)),
             })
-            .collect(),
-    )
+        })
+        .collect();
+    for item in custom {
+        let Some(id) = item.get("id").and_then(Value::as_str)
+            .filter(|id| id.starts_with("custom-")) else { continue };
+        if options.iter().any(|option| option["id"] == id) {
+            continue;
+        }
+        let label = item.get("name").and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty()).unwrap_or(id);
+        options.push(json!({
+            "id": id,
+            "label": label,
+            "gatewayNote": Value::Null,
+            "gatewayChars": 0,
+            "gatewayBlocks": Value::Null,
+        }));
+    }
+    Value::Array(options)
 }
 
 /// 三段正文的 JSON 形态（段名就是 `GatewayBlocks::FIELDS`）
@@ -616,6 +663,64 @@ fn blocks_json(blocks: &GatewayBlocks) -> Value {
         map.insert(field.to_string(), Value::String(blocks.get(field).to_string()));
     }
     Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn custom_entries() -> Vec<Value> {
+        vec![
+            json!({"id":"custom-bedrock", "name":"Bedrock", "enabled":true}),
+            json!({"id":"custom-paused", "name":"Paused provider", "enabled":false}),
+        ]
+    }
+
+    #[test]
+    fn prompt_provider_options_include_registered_custom_providers() {
+        let options = provider_options_for(&custom_entries());
+        let entries = options.as_array().expect("候选列表");
+        for (id, label) in [("custom-bedrock", "Bedrock"), ("custom-paused", "Paused provider")] {
+            let item = entries.iter().find(|item| item["id"] == id).expect("自定义家必须出现");
+            assert_eq!(item["label"], label);
+            assert!(item["gatewayNote"].is_null(), "不能给自定义家伪造官方网关提示词");
+            assert!(item["gatewayBlocks"].is_null());
+            assert_eq!(item["gatewayChars"], 0);
+        }
+        assert_eq!(entries.len(), providers::PROVIDERS.len() + 2);
+        assert_eq!(entries[0]["id"], providers::PROVIDERS[0].id);
+    }
+
+    #[test]
+    fn prompt_provider_validation_accepts_only_registered_ids() {
+        let custom = custom_entries();
+        assert!(is_prompt_provider_id("workbuddy", &custom));
+        assert!(is_prompt_provider_id("custom-bedrock", &custom));
+        assert!(is_prompt_provider_id("custom-paused", &custom));
+        assert!(!is_prompt_provider_id("custom-missing", &custom));
+        assert!(!is_prompt_provider_id("null", &custom));
+        assert!(!is_prompt_provider_id("", &custom));
+        assert!(!is_prompt_provider_id("custom-bedrock", &[]));
+    }
+
+    #[test]
+    fn prompt_model_scope_input_validation() {
+        use crate::server::core::prompt::parse_model_scope;
+        assert_eq!(parse_model_scope(None).unwrap(), None);
+        assert_eq!(parse_model_scope(Some(&Value::Null)).unwrap(), None);
+        assert_eq!(parse_model_scope(Some(&json!([]))).unwrap(), Some(vec![]));
+        assert_eq!(parse_model_scope(Some(&json!([" Model-A ", "model-a", "model-b"]))).unwrap(), Some(vec!["Model-A".to_string(), "model-b".to_string()]));
+        for invalid in [json!("all"), json!(false), json!([1]), json!([""]), json!([null])] {
+            assert!(parse_model_scope(Some(&invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn prompt_custom_provider_options_follow_current_name() {
+        let options = provider_options_for(&[json!({"id":"custom-bedrock", "name":"Renamed"})]);
+        let item = options.as_array().unwrap().iter().find(|item| item["id"] == "custom-bedrock").unwrap();
+        assert_eq!(item["label"], "Renamed");
+    }
 }
 
 /// 400 文案里列出的合法模式

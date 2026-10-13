@@ -46,6 +46,15 @@ impl Region {
         Self::ALL.into_iter().find(|region| region.kind() == kind)
     }
 
+    /// 另一地区（跨地区求「两地都有」的交集时用；与 WorkBuddy 的
+    /// `manifests_for` 同一条链路，见 `providers::catalog`）
+    pub fn other(self) -> Self {
+        match self {
+            Self::Cn => Self::Global,
+            Self::Global => Self::Cn,
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self, GatewayError> {
         match value.trim() {
             "" | "global" | "intl" => Ok(Self::Global),

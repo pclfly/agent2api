@@ -178,9 +178,20 @@ pub(super) fn send_body<'a>(
     // `degraded` = 本请求是否已进入降级（请求开始时状态机已生效，或本次撞了
     // 内容拦截后由转发层置位）：降级期用最小中性提示词（`custom` 模式除外，
     // 见 `PromptChoice::text_for`）。
-    let prompt = ctx.prompt.for_provider(provider_id);
-    let after_prompt = match prompt.apply(ctx.body, degraded) {
-        Some(next) => {
+    let requested = ctx.body.get("model").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let wire = crate::server::core::providers::catalog::wire_target_for_provider(
+        &requested, provider_id, account,
+    );
+    // 自定义家仍在自己的转发器改名；这里只解析同一目标来判定提示词范围，
+    // 不提前写回 body，避免丢失别名上的思考等级绑定。
+    let prompt_model = if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
+        crate::server::core::custom_providers::wire_model_for(provider_id, &requested).0
+    } else {
+        wire.model.clone()
+    };
+    let prompt = ctx.prompt.for_model(provider_id, &prompt_model);
+    let after_prompt = match prompt.and_then(|choice| choice.apply(ctx.body, degraded).map(|next| (choice, next))) {
+        Some((prompt, next)) => {
             logging::verbose(
                 "[Upstream]",
                 &format!(
@@ -246,23 +257,13 @@ pub(super) fn send_body<'a>(
             None => body,
         }
     };
-    let requested = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
     if requested.is_empty() {
         // 没有 model 字段：不改写，也没有可用的冷却键（空串，与改造前一致）
         return SendBody { body, wire_model: requested };
     }
     // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
     // （同源，见模块头「思考等级绑定为什么也在这一步」）
-    let wire = crate::server::core::providers::catalog::wire_target_for_provider(
-        &requested,
-        provider_id,
-        account,
-    );
+    // wire 已在提示词范围判定前解析，与出站改名共用一次结果。
     ctx.telemetry.note_upstream_model(&wire.model);
     rewrite_model(&mut body, &requested, &wire.model, provider_id);
     let injected = apply_reasoning(

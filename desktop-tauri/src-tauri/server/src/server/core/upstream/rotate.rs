@@ -294,7 +294,7 @@ pub(super) fn accounts_in_providers(
         .collect()
 }
 
-/// 候选账号池 + **按模型所属版本收窄**（WorkBuddy 的版本亲和）。
+/// 候选账号池 + **按模型所属版本收窄**（WorkBuddy / Qoder 的地区亲和）。
 ///
 /// ── 为什么还需要它（拆家后仍有用）───────────────────────────
 /// 拆家后两个地区是两家独立 provider，`providers` 已由 `forwarding_providers`
@@ -311,43 +311,64 @@ pub(super) fn accounts_for_model(
     model: &str,
 ) -> Vec<Value> {
     let accounts = accounts_in_providers(service, providers, pinned);
-    restrict_workbuddy_edition(accounts, model)
+    restrict_edition_candidates(accounts, model)
 }
 
-/// WorkBuddy 账号的版本收窄（其余家原样保留）。
+/// 版本后缀账号收窄（WorkBuddy 与 Qoder 两家；其余家原样保留）。
 ///
 /// 判据只有一条：请求名带显式版本后缀（`xxx-intl` / `xxx-cn`）。
 /// 「模型只属于某一个版本」那条判据随拆家退场 —— 那是「一个 provider 两份
 /// 清单」时代的补丁，现在两家 provider 各持一份清单，选路天然分流。
 ///
+/// ── 为什么两家共用这一个函数（2026-10）──────────────────────
+/// Qoder 与 WorkBuddy 是同一条「地区拆成两家 provider」的路数，后缀别名机制
+/// 也在 `providers::catalog` 里并成一处（`stamp_region_manifest`）。两家的地区
+/// 取值都归一到共享的 `cn` / `intl` 域（WorkBuddy `Region::id()`、Qoder
+/// `Region::edition()`），因此「点名哪一区」这条判据对两家逐字相同 —— 只是
+/// 按账号所属的**家**换成那一家里对应地区的 provider id。别家（如 AutoClaw /
+/// Accio）的模型名可能恰好以 `-cn` 结尾，所以收窄必须限定在这两个地区家族内。
+///
 /// ── 收窄后一个都不剩时**退回原集合**（有意）──────────────────
 /// 「那个版本一个可用账号都没有」的正确表现是上游如实报错（模型不存在 / 未授权），
 /// 而不是 503「没有可用账号」—— 后者会把排查方向引到账号页，而问题其实在
 /// 「这个模型属于另一个版本」。
-fn restrict_workbuddy_edition(accounts: Vec<Value>, model: &str) -> Vec<Value> {
+fn restrict_edition_candidates(accounts: Vec<Value>, model: &str) -> Vec<Value> {
     use crate::server::core::models::{split_edition_suffix, EDITION_INTL};
+    use crate::server::core::providers::qoder::endpoints::Region as QoderRegion;
+    use crate::server::core::providers::workbuddy::Region as WorkBuddyRegion;
     let (_name, Some(edition)) = split_edition_suffix(model) else {
         return accounts;
     };
-    let kind = if edition == EDITION_INTL {
-        crate::server::core::providers::ProviderKind::WorkBuddyIntl
-    } else {
-        crate::server::core::providers::ProviderKind::WorkBuddy
+    let want_intl = edition == EDITION_INTL;
+    // 账号 provider → 「本家里被点名的那个地区」的 provider id；不属于这两个
+    // 地区家族时返回 None（这条账号原样保留，不参与收窄）。
+    let wanted = |provider: &str| -> Option<&'static str> {
+        if WorkBuddyRegion::from_provider_id(provider).is_some() {
+            return Some(if want_intl {
+                WorkBuddyRegion::Intl.provider_id()
+            } else {
+                WorkBuddyRegion::Cn.provider_id()
+            });
+        }
+        if QoderRegion::from_provider_id(provider).is_some() {
+            return Some(if want_intl {
+                QoderRegion::Global.provider_id()
+            } else {
+                QoderRegion::Cn.provider_id()
+            });
+        }
+        None
     };
-    let wanted = crate::server::core::providers::kind_id(kind);
     let narrowed: Vec<Value> = accounts
         .iter()
         .filter(|account| {
-            // 只有 WorkBuddy 系受这条判据影响（后缀本来就是它家的路由手段）；
-            // 其余家原样保留 —— 别家的模型名可能恰好以 `-cn` 结尾。
-            if crate::server::core::providers::workbuddy::Region::from_provider_id(
-                provider_of(account),
-            )
-            .is_none()
-            {
-                return true;
+            let provider = provider_of(account);
+            match wanted(provider) {
+                // 地区家族：只留被点名那一区的账号
+                Some(target) => provider == target,
+                // 其余家原样保留 —— 别家的模型名可能恰好以 `-cn` 结尾。
+                None => true,
             }
-            provider_of(account) == wanted
         })
         .cloned()
         .collect();
@@ -691,7 +712,7 @@ mod tests {
         ];
         // `-intl` → 只留国际版那家（其余家不受影响）
         assert_eq!(
-            ids(&restrict_workbuddy_edition(
+            ids(&restrict_edition_candidates(
                 accounts.clone(),
                 "deepseek-v4.1-flash-intl"
             )),
@@ -699,7 +720,7 @@ mod tests {
         );
         // `-cn` → 只留国内版那家
         assert_eq!(
-            ids(&restrict_workbuddy_edition(
+            ids(&restrict_edition_candidates(
                 accounts.clone(),
                 "deepseek-v4.1-flash-cn"
             )),
@@ -707,11 +728,41 @@ mod tests {
         );
         // 不带后缀 → 不收窄（两家的清单各自由 forwarding_providers 命中）
         assert_eq!(
-            restrict_workbuddy_edition(accounts.clone(), "deepseek-v4.1-flash").len(),
+            restrict_edition_candidates(accounts.clone(), "deepseek-v4.1-flash").len(),
             3
         );
         // 不认识的名字 → 原样
-        assert_eq!(restrict_workbuddy_edition(accounts, "no-such-model").len(), 3);
+        assert_eq!(restrict_edition_candidates(accounts, "no-such-model").len(), 3);
+    }
+
+    /// 同一条机制对 Qoder 两地生效（参考 workbuddy：`Qwen3.8-Flash` 两站都有，
+    /// `-intl` 点名国际版、`-cn` 点名中国版）。
+    #[test]
+    fn version_suffix_narrows_qoder_candidates() {
+        let accounts = vec![
+            account("qoder-intl-1", "qoder-intl", "intl"),
+            account("qoder-cn-1", "qoder", "cn"),
+            account("raccoon-1", "raccoon", "cn"),
+        ];
+        assert_eq!(
+            ids(&restrict_edition_candidates(
+                accounts.clone(),
+                "Qwen3.8-Flash-intl"
+            )),
+            vec!["qoder-intl-1", "raccoon-1"]
+        );
+        assert_eq!(
+            ids(&restrict_edition_candidates(
+                accounts.clone(),
+                "Qwen3.8-Flash-cn"
+            )),
+            vec!["qoder-cn-1", "raccoon-1"]
+        );
+        // 不带后缀 → 两地都在候选里（交给既有选路）
+        assert_eq!(
+            restrict_edition_candidates(accounts.clone(), "Qwen3.8-Flash").len(),
+            3
+        );
     }
 
     /// 收窄后一个账号都不剩时退回原集合：让上游如实报「模型不存在」，
@@ -721,7 +772,7 @@ mod tests {
         // 只有国内版账号，却点名 `-intl` → 退回原集合（上游会如实报错）
         let only_cn = vec![account("cn-1", "workbuddy", "cn")];
         assert_eq!(
-            ids(&restrict_workbuddy_edition(
+            ids(&restrict_edition_candidates(
                 only_cn,
                 "deepseek-v4.1-flash-intl"
             )),
@@ -730,7 +781,7 @@ mod tests {
     }
 
     /// 别家的模型名恰好以 `-cn` / `-intl` 结尾时**不该被误伤** ——
-    /// 收窄只作用于 WorkBuddy 系的两家。
+    /// 收窄只作用于 WorkBuddy / Qoder 这两个地区家族。
     #[test]
     fn suffix_narrowing_leaves_other_providers_alone() {
         let accounts = vec![
@@ -739,7 +790,7 @@ mod tests {
             account("raccoon-1", "raccoon", "cn"),
         ];
         assert_eq!(
-            ids(&restrict_workbuddy_edition(accounts, "some-raccoon-model-intl")),
+            ids(&restrict_edition_candidates(accounts, "some-raccoon-model-intl")),
             vec!["intl-1", "raccoon-1"]
         );
     }

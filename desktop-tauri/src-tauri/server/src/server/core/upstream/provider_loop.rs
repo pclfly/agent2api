@@ -973,8 +973,10 @@ async fn attempt_queue(
                     // 换的是 body 不是账号）：所以它也**不**在这里给明细定稿，
                     // 重试成功时这一轮的结局就是成功。`degraded` 置位后不再重复
                     // 触发，一次请求最多补救一次。
+                    let scoped_prompt = ctx.prompt.for_model(provider_id, &wire_model);
                     let attempt_prompt = ctx.prompt.for_provider(provider_id);
                     if matches!(failure.class, UpstreamErrorClass::ContentBlocked { .. })
+                        && scoped_prompt.is_some()
                         && !named_switch
                         && !degraded
                         && attempt_prompt.mode.degradable()

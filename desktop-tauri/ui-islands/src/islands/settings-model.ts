@@ -83,7 +83,7 @@ export type PromptPatch = {
    */
   promptProviders?: Record<
     string,
-    { promptMode?: string; promptFile?: string; promptText?: string } | null
+    { promptMode?: string; promptFile?: string; promptText?: string; promptModels?: string[] | null } | null
   >
   /**
    * 网关自带提示词的逐家开关：`{ "<providerId>": true | false | null }`。

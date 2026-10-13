@@ -108,9 +108,22 @@ pub const PROTOCOL_CHAT_COMPLETIONS: &str = "chat_completions";
 pub const PROTOCOL_RESPONSES: &str = "responses";
 /// 协议枚举：Anthropic Messages
 pub const PROTOCOL_ANTHROPIC: &str = "anthropic";
+/// 协议枚举：AWS Bedrock Converse
+///
+/// 与前三者的差异（见 `protocol::bedrock_outbound` 的模块头）：
+///   - 鉴权是 AWS SigV4（签名随请求体变化），不是固定凭证头；
+///   - 账号的 `apiKey` 承载**二元组** `AccessKeyId:SecretAccessKey`（可选 `:region`）；
+///   - 模型名进 URL 路径（`/model/<id>/converse-stream`），不进请求体；
+///   - 响应是 AWS Event Stream 二进制分帧，不是 SSE 文本行。
+pub const PROTOCOL_BEDROCK: &str = "bedrock";
 
 /// 全部合法协议（校验用；顺序即错误文案与前端下拉的顺序）
-pub const PROTOCOLS: &[&str] = &[PROTOCOL_CHAT_COMPLETIONS, PROTOCOL_RESPONSES, PROTOCOL_ANTHROPIC];
+pub const PROTOCOLS: &[&str] = &[
+    PROTOCOL_CHAT_COMPLETIONS,
+    PROTOCOL_RESPONSES,
+    PROTOCOL_ANTHROPIC,
+    PROTOCOL_BEDROCK,
+];
 
 /// 展示名长度上限（字符数；1~64 是契约）
 const MAX_NAME_CHARS: usize = 64;
@@ -766,6 +779,18 @@ pub fn wire_model_for(provider_id: &str, requested_name: &str) -> (String, Optio
 ///   鉴权：前两者 `Authorization: Bearer <key>`；anthropic 是
 ///   `x-api-key` + `anthropic-version: 2023-06-01`（它的鉴权头不是 Bearer）。
 ///
+/// ── bedrock 是一条独立路径（2026-10-12 加）──────────────────
+/// 前三种协议都是「同一个 baseUrl 换个路径」，Bedrock 不是：
+///   - **端点在另一个 host**：模型清单在控制面
+///     `https://bedrock.<region>.amazonaws.com/foundation-models`，
+///     而对话在 runtime 面 `bedrock-runtime.<region>.amazonaws.com`。
+///     用 runtime 面拼 `/models` 会得到 AWS coral 服务的
+///     `{"Output":{"__type":"...UnknownOperationException"}}` —— 那不是
+///     「路径写错了」而是「这个 host 不认识这个操作」，提示性极差；
+///   - **鉴权是 SigV4**：不是固定凭证头，签名覆盖 method/path/query/头；
+///   - **响应形态不同**：`{modelSummaries:[{modelId,...}]}`，不是 `{data:[{id}]}`。
+///   因此 bedrock 分支在下面单独处理，与前三家的「拼路径 + 塞凭证头」不共用。
+///
 /// key 取该家**第一个可用账号**的凭证（`first_custom_credential`：启用且
 /// 「apiKey 非空 **或** 声明了无需鉴权」，按优先级升序 —— 与转发选路的
 /// 「队首优先」同口径）；一个都没有时报「请先添加账号」。账号配了出网代理就
@@ -798,8 +823,12 @@ pub async fn fetch_upstream_models(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if base_url.is_empty() {
+    if base_url.is_empty() && protocol != PROTOCOL_BEDROCK {
         return Err("该提供商没有配置 baseUrl，无法拉取模型清单".to_string());
+    }
+    // bedrock 的 baseUrl 可以为空（region 从凭证第三段读，端点自动拼）
+    if protocol == PROTOCOL_BEDROCK {
+        return fetch_bedrock_models(&base_url, provider_id, store).await;
     }
     let url = if protocol == PROTOCOL_ANTHROPIC {
         format!("{base_url}/v1/models")
@@ -863,6 +892,184 @@ pub async fn fetch_upstream_models(
 /// 上游清单接口是否成功（2xx 即可：个别网关会回 200 以外的成功码）
 fn response_ok(status: u16) -> bool {
     (200..300).contains(&status)
+}
+
+/// bedrock 的模型清单拉取（[`fetch_upstream_models`] 的独立分支）。
+///
+/// ── 为什么不能走前三家那条路 ────────────────────────────────
+/// 前三家是「同一个 host 换个路径」，Bedrock 的清单在**另一个 host**：
+///   - 对话（runtime 面）：`bedrock-runtime.<region>.amazonaws.com/model/<id>/converse-stream`
+///   - 清单（控制面）：    `bedrock.<region>.amazonaws.com/foundation-models`
+/// 拿 runtime host 拼 `/models` 会撞上 AWS coral 服务的兜底响应
+/// `{"Output":{"__type":"...UnknownOperationException"}}` —— 那不是说路径写错，
+/// 而是说「这个 host 不认识这个操作」，排查时几乎无从下手。
+///
+/// ── 三件事与前三家都不同 ────────────────────────────────────
+///   1. **端点**：从 region 拼控制面 host（`baseUrl` 若填了 AWS 域名则从其
+///      提取 region；填自建代理则原样用作 host）；
+///   2. **鉴权**：SigV4（复用 `protocol::bedrock_outbound::sign_request`），
+///      而不是固定凭证头；
+///   3. **响应**：`{modelSummaries:[{modelId, providerName, ...}]}` —— 取
+///      `modelId`，并把 `inferenceTypesSupported` 里只有 `INFERENCE_PROFILE`
+///      的模型也带上（它们要按 profile ARN 调用，但清单里该让用户看见）。
+///
+/// 查询串 `byOutputModality=TEXT` 只保留文本输出模型 —— 与我们暴露的
+/// `/v1/chat/completions` 能力对齐（图像/嵌入模型进来只会让清单噪声变大）。
+async fn fetch_bedrock_models(
+    base_url: &str,
+    provider_id: &str,
+    store: &AccountStore,
+) -> Result<Vec<String>, String> {
+    use crate::server::core::protocol::bedrock_outbound;
+
+    let credential = store
+        .first_custom_credential(provider_id)
+        .ok_or_else(|| {
+            "请先添加账号：拉取模型清单需要一条启用且可用（填了 apiKey，或声明了无需鉴权）的账号"
+                .to_string()
+        })?;
+    let (access_key, secret_key, region) =
+        bedrock_outbound::split_credentials(&credential.api_key)?;
+
+    // host：填了 AWS 域名就从它提取 region（用户可能在 baseUrl 里指定了
+    // 与凭证不同的区）；否则按凭证的 region 拼标准控制面端点
+    let base = base_url.trim().trim_end_matches('/');
+    let host = if base.contains("amazonaws.com") {
+        // 从 `https://bedrock-runtime.us-west-2.amazonaws.com` 里抠出 region
+        let without_scheme = base.split("://").nth(1).unwrap_or(base);
+        let host_name = without_scheme.split('/').next().unwrap_or("");
+        // `bedrock-runtime.<region>.amazonaws.com` → 取第 2 段
+        let extracted = host_name.split('.').nth(1).filter(|text| !text.is_empty());
+        match extracted {
+            Some(found) => format!("bedrock.{found}.amazonaws.com"),
+            None => format!("bedrock.{region}.amazonaws.com"),
+        }
+    } else if base.is_empty() {
+        format!("bedrock.{region}.amazonaws.com")
+    } else {
+        // 自建代理：原样用（它要么透传签名，要么自己重签）
+        base.to_string()
+    };
+
+    let (amz_date, date_stamp) = bedrock_outbound::amz_timestamps();
+    let query = "byOutputModality=TEXT";
+    let signed = bedrock_outbound::sign_request(
+        "GET",
+        &host,
+        "/foundation-models",
+        query,
+        "",    // GET 无 body
+        None,  // GET 不签 content-type（见 sign_request 的说明）
+        &access_key,
+        &secret_key,
+        &region,
+        &amz_date,
+        &date_stamp,
+    );
+    let url = format!("https://{host}/foundation-models?{query}");
+
+    let client = egress::client_for(credential.proxy.as_ref());
+    let response = client
+        .get(&url)
+        .header("X-Amz-Date", &signed.amz_date)
+        .header("Authorization", &signed.authorization)
+        .timeout(Duration::from_millis(FETCH_MODELS_TIMEOUT_MS))
+        .send()
+        .await
+        .map_err(|error| format!("上游请求失败: {}", egress::describe_error_detail(&error)))?;
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    if !response_ok(status) {
+        let summary: String = text.trim().chars().take(200).collect();
+        return Err(format!("上游返回 {status}: {summary}"));
+    }
+    let payload: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("上游响应不是合法 JSON: {error}"))?;
+    let ids = bedrock_model_ids(&payload);
+    if ids.is_empty() {
+        return Err(
+            "上游返回了空清单：该 region 下没有可用的文本模型，或凭证无权列出模型".to_string(),
+        );
+    }
+    Ok(ids)
+}
+
+/// 从 `/foundation-models` 响应里提取**可直接调用**的模型 ID 清单。
+///
+/// ── 为什么要按 `inferenceTypesSupported` 改写 ID（2026-10-12 加）────
+/// `/foundation-models` 返回的是**基础模型 ID**，但其中相当一部分只能通过
+/// **inference profile** 调用（实测该账号 93 个模型里 41 个是这种情况）：
+///
+/// ```text
+///   modelId: "zai.glm-5.3"
+///   inferenceTypesSupported: ["INFERENCE_PROFILE"]
+///   → 直接调用报：Invocation of model ID zai.glm-5.3 with on-demand throughput
+///     isn't supported. Retry your request with the ID or ARN of an inference profile
+/// ```
+///
+/// 用户点「获取模型」拿到裸 ID、保存、然后调不通 —— 这不是用户配错了，是
+/// 清单没给可直接用的形态。所以拉取时就在这里把「只支持 profile」的 ID
+/// 改写成 profile 形态（`us.<modelId>`），让清单**开箱即用**。
+///
+/// ── 为什么是 `us.` 前缀而不是别的 ───────────────────────────
+/// AWS 的 profile 命名规则是 `<geo>.<modelId>`，geo 取 `us` / `eu` / `ap` /
+/// `global`。实测（2026-10-12）该账号的 profile 清单里，每个只支持 profile
+/// 的模型都有对应的 `us.<id>` 与 `global.<id>`（SYSTEM_DEFINED，AWS 预建，
+/// 无需自己创建）。选 `us.` 的理由：
+///   - 覆盖面最广：该账号 41 个 profile-only 模型**全部**有 `us.` 变体；
+///   - `global.` 是后加的（部分新模型才有），且跨区路由延迟略高；
+///   - 用户要换 `global.` 时手工改前缀即可（文档里写了）。
+///
+/// ── 三类判定 ────────────────────────────────────────────────
+/// ```text
+///   ["ON_DEMAND"]                    → 裸 ID 直接可用，原样返回
+///   ["INFERENCE_PROFILE"]            → 加 us. 前缀
+///   ["ON_DEMAND","INFERENCE_PROFILE"] → 两种都行，原样返回（裸 ID 更短）
+///   ["PROVISIONED"]                  → 需预置吞吐量，普通账号不可用，跳过
+///   (字段缺失)                        → 保守起见原样返回（不猜）
+/// ```
+fn bedrock_model_ids(payload: &Value) -> Vec<String> {
+    let Some(items) = payload.get("modelSummaries").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        let Some(model_id) = item
+            .get("modelId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        // 已经是 profile 形态（含 geo 前缀或 ARN）就原样用
+        if model_id.starts_with("arn:") || model_id.starts_with("us.") || model_id.starts_with("global.")
+        {
+            out.push(model_id.to_string());
+            continue;
+        }
+        let types: Vec<&str> = item
+            .get("inferenceTypesSupported")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let on_demand = types.contains(&"ON_DEMAND");
+        let profile = types.contains(&"INFERENCE_PROFILE");
+        let provisioned_only =
+            !on_demand && !profile && types.contains(&"PROVISIONED");
+        if provisioned_only {
+            // 预置吞吐量模型：普通账号调不了，不进清单（进来只会让用户困惑）
+            continue;
+        }
+        if !on_demand && profile {
+            out.push(format!("us.{model_id}"));
+        } else {
+            out.push(model_id.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// `set_models` 的模型条目校验与归一：id 非空 ≤128、reasoning ≤32、同 id 去重。
@@ -1195,4 +1402,112 @@ fn validate_client_emulation(value: Option<&Value>) -> Result<String, String> {
     Err(format!(
         "clientEmulation 只支持 \"{CLIENT_EMULATION_OPENCODE}\"（留空表示不伪装上游客户端）"
     ))
+}
+
+#[cfg(test)]
+mod bedrock_model_ids_tests {
+    use super::bedrock_model_ids;
+    use serde_json::json;
+
+    /// 实测形状（2026-10-12，us-west-2，93 个模型）：
+    ///   ["ON_DEMAND"] 46 个 / ["INFERENCE_PROFILE"] 41 个
+    ///   ["ON_DEMAND","INFERENCE_PROFILE"] 3 个 / ["PROVISIONED"] 2 个
+    fn summary(model_id: &str, types: Option<Vec<&str>>) -> serde_json::Value {
+        match types {
+            Some(list) => json!({ "modelId": model_id, "inferenceTypesSupported": list }),
+            None => json!({ "modelId": model_id }),
+        }
+    }
+
+    #[test]
+    fn on_demand_models_keep_bare_id() {
+        let payload = json!({ "modelSummaries": [
+            summary("moonshotai.kimi-k2.5", Some(vec!["ON_DEMAND"])),
+            summary("deepseek.v3.2", Some(vec!["ON_DEMAND"])),
+        ]});
+        let ids = bedrock_model_ids(&payload);
+        assert_eq!(ids, vec!["deepseek.v3.2", "moonshotai.kimi-k2.5"]);
+    }
+
+    #[test]
+    fn profile_only_models_get_us_prefix() {
+        // 回归护栏：这两个正是用户实际报错的模型
+        let payload = json!({ "modelSummaries": [
+            summary("moonshotai.kimi-k3", Some(vec!["INFERENCE_PROFILE"])),
+            summary("zai.glm-5.3", Some(vec!["INFERENCE_PROFILE"])),
+            summary("openai.gpt-6-astra", Some(vec!["INFERENCE_PROFILE"])),
+        ]});
+        let ids = bedrock_model_ids(&payload);
+        assert_eq!(ids, vec![
+            "us.moonshotai.kimi-k3",
+            "us.openai.gpt-6-astra",
+            "us.zai.glm-5.3",
+        ]);
+        // 裸 ID 不应出现（否则用户保存后又调不通）
+        assert!(!ids.iter().any(|id| id == "zai.glm-5.3"));
+    }
+
+    #[test]
+    fn dual_mode_models_keep_bare_id() {
+        // 两种都支持时用裸 ID（更短，且 on-demand 优先）
+        let payload = json!({ "modelSummaries": [
+            summary("anthropic.claude-sonnet-4-6", Some(vec!["ON_DEMAND", "INFERENCE_PROFILE"])),
+        ]});
+        let ids = bedrock_model_ids(&payload);
+        assert_eq!(ids, vec!["anthropic.claude-sonnet-4-6"]);
+    }
+
+    #[test]
+    fn provisioned_only_models_are_skipped() {
+        // 预置吞吐量模型普通账号调不了，不该进清单
+        let payload = json!({ "modelSummaries": [
+            summary("some.provisioned-model", Some(vec!["PROVISIONED"])),
+            summary("moonshotai.kimi-k2.5", Some(vec!["ON_DEMAND"])),
+        ]});
+        let ids = bedrock_model_ids(&payload);
+        assert_eq!(ids, vec!["moonshotai.kimi-k2.5"]);
+    }
+
+    #[test]
+    fn already_prefixed_and_arn_ids_pass_through() {
+        let payload = json!({ "modelSummaries": [
+            summary("us.already.prefixed", Some(vec!["INFERENCE_PROFILE"])),
+            summary("global.other.model", Some(vec!["INFERENCE_PROFILE"])),
+            summary("arn:aws:bedrock:us-west-2:1:inference-profile/x", Some(vec!["INFERENCE_PROFILE"])),
+        ]});
+        let ids = bedrock_model_ids(&payload);
+        // 不应被二次加前缀（us.us.… / us.global.…）
+        assert!(ids.contains(&"us.already.prefixed".to_string()));
+        assert!(ids.contains(&"global.other.model".to_string()));
+        assert!(ids.contains(&"arn:aws:bedrock:us-west-2:1:inference-profile/x".to_string()));
+        assert!(!ids.iter().any(|id| id.starts_with("us.us.")));
+        assert!(!ids.iter().any(|id| id.starts_with("us.global.")));
+    }
+
+    #[test]
+    fn missing_types_field_keeps_id_conservatively() {
+        // 字段缺失时不猜（保守原样返回）
+        let payload = json!({ "modelSummaries": [ summary("mystery.model", None) ]});
+        assert_eq!(bedrock_model_ids(&payload), vec!["mystery.model"]);
+    }
+
+    #[test]
+    fn blank_ids_and_missing_field_are_ignored() {
+        let payload = json!({ "modelSummaries": [
+            summary("  ", Some(vec!["ON_DEMAND"])),
+            json!({ "inferenceTypesSupported": ["ON_DEMAND"] }),
+            summary("good.model", Some(vec!["ON_DEMAND"])),
+        ]});
+        assert_eq!(bedrock_model_ids(&payload), vec!["good.model"]);
+        assert!(bedrock_model_ids(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn duplicates_are_deduped() {
+        let payload = json!({ "modelSummaries": [
+            summary("dup.model", Some(vec!["ON_DEMAND"])),
+            summary("dup.model", Some(vec!["ON_DEMAND"])),
+        ]});
+        assert_eq!(bedrock_model_ids(&payload), vec!["dup.model"]);
+    }
 }

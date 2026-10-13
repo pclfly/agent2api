@@ -688,12 +688,19 @@ pub fn usage_to_anthropic(usage: Option<&Value>) -> Value {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let input = number("prompt_tokens");
-    json!({
-        // Anthropic 的 input_tokens **不含**缓存命中部分，所以这里减掉
-        "input_tokens": (input - cached).max(0),
+    // Bedrock 等转换器可能显式上报缓存写入。Anthropic 把读/写从普通输入中
+    // 分开计数；没带写入字段的旧上游保持原响应形状，不凭空添加一项。
+    let created = usage.get("cache_creation_input_tokens")
+        .and_then(Value::as_i64).filter(|value| *value >= 0);
+    let mut out = json!({
+        "input_tokens": input.saturating_sub(cached).saturating_sub(created.unwrap_or(0)).max(0),
         "output_tokens": number("completion_tokens"),
         "cache_read_input_tokens": cached,
-    })
+    });
+    if let Some(created) = created {
+        out["cache_creation_input_tokens"] = json!(created);
+    }
+    out
 }
 
 // ─── 流式：Chat SSE → Anthropic SSE ─────────────────────────

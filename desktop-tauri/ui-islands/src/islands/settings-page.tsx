@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { ProviderPromptModelsButton } from './settings-prompt-model-picker'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
 import {
@@ -836,12 +837,13 @@ function ProviderPromptRows({ prompt, locked, busy }: {
   const options = prompt.options
   const configured = new Map(prompt.providers.map(item => [item.id, item]))
   // 顺序：先按注册表顺序列出带开关的家，再补齐用户配过、但注册表里没标开关的家
-  // （自定义提供商不会出现在 options 里，它们只能靠 promptProviders 出现）
+  // options 包含内置和自定义供应商；无网关自带提示词的家通过下方「添加」进入列表。
   const rows: ProviderPromptState[] = []
   for (const option of options) {
     if (!option.gatewayNote) continue
     rows.push(configured.get(option.id) ?? {
       id: option.id,
+      models: null,
       // 没单独配过的行显示**生效值**（= 全局那份）：界面上一眼看不出「这行是不是
       // 自己配过」，但显示的值必须是真的，否则「跟随默认」这句话就是空话
       mode: prompt.mode,
@@ -908,6 +910,7 @@ function ProviderPromptRows({ prompt, locked, busy }: {
                 </Select>
                 <ProviderFileRow item={item} label={label} locked={locked} busy={busy} />
                 <ProviderPromptTextButton item={item} label={label} locked={locked} busy={busy} />
+                <ProviderPromptModelsButton item={item} label={label} catalog={option?.models ?? []} locked={locked} busy={busy} />
                 {/* 「跟随默认」只在**单独配过**的行上出现：没配过的行点了它也删不掉
                     任何东西（后端此时没有这一项），留一颗无效按钮只会让人以为点坏了 */}
                 {item.configured ? (

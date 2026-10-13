@@ -77,7 +77,7 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::custom_providers;
 use crate::server::core::model_rules;
-use crate::server::core::protocol::{anthropic_outbound, responses_outbound};
+use crate::server::core::protocol::{anthropic_outbound, bedrock_outbound, responses_outbound};
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::core::providers::custom::emulation;
 use crate::server::core::upstream::connections::ConnectionGuard;
@@ -126,6 +126,7 @@ pub(crate) async fn forward(
         custom_providers::PROTOCOL_CHAT_COMPLETIONS => None,
         custom_providers::PROTOCOL_RESPONSES => Some(OutboundKind::Responses),
         custom_providers::PROTOCOL_ANTHROPIC => Some(OutboundKind::Anthropic),
+        custom_providers::PROTOCOL_BEDROCK => Some(OutboundKind::Bedrock),
         other => {
             return Err(GatewayError::with_status(
                 400,
@@ -323,6 +324,14 @@ enum OutboundKind {
     Responses,
     /// Anthropic Messages（`POST {base}/v1/messages`）
     Anthropic,
+    /// AWS Bedrock Converse（`POST {base}/model/<modelId>/converse-stream`）
+    ///
+    /// 与上两者的结构性差异（见 `protocol::bedrock_outbound` 的模块头）：
+    /// 模型名进 URL 路径、鉴权是随请求体变化的 SigV4 签名（而非固定凭证头）、
+    /// 响应是 AWS Event Stream 二进制分帧（而非 SSE 文本行）。因此它在
+    /// [`forward_translated`] 里的处理比另外两家多一步「签名」，
+    /// 且响应侧的状态机吃的是二进制帧而非 `data:` 行。
+    Bedrock,
 }
 
 impl OutboundKind {
@@ -331,6 +340,7 @@ impl OutboundKind {
         match self {
             Self::Responses => "responses",
             Self::Anthropic => "anthropic",
+            Self::Bedrock => "bedrock",
         }
     }
 }
@@ -556,6 +566,75 @@ async fn forward_translated(
             quirks.apply_to(&mut headers);
             (url, headers, payload)
         }
+        OutboundKind::Bedrock => {
+            // ── Bedrock 与上两家的三处结构差异 ─────────────────────
+            // ① 模型名进 URL 路径（`/model/<id>/converse-stream`），不进请求体；
+            // ② 鉴权是 SigV4：签名覆盖 method/path/query/头/body 哈希，因此
+            //    **必须**在 payload 序列化定稿之后才能算 —— 这里先翻译出
+            //    payload，签名在下面统一做（见 `sign_bedrock_request`）；
+            // ③ region 从凭证第三段读（`AK:SK:region`），决定端点与签名 scope。
+            //
+            // baseUrl 的语义：用户填的应是 bedrock-runtime 的**根**（不含
+            // `/model/...`）。兼容两种填法：带 `https://` 的完整地址，或只填
+            // region 让本模块拼标准端点（`https://bedrock-runtime.<region>.amazonaws.com`）。
+            let (access_key, secret_key, region) =
+                bedrock_outbound::split_credentials(api_key)
+                    .map_err(|message| GatewayError::with_status(400, message))?;
+            let base = base_url.trim_end_matches('/');
+            let endpoint = if base.is_empty() {
+                format!("https://bedrock-runtime.{region}.amazonaws.com")
+            } else if base.contains("amazonaws.com") {
+                base.to_string()
+            } else {
+                // 用户填的是自建代理/网关的基址：原样用（签名仍按 AWS 规则算，
+                // 代理若做透传即可；不做透传的代理需要它自己重签）
+                base.to_string()
+            };
+            let payload = bedrock_outbound::bedrock_request_from_chat(
+                &outbound_chat,
+                &wire_model,
+            )
+            .map_err(|message| GatewayError::with_status(400, message))?;
+            let payload_text = serde_json::to_string(&payload)
+                .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
+            // 模型名编成路径段（ARN 形态请求段编码、签名段双重编码）
+            let (request_segment, canonical_segment) =
+                bedrock_outbound::model_path_segments(&wire_model);
+            let host = endpoint
+                .split("://")
+                .nth(1)
+                .unwrap_or(&endpoint)
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let (amz_date, date_stamp) = bedrock_outbound::amz_timestamps();
+            let signed = bedrock_outbound::sign_request(
+                "POST",
+                &host,
+                &format!("/model/{canonical_segment}/converse-stream"),
+                "",
+                &payload_text,
+                // POST + JSON：签 content-type（与下面发出的头一致）
+                Some("application/json"),
+                &access_key,
+                &secret_key,
+                &region,
+                &amz_date,
+                &date_stamp,
+            );
+            let url = format!("{endpoint}/model/{request_segment}/converse-stream");
+            let headers = vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("X-Amz-Date".to_string(), signed.amz_date),
+                ("Authorization".to_string(), signed.authorization),
+            ];
+            // Bedrock 走 Converse 体（非 chat 体），已序列化好；用 Value 包回去
+            // 让下面的统一序列化口径保持一致（二次序列化是幂等的）
+            let reparsed: Value = serde_json::from_str(&payload_text)
+                .unwrap_or(Value::Object(serde_json::Map::new()));
+            (url, headers, reparsed)
+        }
     };
     let payload = serde_json::to_string(&payload)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
@@ -596,11 +675,14 @@ async fn forward_translated(
             .filter(|text| !text.is_empty())
             .map(str::to_string);
         let detail = read_upstream_error(response, telemetry.capture().as_deref()).await;
-        return Err(classify_custom_error(
-            status,
-            &detail.message,
-            retry_after.as_deref(),
-        ));
+        return Err(match kind {
+            OutboundKind::Bedrock => classify_bedrock_error(
+                status,
+                &detail.message,
+                retry_after.as_deref(),
+            ),
+            _ => classify_custom_error(status, &detail.message, retry_after.as_deref()),
+        });
     }
 
     // 上游字节流先过协议翻译（→ 标准 chat SSE），再交给既有消费层：
@@ -654,12 +736,17 @@ struct ProtocolTranslateStream {
     /// 上游已结束（不再 poll 上游，把 pending 吐完即 None）
     upstream_done: bool,
     capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
+    /// Bedrock 的 HTTP 200 仍可能携带异常帧；流错误必须进入请求日志。
+    telemetry: Arc<RequestTelemetry>,
 }
 
 /// 两个翻译状态机的分派壳（转换器接口同形，包一层枚举避免 dyn 分发）
 enum TranslateMachine {
     Responses(responses_outbound::ChatFromResponsesStream),
     Anthropic(anthropic_outbound::ChatFromAnthropicStream),
+    /// Bedrock 的事件流是**二进制分帧**（AWS Event Stream），不是 SSE 文本行 ——
+    /// 状态机的接口同形（`push` / `finish`），但内部按长度字段切帧而非按行。
+    Bedrock(bedrock_outbound::ChatFromBedrockStream),
 }
 
 impl TranslateMachine {
@@ -667,6 +754,7 @@ impl TranslateMachine {
         match self {
             Self::Responses(machine) => machine.push(chunk),
             Self::Anthropic(machine) => machine.push(chunk),
+            Self::Bedrock(machine) => machine.push(chunk),
         }
     }
 
@@ -674,6 +762,7 @@ impl TranslateMachine {
         match self {
             Self::Responses(machine) => machine.finish(),
             Self::Anthropic(machine) => machine.finish(),
+            Self::Bedrock(machine) => machine.finish(),
         }
     }
 }
@@ -708,11 +797,26 @@ impl ProtocolTranslateStream {
                 OutboundKind::Anthropic => TranslateMachine::Anthropic(
                     anthropic_outbound::ChatFromAnthropicStream::new(model),
                 ),
+                OutboundKind::Bedrock => TranslateMachine::Bedrock(
+                    bedrock_outbound::ChatFromBedrockStream::new(model),
+                ),
             },
             pending: std::collections::VecDeque::new(),
             upstream_done: false,
             capture: telemetry.capture(),
+            telemetry: telemetry.clone(),
         }
+    }
+
+    fn enqueue_translated(&mut self, frames: Vec<bytes::Bytes>) {
+        if let TranslateMachine::Bedrock(machine) = &self.machine {
+            if let Some(message) = machine.last_error() {
+                self.telemetry.note_error(message);
+                // 异常已终止协议流，无需等待上游继续发字节或触发空闲超时。
+                self.upstream_done = true;
+            }
+        }
+        self.pending.extend(frames);
     }
 }
 
@@ -736,18 +840,16 @@ impl futures::Stream for ProtocolTranslateStream {
                 std::task::Poll::Ready(None) => {
                     self.upstream_done = true;
                     // 上游 EOF：转换器收尾（finish_reason / usage / [DONE]）
-                    for frame in self.machine.finish() {
-                        self.pending.push_back(frame);
-                    }
+                    let frames = self.machine.finish();
+                    self.enqueue_translated(frames);
                 }
                 std::task::Poll::Ready(Some(Ok(bytes))) => {
                     // 调试模式：采上游原始字节（在翻译之前，与 chat 路径同语义）
                     if let Some(capture) = &self.capture {
                         capture.push(&bytes);
                     }
-                    for frame in self.machine.push(&bytes[..]) {
-                        self.pending.push_back(frame);
-                    }
+                    let frames = self.machine.push(&bytes[..]);
+                    self.enqueue_translated(frames);
                 }
                 std::task::Poll::Ready(Some(Err(error))) => {
                     self.upstream_done = true;
@@ -866,6 +968,162 @@ fn classify_custom_error(status: u16, raw: &str, retry_after: Option<&str>) -> G
             i32::from(status),
             format!("上游返回 {status}: {raw}"),
         ),
+    }
+}
+
+/// 地区策略拒绝不是 token 超限或一般的密钥错误。保留上游状态与原文，
+/// 仅补排查方向；不猜测是来源 IP 还是账户资格，更不自动切换出口或重试。
+fn classify_bedrock_error(status: u16, raw: &str, retry_after: Option<&str>) -> GatewayError {
+    let lower = raw.to_ascii_lowercase();
+    if status == 400
+        && lower.contains("data retention mode")
+        && lower.contains("is not available for this model")
+    {
+        return GatewayError::with_status(
+            i32::from(status),
+            format!(
+                "上游返回 {status}: {}\n\
+                 Bedrock 数据保留策略不满足该模型要求。Fable 5/5.1 要求 aws_review：\
+                 允许 AWS 保留输入输出最多 30 天并可能进行人工审查。bedrock-runtime 使用请求所在 Region 的账户级设置，\
+                 不是普通推理参数；请先确认适用条款与隐私要求，再决定是否调整。网关不会自动开启。\
+                 官方说明：https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html",
+                raw.trim(),
+            ),
+        );
+    }
+    if matches!(status, 400 | 403)
+        && ["openai", "anthropic"].iter().any(|vendor| {
+            lower.contains(&format!(
+                "access to {vendor} models is not allowed from unsupported countries, regions, or territories"
+            ))
+        })
+    {
+        return GatewayError::with_status(
+            i32::from(status),
+            format!(
+                "上游返回 {status}: {}\n\
+                 Bedrock 地区访问限制：此错误与 max_tokens 无关。请核对所在地与 AWS 账户的模型使用资格；\
+                 若符合支持条件仍被拒绝，请联系 AWS Support 核查。模型 ID 的 us./global. 前缀不代表获得地区访问许可。",
+                raw.trim(),
+            ),
+        );
+    }
+    classify_custom_error(status, raw, retry_after)
+}
+
+#[cfg(test)]
+mod bedrock_error_tests {
+    use super::*;
+
+    #[test]
+    fn bedrock_region_rejection_keeps_status_and_original_detail() {
+        for vendor in ["OpenAI", "Anthropic"] {
+            let raw = format!(
+                "Access to {vendor} models is not allowed from unsupported countries, regions, or territories. Please refer to the supported countries documentation."
+            );
+            for status in [400, 403] {
+                let error = classify_bedrock_error(status, &raw, None);
+                assert_eq!(error.status_code, i32::from(status));
+                assert!(error.message.contains(&raw));
+                assert!(error.message.contains("地区访问限制"));
+                assert!(error.message.contains("AWS Support"));
+                assert!(!error.message.contains("上游凭证被拒绝"));
+                assert!(!error.is_quota_limit());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bedrock_empty_stream_error_is_recorded_in_telemetry() {
+        use futures::StreamExt;
+        let telemetry = Arc::new(RequestTelemetry::new());
+        let mut stream = ProtocolTranslateStream {
+            inner: Box::pin(futures::stream::empty()),
+            machine: TranslateMachine::Bedrock(bedrock_outbound::ChatFromBedrockStream::new("m")),
+            pending: std::collections::VecDeque::new(),
+            upstream_done: false,
+            capture: None,
+            telemetry: telemetry.clone(),
+        };
+        let mut text = String::new();
+        while let Some(frame) = stream.next().await {
+            text.push_str(&String::from_utf8_lossy(&frame.expect("应输出标准错误帧")));
+        }
+        assert!(text.contains("上游未返回有效 Bedrock 事件流"));
+        assert_eq!(telemetry.snapshot().error.as_deref(), Some("上游未返回有效 Bedrock 事件流"));
+        assert_eq!(text.matches("data: [DONE]").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn bedrock_exception_records_error_and_stops_without_upstream_eof() {
+        use futures::StreamExt;
+        let mut headers = Vec::new();
+        for (name, value) in [(":message-type", "exception"), (":exception-type", "validationException")] {
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7);
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            headers.extend_from_slice(value.as_bytes());
+        }
+        let payload = br#"{"message":"specific model validation error"}"#;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&((16 + headers.len() + payload.len()) as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0; 4]);
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&[0; 4]);
+        let telemetry = Arc::new(RequestTelemetry::new());
+        let input = futures::stream::iter(vec![Ok(bytes::Bytes::from(frame))])
+            .chain(futures::stream::pending());
+        let mut stream = ProtocolTranslateStream {
+            inner: Box::pin(input),
+            machine: TranslateMachine::Bedrock(bedrock_outbound::ChatFromBedrockStream::new("m")),
+            pending: std::collections::VecDeque::new(),
+            upstream_done: false,
+            capture: None,
+            telemetry: telemetry.clone(),
+        };
+        let text = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut text = String::new();
+            while let Some(frame) = stream.next().await {
+                text.push_str(&String::from_utf8_lossy(&frame.expect("应输出错误帧")));
+            }
+            text
+        }).await.expect("异常后不应继续等上游 EOF");
+        assert!(text.contains("specific model validation error"));
+        assert!(telemetry.snapshot().error.as_deref().is_some_and(|error| error.contains("specific model validation error")));
+        assert_eq!(text.matches("data: [DONE]").count(), 1);
+    }
+
+    #[test]
+    fn bedrock_retention_error_explains_privacy_choice_without_changing_policy() {
+        let raw = "The model returned the following errors: data retention mode 'default' is not available for this model";
+        let error = classify_bedrock_error(400, raw, None);
+        assert_eq!(error.status_code, 400);
+        assert!(error.message.contains(raw));
+        assert!(error.message.contains("aws_review"));
+        assert!(error.message.contains("30 天"));
+        assert!(error.message.contains("人工审查"));
+        assert!(error.message.contains("账户"));
+        assert!(error.message.contains("Region"));
+        assert!(error.message.contains("不会自动"));
+    }
+
+    #[test]
+    fn bedrock_other_errors_keep_existing_classification() {
+        for (status, raw) in [
+            (400, "The maximum tokens you requested exceeds the model limit of 128000."),
+            (403, "AccessDeniedException: missing bedrock:InvokeModel permission"),
+            (429, "Too many requests"),
+            (500, "Internal server error"),
+        ] {
+            let expected = classify_custom_error(status, raw, None);
+            let actual = classify_bedrock_error(status, raw, None);
+            assert_eq!(actual.status_code, expected.status_code);
+            assert_eq!(actual.message, expected.message);
+            assert_eq!(actual.code, expected.code);
+        }
     }
 }
 
