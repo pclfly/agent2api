@@ -835,3 +835,91 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         _ => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::*;
+
+    /// `requests` 上有某一列没有。
+    fn has_column(conn: &Connection, name: &str) -> bool {
+        conn.prepare("SELECT 1 FROM pragma_table_info('requests') WHERE name = ?1")
+            .expect("可查询列清单")
+            .exists([name])
+            .expect("列存在性可判")
+    }
+
+    /// 建一份「v1 的 requests 表」——两线各自加列之前的共同起点。
+    fn base_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("内存库可开");
+        conn.execute_batch(V1_SCHEMA).expect("v1 建表");
+        conn
+    }
+
+    /// 上游那条线的库（user_version = 10，有 `route`、没有 `credit`）升到最新后
+    /// 必须**两列都在**。
+    ///
+    /// ── 这条用例挡的是什么 ──────────────────────────────────────
+    /// 上游与本地各自把 v10 用作一列。只跑 v10 分支的话，从上游升上来的库在
+    /// `user_version = 10` 上、迁移从 `current + 1 = 11` 开始跑，**永远补不上
+    /// `credit`** —— 而缺列不会让编译或启动报错，只会在写请求明细时撞
+    /// `no such column: credit`。v12 就是为这条路存在的，本用例钉住它。
+    #[test]
+    fn upstream_line_gains_credit_column_at_latest_version() {
+        let conn = base_db();
+        // 上游的 v10：只有 route
+        conn.execute_batch("ALTER TABLE requests ADD COLUMN route TEXT;")
+            .expect("补 route 列");
+        conn.pragma_update(None, "user_version", 10).expect("标版本号");
+
+        migrate(&conn).expect("迁移应通过");
+
+        assert!(has_column(&conn, "route"), "上游线本就有 route，迁移后不该丢");
+        assert!(has_column(&conn, "credit"), "上游线升级后必须补上 credit");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("读版本号");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// 本地那条线的库（user_version = 10，有 `credit`、没有 `route`）同理。
+    #[test]
+    fn local_line_gains_route_column_at_latest_version() {
+        let conn = base_db();
+        // 本地的 v10：只有 credit
+        conn.execute_batch("ALTER TABLE requests ADD COLUMN credit REAL;")
+            .expect("补 credit 列");
+        conn.pragma_update(None, "user_version", 10).expect("标版本号");
+
+        migrate(&conn).expect("迁移应通过");
+
+        assert!(has_column(&conn, "credit"), "本地线本就有 credit，迁移后不该丢");
+        assert!(has_column(&conn, "route"), "本地线升级后必须补上 route");
+    }
+
+    /// 全新的库（user_version = 0）从 v1 一路跑到最新，两列都要在 ——
+    /// 这条走的是「正常路径」，与上面两条「存量库收敛」互补。
+    #[test]
+    fn fresh_db_ends_with_both_columns() {
+        let conn = Connection::open_in_memory().expect("内存库可开");
+        migrate(&conn).expect("全新库迁移应通过");
+        assert!(has_column(&conn, "route"), "全新库应有 route 列");
+        assert!(has_column(&conn, "credit"), "全新库应有 credit 列");
+    }
+
+    /// 迁移幂等：跑第二遍不报错、不改版本号。
+    ///
+    /// `apply_v10` 里两次 `ALTER` 靠列存在性判断幂等（SQLite 的
+    /// `ADD COLUMN` 没有 IF NOT EXISTS），重跑一次是这条幂等性的现场验证。
+    #[test]
+    fn migrate_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("内存库可开");
+        migrate(&conn).expect("首跑应通过");
+        migrate(&conn).expect("重跑应通过（幂等）");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("读版本号");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+}
