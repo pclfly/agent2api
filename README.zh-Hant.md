@@ -1,12 +1,42 @@
-# Agent2API · 多供應商本地閘道
+<div align="center">
+
+# Agent2API
+
+**把多家 AI 桌面客戶端的登入狀態，變成一個本地 OpenAI 相容 API 閘道**
 
 [简体中文](./README.md) | [English](./README.en.md) | **繁體中文** | [日本語](./README.ja.md) | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
 
-把多家 AI 桌面客戶端的登入狀態包裝成本地 **OpenAI 相容 API 閘道**，統一暴露一個 `base_url`，附帶多供應商帳號管理、模型管理（啟停 / 刪除 / 對應）、出站指紋脫敏、出口代理與請求報表，並提供一個開箱即用的 Tauri 桌面端。任何支援自訂 `base_url` 的 OpenAI 客戶端都能以 `http://127.0.0.1:3065/v1` 為端點呼叫這幾家的模型額度——不需要 API Key，不需要改客戶端原始碼。
+[![license](https://img.shields.io/badge/license-MIT%20%2B%20附加聲明-green)](./LICENSE)
+[![release](https://img.shields.io/github/v/release/aimod-cc/agent2api?include_prereleases)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
+[![stars](https://img.shields.io/github/stars/aimod-cc/agent2api?style=flat&color=yellow)](https://github.com/aimod-cc/agent2api/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/aimod-cc/agent2api/releases/latest)
 
-各平台的反向代理能力一覽（✓ 支援 · ✗ 不支援 · — 無此概念或不適用）：
+[✨ 核心特性](#-核心特性) • [🤝 支援的供應商](#-支援的供應商) • [🚀 快速開始](#-快速開始) • [🐳 Docker 部署](#-docker-部署) • [📸 介面預覽](#-介面預覽) • [🔧 開發與建置](#-開發與建置) • [📜 使用聲明](#-使用聲明)
 
-| 平台 | LLM 請求 | Token 自動續期 | 模型清單（遠端重新整理） | 餘額查詢 | 簽到 | 領取類 |
+</div>
+
+---
+
+統一暴露一個 `base_url`，附帶多供應商帳號管理、模型管理、出口代理與請求報表，並提供一個開箱即用的 Tauri 桌面端。任何支援自訂 `base_url` 的 OpenAI 客戶端都能以 `http://127.0.0.1:3065/v1` 呼叫這幾家的模型額度 —— **不需要上游 API Key，不需要改客戶端**。
+
+## ✨ 核心特性
+
+- 🔌 **OpenAI 相容端點** —— 統一暴露 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`（含 `count_tokens`）與 `/v1/models`，客戶端即插即用
+- 🏪 **17 家內建供應商** —— WorkBuddy、小浣熊、CatPaw、AutoClaw、Qoder、Cline、Accio、ZCode、CodeArts、Trae、Loomy、KukuAI、MonkeyCode、Command Code、Antigravity、OfficeAce（部分分中國 / 國際兩版），另支援自訂供應商透傳（Chat / Responses / Anthropic）
+- 🔁 **憑證全自動維護** —— Token 自動續期（單飛去重）、臨期憑證批次重新整理、模型目錄遠端重新整理 + 靜態備援
+- 🪂 **穩定轉發** —— 全域優先順序帳號佇列、依模型限額冷卻、429 自動降級、確定性失敗快速跳過不空等
+- 🛡️ **安全與脫敏** —— 出口代理、出站指紋脫敏、多把閘道 Key、fail-closed、登入人機驗證
+- 📊 **請求報表** —— 請求數 / 成功率 / Token 總量、24 小時快取命中率與消耗趨勢、Top 模型與帳號、365 天活躍熱力圖
+- ⏰ **排程任務** —— 自動簽到、憑證維護、模型目錄重新整理等背景任務，開關 / 間隔 / 上次結果一頁管理
+- 💰 **餘額看得見** —— 帳號列內餘額 / 用量顯示，跨帳號並行查詢與定時快照
+- 🖥️ **兩種部署形態** —— Tauri 桌面端（系統匣常駐，免 Node 執行環境）/ Docker headless（面板 + 閘道同連接埠），面板介面六語
+
+## 🤝 支援的供應商
+
+支援情況一覽（✓ 支援 · ✗ 不支援 · — 無此概念）：
+
+| 平台 | LLM 請求 | Token 自動續期 | 模型清單 | 餘額查詢 | 簽到 | 領取類 |
 | --- | :--: | :--: | :--: | :--: | :--: | :--: |
 | WorkBuddy 中國版 | ✓ | ✓ | ✓ 遠端 + 靜態備援 | ✓ | ✓ 每日簽到 | — |
 | WorkBuddy 國際版 | ✓ | ✓ | ✓ 遠端 + 靜態備援 | ✓ | ✗ 無簽到活動 | — |
@@ -27,29 +57,15 @@
 | OfficeAce（華為雲果辦 / OfficeClaw） | ✓ | ✓ 控制面自動續期 | ✓ 僅遠端 | ✓ 積分餘額 | ✓ 每日獎勵（簽到 + 新人禮） | — |
 | 自訂供應商 | ✓ Chat 透傳 / Responses / Anthropic | — | ✓ 手動登記 + 伺服器端拉取 | — | — | — |
 
-三條對話協定入口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，另含 `/v1/messages/count_tokens`）與 `/v1/models` 對所有平台一視同仁，差異只在各家上游能不能做到表裡那些事；模型對應、全域優先順序佇列、429 降級、出口代理、出站指紋脫敏與請求報表同樣對全平台通用。
+`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（含 `count_tokens`）與 `/v1/models` 對所有平台一視同仁；模型對應、全域優先順序佇列、429 降級、出口代理、出站指紋脫敏與請求報表同樣對全平台通用。
 
-> **本專案僅供學習與交流使用。** 它以非官方客戶端形態重用你自己帳號的登入狀態，可能不符合上游服務的使用條款，風險（含帳號被風控、封鎖）自負；禁止商用或繞過計費。詳見[使用聲明](#使用聲明)與 [LICENSE](./LICENSE)。
+> **本專案僅供學習與交流使用。** 它以非官方客戶端形態重用你自己帳號的登入狀態，可能不符合上游服務的使用條款，風險（含帳號被風控、封鎖）自負；禁止商用或繞過計費。詳見[使用聲明](#-使用聲明)與 [LICENSE](./LICENSE)。
 >
-> 本專案與各上游廠商及其官方產品均無關（名單見[使用聲明](#使用聲明)）；介面形態來自對各家客戶端通訊的觀察，上游隨時可能調整。
+> 本專案與各上游廠商及其官方產品均無關（名單見[使用聲明](#-使用聲明)）；介面形態來自對各家客戶端通訊的觀察，上游隨時可能調整。
 
----
+## 🚀 快速開始
 
-## 目錄
-
-- [快速開始](#快速開始)
-- [Docker 部署](#docker-部署)
-- [介面預覽](#介面預覽)
-- [專案結構](#專案結構)
-- [開發與建置](#開發與建置)
-- [使用聲明](#使用聲明)
-- [授權](#授權)
-
----
-
-## 快速開始
-
-從 Releases 下載安裝包（NSIS，簡體中文，預設裝到 `C:\Program Files\Agent2API`，安裝時需要管理員授權），安裝後啟動即可，**無需安裝 Node 或任何其它執行環境**。
+從 [Releases](https://github.com/aimod-cc/agent2api/releases/latest) 下載安裝包（NSIS，簡體中文，預設裝到 `C:\Program Files\Agent2API`，安裝時需要管理員授權），安裝後啟動即可，**無需安裝 Node 或任何其它執行環境**。
 
 1. 首次啟動即在應用程式行程內啟動本機閘道（連接埠 3065）並開啟主視窗；若偵測到舊版本的資料目錄或資料檔案，會彈窗提示遷移，依指引操作即可。
 2. 點「帳號」頁的「新增帳號」，選供應商後依彈窗提示完成登入或填寫憑證即可（方式以彈窗為準：網頁登入 / 手機驗證碼 / 貼上憑證 / 匯入本機登入狀態）。
@@ -89,9 +105,7 @@ print(resp.choices[0].message.content)
 
 預設只監聽 `127.0.0.1`。開啟「設定 → 一般 → 區域網路存取」後改聽所有網路介面卡，區域網路裝置把 API 位址指向本機 IP 即可共用（介面會給出完整位址）。出於安全，開啟前必須註冊面板管理員：管理介面要求管理員工作階段或閘道 Key，無可用 Key 時轉發介面同樣拒絕服務（開啟流程會自動補一把「預設」Key）；也可選擇同時開放網頁面板（預設關閉）。變更重新啟動後生效。
 
----
-
-## Docker 部署
+## 🐳 Docker 部署
 
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
@@ -99,7 +113,7 @@ docker run -d --name agent2api --restart unless-stopped \
   aimodcc/agent2api:latest
 ```
 
-瀏覽器開啟 `http://<主機>:3065`，首次進入會引導**註冊管理員帳號**（後續登入用它）；登入後在「閘道 Key」頁建立一把 API Key 給客戶端用 —— `http://<主機>:3065/v1` 即 OpenAI 相容端點，未建立 Key 前拒絕轉發，建立第一把後自動恢復。所有狀態（SQLite 資料庫 / 設定 / 日誌）都落在 `./data` 一個卷裡。
+瀏覽器開啟 `http://<主機>:3065`，首次進入會引導**註冊管理員帳號**；登入後在「閘道 Key」頁建立一把 API Key 給客戶端用 —— `http://<主機>:3065/v1` 即 OpenAI 相容端點（未建立 Key 前拒絕轉發）。所有狀態（SQLite 資料庫 / 設定 / 日誌）都落在 `./data` 一個卷裡。
 
 compose 使用者（amd64 / arm64 都有映像）：
 
@@ -115,7 +129,7 @@ services:
       - ./data:/data
 ```
 
-環境變數（都可選，不需要預置任何東西）：
+環境變數（都可選）：
 
 | 變數 | 說明 |
 | --- | --- |
@@ -123,15 +137,42 @@ services:
 | `AGENT2API_PANEL_PORT` | 面板分連接埠：設定後面板（介面 + `/api/*`）單獨監聽該連接埠，公網只映射主連接埠即可把管理面留在內網（面板連接埠綁定迴環位址，寫 `127.0.0.1:3066:3066`） |
 | `AGENT2API_HOST` / `AGENT2API_PROXY_PORT` | 監聽位址（預設 `0.0.0.0`）/ 連接埠（預設 `3065`） |
 | `AGENT2API_ALLOW_NO_KEY` | 設 `1` 關閉 fail-closed（未設 Key 也放行 `/v1`，僅限純內網） |
-| `AGENT2API_CAPTCHA_ENABLED` | 登入頁人機驗證元件環境變數：預設為 `1` 開啟，`0` 為關閉 |
+| `AGENT2API_CAPTCHA_ENABLED` | 登入頁人機驗證元件：預設 `1` 開啟，`0` 關閉 |
+| `AGENT2API_SELF_UPDATE` | 容器內的更新入口：預設 `1` 開啟（面板可「下載並更新」）；設 `0` 關閉，只走手動升級 |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 進階：把「檢查更新 / 下載更新」換成自建源。前者換儲存庫（預設跟上游 `aimod-cc/agent2api`，fork 後可改），後者換 API 根（預設 `https://api.github.com`，需返回與 GitHub 同形的 release JSON）。配了自建源後，下載白名單只額外放行**該源自己的網域**（按源的 scheme：配 `http://` 就允許明文下載，僅建議本地演練 / 內網映像用） |
 
 從原始碼建置：複製本專案後 `docker compose up -d --build`（映像裡只有閘道與面板，不含 Rust 工具鏈）。
 
+<details>
+<summary><b>升級與回滾</b>（點開）</summary>
+
+**面板裡直接升**：設定 → 軟體更新 → 檢查更新，發現新版本後點「下載並更新」，包下完再點「安裝並重新啟動」。伺服器端會校驗 sha256，替換容器內的可執行檔與介面檔案，然後重新啟動行程 —— 容器由 `restart: unless-stopped` 拉起（同一個容器，資料卷不動），頁面幾秒後自動重新整理。想退回上一版，面板上有「回復到上一版本」（用的是更新時留下的備份）。
+
+三點需要知道：
+
+- **更新的是容器裡的檔案，不是你本地的映像**：compose 裡的 `image:` 標籤不會變，`docker inspect` 仍顯示舊 tag；之後再 `docker compose pull && docker compose up -d`（重建容器）會回到映像裡的版本。想讓兩邊一致，升級後順手把 compose 裡的標籤改成新版本號，再 `docker compose pull && up -d` 一次即可。
+- 更新入口只在容器裡出現（`AGENT2API_SELF_UPDATE=1`，映像預設已設）；設 `0` 就退回下面的手動方式。
+- 包來自 GitHub Release（`agent2api-server-linux-<arch>.tar.gz` + 同名 `.sha256`）。下載走「更新設定」裡配的出口線路（與檢查更新共用），國內直連不暢時可在那裡指定代理或填 GitHub 權杖。
+
+**手動升級**（任何部署形態都適用）：
+
+```bash
+# compose（用儲存庫裡那份 compose 時）
+docker compose pull && docker compose up -d
+
+# docker run：拉新映像後重建容器（資料都在 ./data 卷裡，不會丟）
+docker pull aimodcc/agent2api:latest
+docker rm -f agent2api
+# 再執行一遍上面「docker run」那段原始命令
+```
+
+從原始碼建置的：`git pull && docker compose up -d --build`。
+
+</details>
+
 **網頁端功能差異**（源於「沒有本機桌面客戶端」）：網頁登入（WorkBuddy / Qoder / Cline）、手機驗證碼、貼上憑證完全可用；需要本機回呼的網頁登入（AutoClaw / CatPaw / Accio / CodeArts / Trae）與「匯入本機登入狀態」不可用，請改用貼上憑證。
 
----
-
-## 介面預覽
+## 📸 介面預覽
 
 ### 帳號
 
@@ -159,11 +200,12 @@ services:
 
 ![排程任務頁：自動簽到、憑證維護、模型目錄重新整理等背景任務的開關與間隔](./assets/screenshots/scheduled-tasks.png)
 
----
+## 🧱 專案結構
 
-## 專案結構
+後端是 `src-tauri/` 下的 Rust 行程內 HTTP 伺服器，前端是 `ui/` 下的原生 HTML/CSS/JS。
 
-閘道與桌面端都在 `desktop-tauri/`：後端是 `src-tauri/` 下的 Rust 行程內 HTTP 伺服器，前端是 `ui/` 下的原生 HTML/CSS/JS。
+<details>
+<summary>完整目錄樹（點開）</summary>
 
 ```
 agent2api/
@@ -185,7 +227,7 @@ agent2api/
 │  │  │  │  │  ├─ router.rs     模型名 → 候選 provider 集合（彙總目錄）
 │  │  │  │  │  ├─ catalog.rs    彙總模型目錄（清單合併 / 同名去重 / 可用性判定）
 │  │  │  │  │  ├─ catalog_cache.rs  各家遠端清單的持久化快取（重啟後讀回，不再回落到內建清單）
-│  │  │  │  │  ├─ refresh_flight.rs  憑證重新整理的去重單飛
+│  │  │  │  │  ├─ refresh_flight.rs  憑證重新整理的單飛去重
 │  │  │  │  │  ├─ workbuddy.rs  WorkBuddy 適配器（標頭集合 / system 注入 / 6004 / 11-128）
 │  │  │  │  │  ├─ raccoon/      小浣熊：mod / models / credentials / jwt / oauth / balance
 │  │  │  │  │  ├─ catpaw/       CatPaw：adapter（is_stateful）/ conversation（輪次狀態機）/
@@ -200,7 +242,7 @@ agent2api/
 │  │  │  │  │  ├─ qoder/        Qoder：adapter / endpoints（兩站位址）/ oauth（裝置授權）/
 │  │  │  │  │  │                auth / cosy（COSY 簽名與 body 編碼）/ protocol（信封解碼）/
 │  │  │  │  │  │                chat（工作階段式轉發）/ stream / machine（PKCE 與機器識別）/
-│  │  │  │  │  │                credentials / refresh / models / balance
+│  │  │  │  │  │                credentials / refresh / models / balance / risk（UMID 風控元件）
 │  │  │  │  │  ├─ cline/        Cline：adapter（Bearer + 產品面標頭）/ credentials（workos: 前綴
 │  │  │  │  │  │                + 桌面端登入狀態 + 姓名解析）/ login（WorkOS 裝置授權）/
 │  │  │  │  │  │                refresh（單飛續期）/ models（兩額度池 + 預設對應種子）/
@@ -251,9 +293,9 @@ agent2api/
 │  │  │  │  │  │                fingerprint（決定性裝置指紋與 8h 回報）/ models /
 │  │  │  │  │  │                plan（8 鍵信封與 params 重寫、session id 派生）
 │  │  │  │  │  ├─ antigravity/  Antigravity（Google，Gemini）：oauth（refresh token 續期 + 單飛）/
-│  │  │  │  │                   project（loadCodeAssist → onboardUser 探索）/ credentials /
-│  │  │  │  │                   endpoints（三環境基址與標頭集合）/ login /
-│  │  │  │  │                   models（fetchAvailableModels + 內建備援 + 上游真名對應）/ adapter
+│  │  │  │  │  │                project（loadCodeAssist → onboardUser 探索）/ credentials /
+│  │  │  │  │  │                endpoints（三環境基址與標頭集合）/ login /
+│  │  │  │  │  │                models（fetchAvailableModels + 內建備援 + 上游真名對應）/ adapter
 │  │  │  │  │  └─ officeace/    OfficeAce（華為雲果辦 / OfficeClaw）：oauth（PKCE + P-256 DPoP 自助登入）/
 │  │  │  │  │                   signer（SDK-HMAC 與 V11-HMAC 兩套簽章 + 向量 fixtures）/ credentials（閘道器 Basic 與控制面臨時 AK/SK 兩層）/
 │  │  │  │  │                   chat（無狀態 OpenAI 相容轉發）/ models（遠端目錄 + 每模型倍率）/
@@ -295,6 +337,7 @@ agent2api/
 │  │  ├─ bridge.rs               注入 window.workbuddyDesktop 的橋接腳本
 │  │  └─ update.rs / settings.rs / state.rs / tray.rs
 │  ├─ ui/                        前端（原生 HTML/CSS/JS，無框架）
+│  ├─ i18n/                      介面詞典原始碼與建置腳本（六語）
 │  └─ src-tauri/tauri.conf.json  打包設定（NSIS）
 ├─ build/make-icon.mjs           產生應用程式圖示來源圖
 ├─ assets/screenshots/           README 配圖（介面截圖）
@@ -303,14 +346,14 @@ agent2api/
 └─ package.json                  建置腳本入口（tauri:dev / tauri:build / build:icon）
 ```
 
----
+</details>
 
-## 開發與建置
+## 🔧 開發與建置
 
 ### 環境需求
 
 - Rust >= 1.77 與 Tauri 2 工具鏈（編譯桌面端本體；Windows 上還需 WebView2 執行環境）
-- Node.js >= 18.17（僅用來執行 `npm run tauri:*` 與 `build/make-icon.mjs` 這些前端建置腳本，桌面端執行時不依賴 Node，也不會打包任何 Node 產物）
+- Node.js >= 18.17（僅用來執行 `npm run tauri:*` 與前端建置腳本，桌面端執行時不依賴 Node）
 
 ### 常用腳本
 
@@ -322,11 +365,9 @@ npm run tauri:build        # 建置桌面端安裝包
 npm run build:icon         # 產生圖示來源圖（改圖示設計後執行，再跑 tauri icon）
 ```
 
-根專案本身沒有執行期依賴，`package.json` 只提供上面這些快捷腳本入口。打包產物為 `target/release/bundle/nsis/Agent2API_<版本>_x64-setup.exe`（目前約 3.0 MB；`src-tauri/.cargo/config.toml` 把 cargo 的 `target-dir` 指到了專案根的 `target/`）。
+打包產物為 `target/release/bundle/nsis/Agent2API_<版本>_x64-setup.exe`（目前約 3.0 MB；`src-tauri/.cargo/config.toml` 把 cargo 的 `target-dir` 指到了專案根的 `target/`）。
 
----
-
-## 使用聲明
+## 📜 使用聲明
 
 ### 僅供學習與交流
 
@@ -348,17 +389,13 @@ npm run build:icon         # 產生圖示來源圖（改圖示設計後執行，
 
 本專案依「現狀」提供，作者不對其可用性、穩定性、安全性或對特定用途的適用性作任何承諾。上游介面隨時可能變更，本專案可能隨時失效而不再維護。完整條款見 [LICENSE](./LICENSE)。本專案中的介面形態、協定欄位等資訊來自對各官方客戶端公開網路通訊的觀察與整理，相關商標與服務的權利歸其各自所有者；若權利方認為本專案存在不當之處，請聯絡作者，將及時調整或刪除。
 
----
-
-## 授權
+## 📄 授權
 
 本專案基於 [MIT License](./LICENSE)，可自由使用、修改與分發，須保留版權聲明。
 
 需要留意的是：LICENSE 正文之後附有一份**使用聲明**，其中第 3 條在 MIT 之上**追加了限制**（禁止商業用途、禁止二次分發牟利、禁止批次帳號營運）。因此本專案**不是**純粹的 MIT 專案——**MIT 條款與使用聲明共同構成完整的授權與使用約定**，兩者對同一行為給出不同結論時以更嚴格的一方為準。這也是 `Cargo.toml` 用 `license-file` 指向 LICENSE、而不宣告 SPDX `"MIT"` 的原因。
 
----
-
-## Star History
+## ⭐ Star History
 
 <a href="https://star-history.com/#aimod-cc/agent2api&Date">
   <picture>
@@ -367,3 +404,11 @@ npm run build:icon         # 產生圖示來源圖（改圖示設計後執行，
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
   </picture>
 </a>
+
+<div align="center">
+
+**[下載最新版](https://github.com/aimod-cc/agent2api/releases/latest)** • **[問題回饋](https://github.com/aimod-cc/agent2api/issues)**
+
+如果這個專案對你有幫助，歡迎點一個 ⭐️ Star！
+
+</div>

@@ -12,7 +12,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
 function fixture(handler) {
   const calls = [], timers = [], popups = [], toasts = []
   let now = 0
-  const window = { location: { href: 'http://panel.invalid/', origin: 'http://panel.invalid' }, open: () => {
+  const window = { location: new URL('http://localhost:8080/'), open: () => {
     const popup = { closed: false, location: { href: 'about:blank' }, close() { this.closed = true } }
     popups.push(popup)
     return popup
@@ -47,6 +47,45 @@ function fixture(handler) {
     const [timer] = timers.splice(index, 1); now += advance; timer.fn(); await tick()
   } }
 }
+test('Web update check preserves disabled and enabled capabilities without starting installation', async () => {
+  for (const selfUpdate of [false, true]) {
+    const info = { currentVersion: '3.0.6', latestVersion: '3.0.7', hasUpdate: true,
+      selfUpdate, asset: { url: 'https://example.invalid/desktop.exe' },
+      serverAsset: { url: 'https://example.invalid/server.tar.gz' }, notes: 'release notes' }
+    const f = fixture(() => info)
+    assert.deepEqual(JSON.parse(JSON.stringify(await f.bridge.checkUpdate())), info)
+    assert.deepEqual(f.calls.map(call => call.path), ['/api/update/check'])
+  }
+})
+
+test('Web bridge retains proxy compatibility commands and forwards replacement file metadata', async () => {
+  const f = fixture(() => ({ items: [] }))
+  await f.bridge.setProxyPoolItemEnabled({ id: 'px', enabled: false })
+  await f.bridge.setProxyPoolItemDisabled('px', true)
+  await f.bridge.getUsableProxyPool()
+  const payload = { id: 'sub', contentBase64: 'eA==', fileName: 'x.yaml', sourcePath: '' }
+  await f.bridge.replaceSubscriptionFile(payload)
+  assert.deepEqual(f.calls.map(call => call.path), [
+    '/api/proxies/pool/enable', '/api/proxies/pool/set-disabled',
+    '/api/proxies/pool/usable', '/api/subscriptions/replace-file',
+  ])
+  assert.deepEqual(f.calls.at(-1).body, payload)
+})
+
+test('Raccoon rejects unsupported callback origins before creating a login task', async () => {
+  const f = fixture(() => assert.fail('invalid callback origin must not reach backend'))
+  f.context.window.location = new URL('https://panel.invalid/')
+  const flow = f.bridge.startLogin('cn', 'external', 'raccoon')
+  const rejected = assert.rejects(flow, /http:\/\//)
+  await tick()
+  assert.equal(f.popups.length, 0)
+  assert.equal(f.calls.length, 0)
+  const button = f.nodes.find(node => node.tag === 'button')
+  assert.ok(button)
+  button.listeners.click()
+  await rejected
+})
+
 const started = state => ({ state, authUrl: 'https://gateway.qwenwork.ai/device/selectAccounts?challenge=synthetic' })
 
 test('QwenWork configuration exposes web, manual and Windows snapshot modes', async () => {

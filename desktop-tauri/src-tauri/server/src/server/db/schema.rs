@@ -100,9 +100,13 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 状态」一类：不是配置项，配置写入绝不能动它。
     "panelAdmin",
     // 面板刷新令牌（server::access）：整份记录数组一个键（条目是个位数：
-    // 每设备一条活链），轮换/撤销都是整键重写。刷新令牌在库里只存 sha256，
-    // 重启后 access 短效令牌虽在内存丢失，浏览器用它静默换新。
+    // 每设备一条活链），轮换/撤销都是整键重写。刷新令牌在库里只存 sha256。
     "panelTokens",
+    // 面板 access 会话表（server::access）：与 `panelTokens` 同一形状、同样只存
+    // sha256。落库的理由是「重启不该把所有已登录的浏览器打成无效」—— 重启前它们
+    // 只在内存，重启后浏览器带着还在的 cookie 撞 401，而 401 又不清 cookie，
+    // 现场表现为「同一把对不上任何登录的指纹反复出现几十次」。
+    "panelAccessSessions",
     // ALTCHA 机器人校验的 HMAC 密钥（server::altcha）：首次签发 challenge
     // 时生成并落库，只经 HMAC 使用、从不外发。属于「其它零散状态」，
     // 配置写入绝不能动它。
@@ -155,8 +159,13 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 它不是配置项（配置写入绝不能动它，否则用户配好的代理会被改一次 API Key
     // 清空）。条目不落独立表、只整份读写，理由见那个模块头。
     "proxyPool",
+    // 代理设置（core::proxy_settings）：`{listenerPortBase, listenerPortEnd,
+    // testUrl}` 一个键 —— 「网络代理」页设置弹窗维护的节点监听端口范围与
+    // 出口测试网址。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能
+    // 动它（否则用户改一次 API Key 端口范围就退回默认、大订阅又分配不出端口）。
+    "proxySettings",
     // 订阅（core::subscriptions）：整份 `{items: [...]}` 一个键 —— 「网络代理」
-    // 页「订阅」区块维护的订阅链接，内核（sub_kernel）拉起时从 api 层拿启用
+    // 页「订阅管理」维护的订阅链接，内核（sub_kernel）拉起时从 api 层拿启用
     // 清单。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能动它。
     "subscriptions",
     // OfficeAce 模型可用性探测的结论（core::providers::officeace::probe）：
@@ -239,13 +248,53 @@ pub fn is_reserved(key: &str) -> bool {
 /// config.json 里一条聚合同 lastResult」看不见的明细。写入方是
 /// `core::checkin_records`（记账点唯一：`core::billing::checkin::run_checkin`）。
 ///
-/// ── 版本 12：两线 v10 的收敛（`requests.route` + `requests.credit`）──
-/// 见 [`apply_v10`]。上游与本地各自把 v10 用作一列（上游 `route`、本地
-/// `credit`），从任一线升上来的库都缺对方那一列，而迁移从 `current + 1`
-/// 开始跑、跳不到那一版 —— 本版本重跑同一份幂等加列，两条线在此收敛。
+/// ── 版本 12：requests 补「来源客户端」一列 ─────────────────────
+/// 见 [`V12_SCHEMA`]。与 v5 / v10 同一形态（既有表加列，单条 ALTER）。
+/// 请求日志的「客户端」列读它：入口 handler 从下游 `User-Agent` 按
+/// `core::client` 的规则表判出客户端类型（`Codex` / `ZCode` / `Claude Code`
+/// …），随记账落库。存归类结果而不是原始 UA：UA 带版本号，逐条存既撑大
+/// 明细也读不出「是谁」。旧行 DEFAULT '' = 没有记录（那时还没采集），
+/// 展示层显示占位符 —— 不给旧数据猜值。
 ///
-/// v13：请求积分来源。必须使用新迁移，已到 v12 的库不会重跑 apply_v10。
-pub const SCHEMA_VERSION: i64 = 13;
+/// ── 版本 13：清空 `request_raw` 的历史正文（一次性空间回收）─────
+/// 预览对话的下游正文从本版起改为**仅调试模式开启时采集**
+/// （对齐 OmniProxy 的口径：不开调试模式就不保存任何原始正文），而升级前
+/// 无条件采集下来的那批正文在此清空 —— 它们对用户不再有意义（新语义下也
+/// 不会有新数据填补开关关闭的时段），留着只白占空间。
+///
+/// 注意这一版是**数据动作**而不是结构变更（表结构一字未动）。放在 schema
+/// 版本里而不是启动期的 kv 标记：两者都「只跑一次」，但版本号是既有的幂等
+/// 机制（`user_version` 与语句同事务提交），复用它就是零新增状态 —— 那条
+/// kv 标记会变成第二个「这条数据动作跑过没有」的事实来源。
+///
+/// 语句不写成 `*_SCHEMA` 常量而在 `apply_version` 的 v13 分支里单独执行：
+/// 要拿**被删的行数**，`migrate` 据此决定是否紧跟着 VACUUM（把空闲页真正
+/// 还给文件系统 —— 光 DELETE 不会让库文件缩小，而「省空间」正是这一版的
+/// 目的），完整说明见 `migrate` 尾部那段。
+///
+/// ── 版本 14：账号 `data` 列改为密文（`core::crypto` 的 `enc1:` 信封）──
+/// 这一版**没有任何 DDL**，也不清任何历史行（`cleaned_raw_rows` 写 0）：
+/// 它只是一个**内容形态的标记**。`accounts.data` 从明文 JSON 变成 AES-256-GCM
+/// 密文，而这件事没有列要加、没有表要建 —— 加密是逐行的内容变换，由
+/// `core::account_store::store_admin::encrypt_legacy_accounts`（挂在
+/// `account_bootstrap::run` 的启动迁移里）把存量明文行就地加密；密钥在库外
+/// （`{config_dir}/account.key`，兜底 `AGENT2API_ACCOUNT_KEY`，见
+/// `core::crypto` 模块头）。所以 `apply_version` 的 v14 分支是空操作。
+///
+/// **为什么仍要占一个版本号**（而不是只靠那段启动迁移）：因为「库里的数据形态」
+/// 真的变了，而 `user_version` 是它唯一的事实来源。升到 14 的库，其 `data` 列
+/// 应被当成密文；这条事实**在旧程序那一侧才有用** —— `migrate` 新加的「库版本
+/// 高于程序版本就拒绝打开」判据（见 [`migrate`]）正建立在版本号上：旧程序
+/// （`SCHEMA_VERSION <= 13`）读到 v14 库会明确失败，而不是把密文当坏数据跳过、
+/// 再在写回时把「读不出来的行」当成「内存里没有」DELETE 掉（即「回退一次 =
+/// 账号被删」）。对本程序，v14 只是一次空操作。
+/// ── 版本 15：本地 / 官方 v12、v13 撞号后的幂等收敛 ─────────────
+/// 本地 v12 是 route/credit 收敛、v13 是 credit_source；官方 v12 是 client、
+/// v13 是历史正文清理、v14 是加密标记。v15 按实际列补齐四列与索引，已有
+/// 积分与来源不改（NULL 不补成 0）。缺 client 是旧本地线的结构证据，在
+/// 补列的同一事务补做正文清理；官方 v13/v14 已有 client，不重复删除升级后
+/// 采集的调试正文。v14 账号加密启动迁移及高版本库的保护屏障保持不变。
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -446,8 +495,8 @@ CREATE INDEX IF NOT EXISTS idx_debug_traffic_ts ON debug_traffic(ts);
 ///
 /// ── 为什么用 ALTER 而不重建表 ────────────────────────────────
 /// 两张表的其它列与索引一个都不动，重建要「建新表 → 搬数据 → 删旧表 → 重建索引」，
-/// 而 `requests` 可能有几万行（`MAX_ENTRIES` = 20000）。ALTER ADD COLUMN 是
-/// SQLite 的元数据操作（常数时间、不重写数据），代价可以忽略。
+/// 而 `requests` 是全量保留的明细表（长期使用可达几万甚至几十万行）。
+/// ALTER ADD COLUMN 是 SQLite 的元数据操作（常数时间、不重写数据），代价可以忽略。
 ///
 /// ── 为什么这里不能写 IF NOT EXISTS ───────────────────────────
 /// SQLite 的 `ALTER TABLE ... ADD COLUMN` **不支持** `IF NOT EXISTS`（这是它与
@@ -478,11 +527,15 @@ ALTER TABLE requests ADD COLUMN sensitive_hits TEXT NOT NULL DEFAULT '[]';
 /// 版本 3：`request_raw` 表 —— 请求/响应的**下游侧**原始正文（预览对话功能的地基）。
 ///
 /// ── 它和 debug_traffic 表是什么关系 ──────────────────────────
-/// `debug_traffic`（调试报文）是**调试模式专用**的上游侧报文（头部脱敏、
-/// 有全局字节闸、开关关闭时完全不采集）；本表是**始终采集**的下游侧正文
-/// （客户端发来的请求体 + 网关下发的响应体），供请求日志的「预览对话」弹窗
-/// 用。两表按同一个 `id`（请求关联 id）各存各的，谁也不依赖谁 ——
-/// `core::debug_traffic` 的现有行为一字未动，本表是纯粹的并行补充。
+/// `debug_traffic`（调试报文）是调试模式的**上游侧**报文（头部脱敏、
+/// 有全局字节闸）；本表是**下游侧**正文（客户端发来的请求体 + 网关下发的
+/// 响应体），供请求日志的「预览对话」弹窗用。两表按同一个 `id`（请求关联 id）
+/// 各存各的，谁也不依赖谁。
+///
+/// ── 采集条件：与调试模式同一个开关（v13 起）───────────────────
+/// 正文**只在调试模式开启时采集**（对齐 OmniProxy 的口径：不开调试模式就不
+/// 保存任何原始正文）—— 关着时连截断转换都不做，采集路径零开销。v13 之前的
+/// 版本是无条件采集的，那批历史正文已由 v13 一次清空（见 [`SCHEMA_VERSION`]）。
 ///
 /// ── 为什么独立成表而不是给 requests 加两列 ────────────────────
 /// 正文是大字段（两侧各 128 KiB 上限），明细列表的每次分页都要取
@@ -500,10 +553,10 @@ ALTER TABLE requests ADD COLUMN sensitive_hits TEXT NOT NULL DEFAULT '[]';
 /// `sqlite3` 命令行里直接看（排障的主要用法）。
 ///
 /// ── 为什么没有索引（连 ts 都不建）────────────────────────────
-/// 本表只有两种读法：按主键 id 取单行（主键自带）、按「保留最新 N 行」裁剪
-/// （2000 行的表全排序是微秒级）。唯一会按 ts 范围查它的是清理预览的计数，
-/// 那条走的是 `id IN (SELECT id FROM requests ...)` 主键查找。表有行数硬闸，
-/// 不会长到大到需要索引。
+/// 本表只有两种读法：按主键 id 取单行（主键自带）、清理时按
+/// 「`id IN (SELECT id FROM requests …)`」定位（主键查找）。唯一的全表扫描是
+/// 用户手动清空（`DELETE FROM request_raw`），而正文只在调试模式开启期间写入
+/// —— 表的增长由那个开关天然约束，不会长到需要为检索建索引。
 const V3_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS request_raw (
   id            TEXT PRIMARY KEY,
@@ -651,15 +704,14 @@ const V9_SCHEMA: &str = "
 CREATE INDEX IF NOT EXISTS idx_requests_account_ts ON requests(account_id, ts);
 ";
 
-/// 版本 10 / 12：`requests` 补两列 —— 上游的**选路决策快照** `route` 与
+/// 版本 10 / 15：`requests` 补两列 —— 上游的**选路决策快照** `route` 与
 /// 本地的**本次消耗积分** `credit`。
 ///
 /// ── 为什么两列在同一处 ───────────────────────────────────────
 /// 上游与本地各自把 v10 用作一列（上游 `route`、本地 `credit`），合并后两列
-/// 都必须存在。从任一线升上来的存量库在 `user_version = 10`（或 11）上，
-/// 迁移从 `current + 1` 开始跑，**会跳过对方那一列** —— 所以本函数在 v10 与
-/// v12 两处都被调用：v10 服务「升到 10 的库」，v12 服务「已经是 10 / 11 的
-/// 库」，两边都收敛到同一份表结构。函数本身幂等（查列存在性），重跑无副作用。
+/// 都必须存在。旧本地 v12 曾重放此函数；现在 v12 留给官方 client 迁移，
+/// v15 承接双线收敛，补齐被版本号跳过的列。函数本身幂等（查列存在性），
+/// 重跑不改变已有积分、路由或 NULL 值。
 ///
 /// ── `route` 存什么 ──────────────────────────────────────────
 /// 整个决策 JSON 的原文（`{strategy, sticky, stickyHit, picked, ordered[],
@@ -733,7 +785,8 @@ fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {
 ///     免得每个读点都写 `(outcome='success' OR outcome='already')`）；
 ///   - `message`：claim.msg 原文（「今日积分 +100」等**收益就在这里**）；
 ///   - `error`：执行错误原文（失败行的原因）；
-///   - `kept_active`：国际版保活成功（`activity.pokeSucceeded`）标记。
+///   - `kept_active`：国际版保活成功标记（保活对话 `pokeSucceeded` 或网页
+///     会话 `webConversation.succeeded` 任一，见 `checkin_records::kept_active_of`）。
 ///
 /// 为什么 row_id 用 AUTOINCREMENT：与 `requests` 同一理由 —— 它当翻页游标，
 /// 复用 rowid 会让「翻页漏行 / 重行」。
@@ -762,20 +815,97 @@ CREATE INDEX IF NOT EXISTS idx_checkin_records_outcome ON checkin_records(outcom
 CREATE INDEX IF NOT EXISTS idx_checkin_records_provider ON checkin_records(provider);
 ";
 
+/// 版本 12：requests 补「来源客户端」一列（schema v12）。
+///
+/// 与 v5 / v7 / v10 同一形态（既有表加列，单条 ALTER，幂等靠版本号）：
+/// `client` 存入口从下游 `User-Agent` 判出的客户端类型（`core::client`），
+/// 请求日志的「客户端」列读它。DEFAULT ''：旧行与「请求没带 UA」的路径都是
+/// 空串 —— 两者在展示层的处理相同（占位符），不必分两种形态。
+const V12_SCHEMA: &str = "
+-- ── requests 补来源客户端列（schema v12）─────────────────────
+ALTER TABLE requests ADD COLUMN client TEXT NOT NULL DEFAULT '';
+";
+// v13 没有对应的 `*_SCHEMA` 常量：它只有一条 DELETE，且在 `apply_version`
+// 的分支里用 `execute` 单独执行（要拿被删行数），语句就在那里 —— 见
+// `SCHEMA_VERSION` 的 v13 段。
+
+/// v15: converge both released histories without reclassifying any existing credit.
+fn apply_v15(conn: &Connection, cleaned_raw_rows: &mut usize) -> rusqlite::Result<()> {
+    apply_v10(conn)?;
+    let has_column = |name: &str| -> rusqlite::Result<bool> {
+        conn.prepare("SELECT 1 FROM pragma_table_info('requests') WHERE name = ?1")?
+            .exists([name])
+    };
+    if !has_column("credit_source")? {
+        conn.execute_batch(
+            "ALTER TABLE requests ADD COLUMN credit_source TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    conn.execute_batch(V3_SCHEMA)?;
+    if !has_column("client")? {
+        // Only the local v12/v13 lineage lacks client. Adding it and clearing the
+        // pre-debug-only history share the version transaction, including on retry.
+        conn.execute_batch(V12_SCHEMA)?;
+        *cleaned_raw_rows += conn.execute("DELETE FROM request_raw", [])?;
+    }
+    Ok(())
+}
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
+///
+/// **库版本高于本程序时返回 `Err` 拒绝打开**（v14 起有意反转的一条既有决定，
+/// 完整论证见函数体里那个分支的注释）：加密后的 `accounts.data` 被旧程序当坏
+/// 数据跳过、再被它的差异写当成「内存里没有」删掉，静默放行等于「回退一次 =
+/// 账号被删」。库版本**低于**本程序则照常逐版本升级；**等于**则空操作。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
 /// 是唯一消费点，它把错误包成一句人能读的话（`format!`）就够了；而这里需要
 /// 区分「读版本号失败 / 跑 DDL 失败 / 写版本号失败」三种，保留 rusqlite 的
-/// 错误类型（含 SQLite 的错误码与消息）才说得清是哪一步坏的。
+/// 错误类型（含 SQLite 的错误码与消息）才说得清是哪一步坏的。那句「库比程序新」
+/// 的拒绝理由用 `ToSqlConversionFailure` 承载（它的 `Display` 就是原话）。
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current >= SCHEMA_VERSION {
-        // 版本比本二进制新（用户从新版回退到旧版）：**不报错、也不动库**。
-        // 报错会让旧版直接起不来（用户只是想回退一次），而「降级 schema」
-        // 意味着删列删表，那是不可逆的数据丢失 —— 两者都不该自动发生。
+    if current == SCHEMA_VERSION {
+        // 已是最新版：什么都不做（全新库跑完建表之后、已升级的库每次启动都走这里）。
         return Ok(());
     }
+    if current > SCHEMA_VERSION {
+        // ── 库比程序新：**拒绝打开**（本切片有意反转的一条既有决定）─────────
+        //
+        // 改造前这里的口径是「不报错、也不动库」：理由写的是「用户从新版回退到
+        // 旧版，报错会让旧版直接起不来，而他只是想回退一次」。那条理由在
+        // `accounts.data` 是明文的年代成立 —— 旧程序读不懂新库的新列/新表，
+        // 但账号那几张表它写得回去，最坏是丢一点新功能的数据。
+        //
+        // **本版起它不再成立**：`accounts.data` 是 `enc1:` 密文（v14 起），而旧程序
+        // （`SCHEMA_VERSION <= 13`）的 `decode_data` 只认明文 JSON —— 于是：
+        //   1. 旧程序读出每一行都会失败，把它们**当成坏数据跳过** → 界面上账号
+        //      全部消失；
+        //   2. 更致命的是写路径：旧程序的 `save_state` 按 id 做差异写，「库里有、
+        //      内存状态里没有」的行会被 `DELETE FROM accounts WHERE id = ?` ——
+        //      它读不出来的那些密文行**恰好**落进这个分支。于是「回退一次并触发
+        //      任意一次账号写入」= 把加密后的账号**静默删光**。
+        // 静默放行等于「回退一次 = 账号被删」，而账号数据丢了是不可逆的用户损失
+        // —— 所以这里改成明确失败：让启动在日志里说清原因，用户退回去用新版。
+        //
+        // 这不是「降级 schema」（那才需要删列删表、不可逆，本函数从没做过，也不
+        // 会做）：这里只是**在动手之前先拒绝**，库文件一个字节都不碰。
+        //
+        // 用什么承载这句错误：`ToSqlConversionFailure` 的 `Display` 就是里面那句
+        // 话的原文（本仓既有手法，见 `db::migrate::logs::assign_log_id` 的说明），
+        // 于是 `Db::open` 的 `format!("建表/升级 schema 失败: {error}")` 会把这段
+        // 话原样带到启动日志里。
+        return Err(rusqlite::Error::ToSqlConversionFailure(
+            format!(
+                "库 schema 版本（{current}）高于当前程序（{SCHEMA_VERSION}）：这通常是回退到了旧版本。\
+                 请使用更新的程序，或从备份恢复——用旧程序打开会把加密后的账号静默删除。"
+            )
+            .into(),
+        ));
+    }
+    // v13 / v15 清掉的历史正文行数（0 = 这一轮什么都没删）：循环后决定是否
+    // VACUUM（见本函数尾部那段）。放循环外是因为 VACUUM 不能在事务里跑。
+    let mut cleaned_raw_rows = 0usize;
     for version in (current + 1)..=SCHEMA_VERSION {
         // 每个版本一个独立事务：DDL 与版本号必须一起生效或一起不生效，
         // 否则中断后会出现「表已建、版本号还是旧的」（下次启动重跑 DDL，
@@ -792,21 +922,44 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // 写事务的独占性由 SQLite 自己保证（同一连接上不允许第二条语句并发），
         // 不是靠 Rust 的独占借用。
         let tx = conn.unchecked_transaction()?;
-        apply_version(&tx, version)?;
+        apply_version(&tx, version, &mut cleaned_raw_rows)?;
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
+    }
+    if cleaned_raw_rows > 0 {
+        // ── 删完之后顺手 VACUUM 一次（v13 的「省空间」在这里真正落地）──
+        // `DELETE` 只是把行标成空闲页，库文件**不会缩小** —— 对「升级后马上想
+        // 看到磁盘降下来」的用户，只有 VACUUM（重建整库文件）才把空闲页还给
+        // 文件系统。触发条件是 `cleaned_raw_rows > 0`：全新库（表本来就空）与
+        // 已升过级的库都删 0 行、不付这个代价；只有「确实有历史正文被清掉」的
+        // 那次升级会做一遍整库重建（几十 MB 的库通常秒级，一次性成本）。
+        //
+        // VACUUM 不能在事务里，所以放在循环外（每个版本的事务都已提交）；
+        // 失败**不报错**：数据已经删掉了，回收空间是尽力而为的优化 —— 用户
+        // 之后仍可在请求日志页的「清理」弹窗里手动压缩（那条路有后台线程与
+        // 进度状态，见 `RequestStats::compact`）。
+        let _ = conn.execute_batch("VACUUM;");
     }
     Ok(())
 }
 
-/// 执行某个版本的 DDL。**新增版本时在这里加一个分支**，并在上面写好该版本的
-/// 建表/改表语句常量。
+/// 执行某个版本的 DDL / 数据动作，并把「清掉的历史正文行数」带回给 `migrate`
+/// （v13 清理和 v15 旧本地线补清理会累加，其余版本不改）。**新增版本时在这里加一个分支**，
+/// 并在上面写好该版本的建表/改表语句常量。
+///
+/// `cleaned_raw_rows` 做成出参而不是返回值：绝大多数分支只是跑一段 DDL、
+/// 没有数据要上报，若改成 `Result<usize>` 则每个分支都得包一层 `Ok(0)`
+/// （形式噪音），出参让「只有关心它的那一版」写它。
 ///
 /// `_` 分支返回 Ok 而不是 unreachable!：版本号是外部输入（库文件可能来自
 /// 更新的二进制，被旧版读到），越过 [`SCHEMA_VERSION`] 的版本不该 panic。
 /// `migrate` 的主循环也不可能走到这里（循环上界就是 SCHEMA_VERSION），
 /// 所以这个分支实际是「调用方传了越界的 version」的防御。
-fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
+fn apply_version(
+    conn: &Connection,
+    version: i64,
+    cleaned_raw_rows: &mut usize,
+) -> rusqlite::Result<()> {
     match version {
         1 => conn.execute_batch(V1_SCHEMA),
         // v2：requests 补两个 JSON 文本列（重试链 / 敏感词命中）。
@@ -832,16 +985,28 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         10 => apply_v10(conn),
         // v11：checkin_records 签到记录明细台账（签到记录页的数据源，见 V11_SCHEMA）
         11 => conn.execute_batch(V11_SCHEMA),
-        // v12：两线 v10 的收敛 —— 重跑同一份幂等加列，让「上游的库」补上
-        // credit、「本地的库」补上 route（见 SCHEMA_VERSION 与 apply_v10）
-        12 => apply_v10(conn),
+        // v12：requests 补「来源客户端」一列（请求日志的客户端列，见 V12_SCHEMA）
+        12 => conn.execute_batch(V12_SCHEMA),
+        // v13：清空预览对话的历史正文（一次性空间回收，见 SCHEMA_VERSION 的
+        // v13 段）。先重放 v3 建表：存量库里有「版本号不低、request_raw 表却
+        // 缺失」的个例（v4 就是为修它而加的）—— 对那种库直接 DELETE 会报
+        // 「no such table」并把整个版本事务回滚，迁移就卡死了。
+        // 用 `execute` 而不是 `execute_batch`：要拿被删行数带出去，`migrate`
+        // 据此决定是否紧跟着 VACUUM（光 DELETE 不会让库文件缩小）。
         13 => {
-            let exists = conn.prepare("SELECT 1 FROM pragma_table_info('requests') WHERE name = 'credit_source'")?.exists([])?;
-            if !exists {
-                conn.execute_batch("ALTER TABLE requests ADD COLUMN credit_source TEXT NOT NULL DEFAULT '';")?;
-            }
+            conn.execute_batch(V3_SCHEMA)?;
+            *cleaned_raw_rows = conn.execute("DELETE FROM request_raw", [])?;
             Ok(())
         }
+        // v14：账号 `data` 列改为密文（`enc1:` 信封）。
+        // **这一版没有 DDL**，所以是空操作：加密是逐行的内容变换（由启动迁移
+        // `account_store::store_admin::encrypt_legacy_accounts` 把存量明文行就地
+        // 加密），没有列要加、没有表要建、也没有历史行要删（`cleaned_raw_rows`
+        // 保持 0，不触发 VACUUM）。版本号的作用在**旧程序那一侧**：它让旧程序
+        // 读到 v14 库时明确失败（见 `migrate` 的拒绝分支），而不是把密文当坏
+        // 数据跳过后又删掉。完整说明见 [`SCHEMA_VERSION`] 的 v14 段。
+        14 => Ok(()),
+        15 => apply_v15(conn, cleaned_raw_rows),
         _ => Ok(()),
     }
 }
@@ -874,7 +1039,7 @@ mod tests {
     /// 上游与本地各自把 v10 用作一列。只跑 v10 分支的话，从上游升上来的库在
     /// `user_version = 10` 上、迁移从 `current + 1 = 11` 开始跑，**永远补不上
     /// `credit`** —— 而缺列不会让编译或启动报错，只会在写请求明细时撞
-    /// `no such column: credit`。v12 就是为这条路存在的，本用例钉住它。
+    /// `no such column: credit`。v15 承接旧本地 v12 的收敛职责，本用例钉住它。
     #[test]
     fn upstream_line_gains_credit_column_at_latest_version() {
         let conn = base_db();
@@ -916,20 +1081,190 @@ mod tests {
         migrate(&conn).expect("全新库迁移应通过");
         assert!(has_column(&conn, "route"), "全新库应有 route 列");
         assert!(has_column(&conn, "credit"), "全新库应有 credit 列");
+        assert_converged(&conn);
+        conn.execute("INSERT INTO requests(id, ts, model) VALUES ('fresh', 1, 'test')", []).unwrap();
+        let row: (Option<f64>, String, String) = conn.query_row(
+            "SELECT credit, credit_source, client FROM requests", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(row, (None, String::new(), String::new()));
+        insert_raw(&conn, "new-debug");
+        migrate(&conn).unwrap();
+        assert_eq!(raw_count(&conn), 1);
+    }
+
+    /// Reconstruct released schemas, not the merged v10/v12 branches: otherwise
+    /// an upstream fixture would already contain credit and hide the collision.
+    fn released_db(local: bool, version: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut cleaned = 0;
+        for v in 1..=9 {
+            apply_version(&conn, v, &mut cleaned).unwrap();
+        }
+        if local {
+            apply_v10(&conn).unwrap();
+        } else {
+            conn.execute_batch("ALTER TABLE requests ADD COLUMN route TEXT;").unwrap();
+        }
+        conn.execute_batch(V11_SCHEMA).unwrap();
+        if local {
+            if version >= 13 {
+                conn.execute_batch(
+                    "ALTER TABLE requests ADD COLUMN credit_source TEXT NOT NULL DEFAULT '';",
+                ).unwrap();
+            }
+        } else {
+            conn.execute_batch(V12_SCHEMA).unwrap();
+            for v in 13..=version {
+                apply_version(&conn, v, &mut cleaned).unwrap();
+            }
+        }
+        conn.pragma_update(None, "user_version", version).unwrap();
+        conn
+    }
+
+    fn insert_raw(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO request_raw(id, ts, request_body) VALUES (?1, 1, 'body')",
+            [id],
+        ).unwrap();
+    }
+
+    fn raw_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM request_raw", [], |r| r.get(0)).unwrap()
+    }
+
+    fn assert_converged(conn: &Connection) {
+        for column in ["route", "credit", "credit_source", "client"] {
+            assert!(has_column(conn, column), "missing {column}");
+        }
+        let indexed: Vec<String> = conn.prepare(
+            "SELECT name FROM pragma_index_info('idx_requests_account_ts') ORDER BY seqno",
+        ).unwrap().query_map([], |r| r.get(0)).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(indexed, ["account_id", "ts"]);
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Local v12/v13 missed the official client/cleanup versions. Preserve
+    /// fractional/zero/NULL credits and existing source labels while converging.
+    #[test]
+    fn local_v12_v13_migration_matrix() {
+        for version in [12, 13] {
+            let conn = released_db(true, version);
+            assert!(!has_column(&conn, "client"));
+            assert_eq!(has_column(&conn, "credit_source"), version == 13);
+            conn.execute_batch(
+                "INSERT INTO requests(id, ts, model, credit, route) VALUES
+                 ('billed', 1, 'test', 0.125, '{\"picked\":\"a\"}'),
+                 ('free', 2, 'test', 0.0, NULL),
+                 ('unknown', 3, 'test', NULL, NULL);
+                 DROP INDEX idx_requests_account_ts;",
+            ).unwrap();
+            if version == 13 {
+                conn.execute_batch(
+                    "UPDATE requests SET credit_source = 'estimate' WHERE id = 'billed';
+                     UPDATE requests SET credit_source = 'reported' WHERE id = 'free';",
+                ).unwrap();
+            }
+            insert_raw(&conn, "legacy");
+            migrate(&conn).unwrap();
+            assert_converged(&conn);
+            assert_eq!(raw_count(&conn), 0, "local v{version} must clear legacy bodies");
+            let rows: Vec<(Option<f64>, String)> = conn.prepare(
+                "SELECT credit, credit_source FROM requests ORDER BY ts",
+            ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+                .collect::<rusqlite::Result<_>>().unwrap();
+            assert_eq!(rows, vec![
+                (Some(0.125), if version == 13 { "estimate" } else { "" }.into()),
+                (Some(0.0), if version == 13 { "reported" } else { "" }.into()),
+                (None, String::new()),
+            ]);
+            let route: String = conn.query_row(
+                "SELECT route FROM requests WHERE id = 'billed'", [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(route, "{\"picked\":\"a\"}");
+            insert_raw(&conn, "new-debug");
+            migrate(&conn).unwrap();
+            assert_eq!(raw_count(&conn), 1, "restarting must keep new debug bodies");
+        }
+    }
+
+    /// Official v12 still needs v13 cleanup; official v13/v14 have already
+    /// cleaned their history, so every subsequent body must survive v15.
+    #[test]
+    fn upstream_v12_v13_v14_migration_matrix() {
+        for version in [12, 13, 14] {
+            let conn = released_db(false, version);
+            assert!(has_column(&conn, "client"));
+            assert!(!has_column(&conn, "credit"));
+            conn.execute_batch(
+                "INSERT INTO requests(id, ts, model, client, route)
+                 VALUES ('request', 1, 'test', 'Codex', '{\"picked\":\"a\"}');
+                 INSERT INTO accounts(id, provider, priority, data)
+                 VALUES ('account', 'workbuddy', 1, 'enc1:preserve-verbatim');",
+            ).unwrap();
+            insert_raw(&conn, "existing-body");
+            migrate(&conn).unwrap();
+            assert_converged(&conn);
+            assert_eq!(raw_count(&conn), if version == 12 { 0 } else { 1 }, "upstream v{version}");
+            let row: (Option<f64>, String, String, String) = conn.query_row(
+                "SELECT credit, credit_source, client, route FROM requests", [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            ).unwrap();
+            assert_eq!(row, (None, String::new(), "Codex".into(), "{\"picked\":\"a\"}".into()));
+            let account: String = conn.query_row("SELECT data FROM accounts", [], |r| r.get(0)).unwrap();
+            assert_eq!(account, "enc1:preserve-verbatim");
+            insert_raw(&conn, "new-debug");
+            migrate(&conn).unwrap();
+            assert_eq!(raw_count(&conn), if version == 12 { 1 } else { 2 });
+        }
     }
 
     #[test]
-    fn v12_gains_credit_source_without_losing_credit() {
-        let conn = Connection::open_in_memory().unwrap();
-        for version in 1..=12 { apply_version(&conn, version).unwrap(); }
-        conn.pragma_update(None, "user_version", 12).unwrap();
-        assert!(!has_column(&conn, "credit_source"));
-        conn.execute("INSERT INTO requests(id, ts, model, credit) VALUES ('1', 1, 'test', 0.125)", []).unwrap();
+    fn v15_cleanup_and_columns_roll_back_together_and_retry() {
+        let conn = released_db(true, 13);
+        insert_raw(&conn, "legacy");
+        conn.execute_batch(
+            "CREATE TRIGGER block_cleanup BEFORE DELETE ON request_raw
+             BEGIN SELECT RAISE(ABORT, 'test cleanup failure'); END;",
+        ).unwrap();
+        assert!(migrate(&conn).is_err());
+        // v14 committed independently; v15 must not leave its client marker behind.
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, 14);
+        assert!(!has_column(&conn, "client"));
+        assert_eq!(raw_count(&conn), 1);
+        conn.execute_batch("DROP TRIGGER block_cleanup;").unwrap();
         migrate(&conn).unwrap();
-        migrate(&conn).unwrap();
-        let row:(f64,String)=conn.query_row("SELECT credit, credit_source FROM requests WHERE id=1", [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(row, (0.125, String::new()));
-        apply_version(&conn, 13).unwrap();
+        assert_converged(&conn);
+        assert_eq!(raw_count(&conn), 0);
+    }
+
+    #[test]
+    fn missing_raw_table_is_repaired_on_both_histories() {
+        for (local, version) in [(true, 12), (true, 13), (false, 12), (false, 13), (false, 14)] {
+            let conn = released_db(local, version);
+            conn.execute_batch("DROP TABLE request_raw;").unwrap();
+            migrate(&conn).unwrap();
+            assert_converged(&conn);
+            insert_raw(&conn, "new-debug");
+            migrate(&conn).unwrap();
+            assert_eq!(raw_count(&conn), 1);
+        }
+    }
+
+    #[test]
+    fn newer_schema_is_rejected_without_mutation() {
+        let conn = released_db(false, 14);
+        insert_raw(&conn, "keep");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+        assert!(migrate(&conn).is_err());
+        assert!(!has_column(&conn, "credit"));
+        assert_eq!(raw_count(&conn), 1);
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1);
     }
 
     /// 迁移幂等：跑第二遍不报错、不改版本号。

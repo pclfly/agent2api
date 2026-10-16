@@ -1,8 +1,38 @@
-# Agent2API · 多提供商本地网关
+<div align="center">
 
-**简体中文** | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
+# Agent2API
 
-把多家 AI 桌面客户端的登录态变成一个本地 **OpenAI 兼容 API 网关**：统一暴露一个 `base_url`，带多账号管理、模型管理、出网代理与请求报表，并附一个开箱即用的 Tauri 桌面端。任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 调用这几家的模型额度 —— 不需要上游 API Key，不需要改客户端。
+**把多家 AI 桌面客户端的登录态，变成一个本地 OpenAI 兼容 API 网关**
+
+[简体中文](./README.md) | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
+
+[![license](https://img.shields.io/badge/license-MIT%20%2B%20附加声明-green)](./LICENSE)
+[![release](https://img.shields.io/github/v/release/aimod-cc/agent2api?include_prereleases)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
+[![stars](https://img.shields.io/github/stars/aimod-cc/agent2api?style=flat&color=yellow)](https://github.com/aimod-cc/agent2api/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/aimod-cc/agent2api/releases/latest)
+
+[✨ 核心特性](#-核心特性) • [🤝 支持的提供商](#-支持的提供商) • [🚀 快速开始](#-快速开始) • [🐳 Docker 部署](#-docker-部署) • [📸 界面预览](#-界面预览) • [🔧 开发与构建](#-开发与构建) • [📜 使用声明](#-使用声明)
+
+</div>
+
+---
+
+统一暴露一个 `base_url`，带多账号管理、模型管理、出网代理与请求报表，并附一个开箱即用的 Tauri 桌面端。任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 调用这几家的模型额度 —— **不需要上游 API Key，不需要改客户端**。
+
+## ✨ 核心特性
+
+- 🔌 **OpenAI 兼容端点** —— 统一暴露 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`（含 `count_tokens`）与 `/v1/models`，客户端即插即用
+- 🏪 **17 家内置提供商** —— WorkBuddy、小浣熊、CatPaw、AutoClaw、Qoder、Cline、Accio、ZCode、CodeArts、Trae、Loomy、KukuAI、MonkeyCode、Command Code、Antigravity、OfficeAce（部分分国内 / 国际两版），另支持自定义提供商透传（Chat / Responses / Anthropic）
+- 🔁 **凭证全自动维护** —— Token 自动续期（单飞去重）、临期凭证批量刷新、模型目录远程刷新 + 静态兜底
+- 🪂 **稳定转发** —— 全局优先级账号队列、按模型限额冷却、429 自动降级、确定性失败快速跳过不空等
+- 🛡️ **安全与脱敏** —— 出网代理、出站指纹脱敏、多把网关 Key、fail-closed、登录人机验证
+- 📊 **请求报表** —— 请求数 / 成功率 / Token 总量、24 小时缓存命中率与消耗趋势、Top 模型与账号、365 天活跃热力图
+- ⏰ **定时任务** —— 自动签到、凭证维护、模型目录刷新等后台任务，开关 / 间隔 / 上次结果一页管理
+- 💰 **余额看得见** —— 账号行内余额 / 用量展示，跨账号并发查询与定时快照
+- 🖥️ **两种部署形态** —— Tauri 桌面端（托盘常驻，免 Node 运行时）/ Docker headless（面板 + 网关同端口），面板界面六语
+
+## 🤝 支持的提供商
 
 支持情况一览（✓ 支持 · ✗ 不支持 · — 无此概念）：
 
@@ -29,27 +59,13 @@
 
 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`（含 `count_tokens`）与 `/v1/models` 对所有平台一视同仁；模型映射、全局优先级队列、429 降级、出网代理、出站指纹脱敏与请求报表同样全平台通用。
 
-> **本项目仅供学习与交流使用。** 它以非官方客户端形态复用你自己账号的登录态，可能不符合上游服务的使用条款，风险（含账号被风控、封禁）自负；禁止商用或绕过计费。详见[使用声明](#使用声明)与 [LICENSE](./LICENSE)。
+> **本项目仅供学习与交流使用。** 它以非官方客户端形态复用你自己账号的登录态，可能不符合上游服务的使用条款，风险（含账号被风控、封禁）自负；禁止商用或绕过计费。详见[使用声明](#-使用声明)与 [LICENSE](./LICENSE)。
 >
-> 本项目与各上游厂商及其官方产品均无关（名单见[使用声明](#使用声明)）；接口形态来自对各家客户端通信的观察，上游随时可能调整。
+> 本项目与各上游厂商及其官方产品均无关（名单见[使用声明](#-使用声明)）；接口形态来自对各家客户端通信的观察，上游随时可能调整。
 
----
+## 🚀 快速开始
 
-## 目录
-
-- [快速开始](#快速开始)
-- [Docker 部署](#docker-部署)
-- [界面预览](#界面预览)
-- [项目结构](#项目结构)
-- [开发与构建](#开发与构建)
-- [使用声明](#使用声明)
-- [许可](#许可)
-
----
-
-## 快速开始
-
-从 Releases 下载安装包（NSIS，简体中文，默认装到 `C:\Program Files\Agent2API`，安装时需要管理员授权），安装后启动即可，**无需安装 Node 或任何其它运行时**。
+从 [Releases](https://github.com/aimod-cc/agent2api/releases/latest) 下载安装包（NSIS，简体中文，默认装到 `C:\Program Files\Agent2API`，安装时需要管理员授权），安装后启动即可，**无需安装 Node 或任何其它运行时**。
 
 1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口；若检测到旧版本的数据目录或数据文件，会弹窗提示迁移，按指引操作即可。
 2. 点「账号」页的「添加账号」，选提供商后按弹窗提示完成登录或填写凭证即可（方式以弹窗为准：网页登录 / 手机验证码 / 粘贴凭证 / 导入本机登录态）。
@@ -89,9 +105,7 @@ print(resp.choices[0].message.content)
 
 默认只监听 `127.0.0.1`。开启「设置 → 通用 → 局域网访问」后改听所有网卡，局域网设备把 API 地址指向本机 IP 即可共用（界面会给出完整地址）。出于安全，开启前必须注册面板管理员：管理接口要求管理员会话或网关 Key，无可用 Key 时转发接口同样拒绝服务（开启流程会自动补一把「默认」Key）；也可选择同时开放网页面板（默认关闭）。改动重启生效。
 
----
-
-## Docker 部署
+## 🐳 Docker 部署
 
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
@@ -124,14 +138,41 @@ services:
 | `AGENT2API_HOST` / `AGENT2API_PROXY_PORT` | 监听地址（默认 `0.0.0.0`）/ 端口（默认 `3065`） |
 | `AGENT2API_ALLOW_NO_KEY` | 置 `1` 关闭 fail-closed（未配 Key 也放行 `/v1`，仅限纯内网） |
 | `AGENT2API_CAPTCHA_ENABLED` | 登录页人机验证：默认 `1` 开启，`0` 关闭 |
+| `AGENT2API_SELF_UPDATE` | 容器内的更新入口：默认 `1` 开启（面板可「下载并更新」）；置 `0` 关闭，只走手动升级 |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 进阶：把「检查更新 / 下载更新」换成自建源。前者换仓库（默认跟上游 `aimod-cc/agent2api`，fork 后可改），后者换 API 根（默认 `https://api.github.com`，需返回与 GitHub 同形的 release JSON）。配了自建源后，下载白名单只额外放行**该源自己的域名**（按源的 scheme：配 `http://` 就允许明文下载，仅建议本地演练/内网镜像用）|
 
 从源码构建：克隆本仓库后 `docker compose up -d --build`（镜像里只有网关与面板，不含 Rust 工具链）。
 
+<details>
+<summary><b>升级与回滚</b>（点开）</summary>
+
+**面板里直接升**：设置 → 软件更新 → 检查更新，发现新版本后点「下载并更新」，包下完再点「安装并重启」。服务端会校验 sha256，替换容器内的可执行文件与界面文件，然后重启进程 —— 容器由 `restart: unless-stopped` 拉起（同一个容器，数据卷不动），页面几秒后自动刷新。想退回上一版，面板上有「回滚到上一版本」（用的是更新时留下的备份）。
+
+三点需要知道：
+
+- **更新的是容器里的文件，不是你本地的镜像**：compose 里的 `image:` 标签不会变，`docker inspect` 仍显示旧 tag；之后再 `docker compose pull && docker compose up -d`（重建容器）会回到镜像里的版本。想让两边一致，升级后顺手把 compose 里的标签改成新版本号，再 `docker compose pull && up -d` 一次即可。
+- 更新入口只在容器里出现（`AGENT2API_SELF_UPDATE=1`，镜像默认已设）；置 `0` 就退回下面的手动方式。
+- 包来自 GitHub Release（`agent2api-server-linux-<arch>.tar.gz` + 同名 `.sha256`）。下载走「更新设置」里配的出网线路（与检查更新共用），国内直连不畅时可在那里指定代理或填 GitHub 令牌。
+
+**手动升级**（任何部署形态都适用）：
+
+```bash
+# compose（用仓库里那份 compose 时）
+docker compose pull && docker compose up -d
+
+# docker run：拉新镜像后重建容器（数据都在 ./data 卷里，不会丢）
+docker pull aimodcc/agent2api:latest
+docker rm -f agent2api
+# 再执行一遍上面「docker run」那段原始命令
+```
+
+从源码构建的：`git pull && docker compose up -d --build`。
+
+</details>
+
 **网页端功能差异**（源于「没有本机桌面客户端」）：网页登录（WorkBuddy / Qoder / Cline）、手机验证码、粘贴凭证完全可用；需要本机回调的网页登录（AutoClaw / CatPaw / Accio / CodeArts / Trae）与「导入本机登录态」不可用，请改用粘贴凭证。
 
----
-
-## 界面预览
+## 📸 界面预览
 
 ### 账号
 
@@ -159,9 +200,7 @@ services:
 
 ![定时任务页：自动签到、凭证维护、模型目录刷新等后台任务的开关与间隔](./assets/screenshots/scheduled-tasks.png)
 
----
-
-## 项目结构
+## 🧱 项目结构
 
 后端是 `src-tauri/` 下的 Rust 进程内 HTTP 服务器，前端是 `ui/` 下的原生 HTML/CSS/JS。
 
@@ -254,9 +293,9 @@ agent2api/
 │  │  │  │  │  │                fingerprint（确定性设备指纹与 8h 上报）/ models /
 │  │  │  │  │  │                plan（8 键信封与 params 重写、session id 派生）
 │  │  │  │  │  ├─ antigravity/  Antigravity（Google，Gemini）：oauth（refresh token 续期 + 单飞）/
-│  │  │  │  │                   project（loadCodeAssist → onboardUser 发现）/ credentials /
-│  │  │  │  │                   endpoints（三环境基址与头集合）/ login /
-│  │  │  │  │                   models（fetchAvailableModels + 内置兜底 + 上游真名映射）/ adapter
+│  │  │  │  │  │                project（loadCodeAssist → onboardUser 发现）/ credentials /
+│  │  │  │  │  │                endpoints（三环境基址与头集合）/ login /
+│  │  │  │  │  │                models（fetchAvailableModels + 内置兜底 + 上游真名映射）/ adapter
 │  │  │  │  │  └─ officeace/    OfficeAce（华为云果办 / OfficeClaw）：oauth（PKCE + P-256 DPoP 自助登录）/
 │  │  │  │  │                   signer（SDK-HMAC 与 V11-HMAC 两套签名 + 向量夹具）/ credentials（网关 Basic 与控制面临时 AK/SK 两层）/
 │  │  │  │  │                   chat（无状态 OpenAI 兼容转发）/ models（远程目录 + 每模型倍率）/
@@ -309,9 +348,7 @@ agent2api/
 
 </details>
 
----
-
-## 开发与构建
+## 🔧 开发与构建
 
 ### 环境要求
 
@@ -330,9 +367,7 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
 
 打包产物为 `target/release/bundle/nsis/Agent2API_<版本>_x64-setup.exe`（当前约 3.0 MB；`src-tauri/.cargo/config.toml` 把 cargo 的 `target-dir` 指到了项目根的 `target/`）。
 
----
-
-## 使用声明
+## 📜 使用声明
 
 ### 仅供学习与交流
 
@@ -354,17 +389,13 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
 
 本项目按「现状」提供，作者不对其可用性、稳定性、安全性或对特定用途的适用性作任何承诺。上游接口随时可能变更，本项目可能随时失效而不再维护。完整条款见 [LICENSE](./LICENSE)。本项目中的接口形态、协议字段等信息来自对各官方客户端公开网络通信的观察与整理，相关商标与服务的权利归其各自所有者；若权利方认为本项目存在不当之处，请联系作者，将及时调整或删除。
 
----
-
-## 许可
+## 📄 许可
 
 本项目基于 [MIT License](./LICENSE)，可自由使用、修改与分发，须保留版权声明。
 
 需要留意的是：LICENSE 正文之后附有一份**使用声明**，其中第 3 条在 MIT 之上**追加了限制**（禁止商业用途、禁止二次分发牟利、禁止批量账号运营）。因此本项目**不是**纯粹的 MIT 项目——**MIT 条款与使用声明共同构成完整的授权与使用约定**，两者对同一行为给出不同结论时以更严格的一方为准。这也是 `Cargo.toml` 用 `license-file` 指向 LICENSE、而不声明 SPDX `"MIT"` 的原因。
 
----
-
-## Star History
+## ⭐ Star History
 
 <a href="https://star-history.com/#aimod-cc/agent2api&Date">
   <picture>
@@ -373,3 +404,11 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
   </picture>
 </a>
+
+<div align="center">
+
+**[下载最新版](https://github.com/aimod-cc/agent2api/releases/latest)** • **[问题反馈](https://github.com/aimod-cc/agent2api/issues)**
+
+如果这个项目对你有帮助，欢迎点一个 ⭐️ Star！
+
+</div>

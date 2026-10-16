@@ -60,9 +60,11 @@ test('disabled label comes from usable, not from the upstream enabled flag', asy
   assert.equal(label({ ...base, enabled: false, disabled: false, usable: false }),
     '香港节点（HTTP 127.0.0.1:19107 · 已禁用）')
 
-  // 旧壳没有 usable 字段时回落判 disabled（不看 enabled：镜像的 enabled 是上游的事）
+  // 缺 usable 时 enabled 仍是有效状态，两种本地禁用字段也都要识别。
   assert.equal(label({ ...base, enabled: false }),
-    '香港节点（HTTP 127.0.0.1:19107）')
+    '香港节点（HTTP 127.0.0.1:19107 · 已禁用）')
+  assert.equal(label({ ...base, enabled: true, localDisabled: true }),
+    '香港节点（HTTP 127.0.0.1:19107 · 已禁用）')
   assert.equal(label({ ...base, enabled: true, disabled: true }),
     '香港节点（HTTP 127.0.0.1:19107 · 已禁用）')
 })

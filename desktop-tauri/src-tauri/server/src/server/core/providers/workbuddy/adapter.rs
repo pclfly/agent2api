@@ -47,6 +47,7 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::{is_token_expiring, AuthService};
 use crate::server::core::models::global_catalog;
+use crate::server::core::upstream::request::{new_conversation_id, new_message_id, new_span_id};
 use crate::server::errors::GatewayError;
 
 use super::super::adapter::{
@@ -172,12 +173,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
             None => normalized,
         };
         let url = chat_completions_url(session, self.region);
-        let headers = chat_headers(
-            session,
-            self.region,
-            &crate::server::core::upstream::request::new_request_id(),
-            Some("text/event-stream"),
-        );
+        let headers = chat_headers(session, self.region, Some("text/event-stream"));
         Ok(ChatRequestPlan::chat(url, headers, with_system))
     }
 
@@ -631,10 +627,11 @@ impl ProviderAdapter for WorkBuddyAdapter {
 /// ── `planName` 为什么要分档改写 ──────────────────────────────
 /// 前端的套餐徽标按**上游原始名**分流（`isFreePlan` 只认 `^free$`、
 /// `planBadgeLabel` 只认 `^trial$` —— ZCode 现网就给的这两个词），而本家的
-/// `planName` 是商品码的中文名（「免费版每日额度」这类），照直传进去会让
+/// `planName` 是积分包的**上游名**（`PackageName`，如「CodeBuddy个人体验版」；
+/// 国际版给的是英文名「Bonus Pack」这类），照直传进去会让
 /// **免费账号徽标走付费样式**、而且名字长到一行放不下。所以这里按
 /// `editionType` 把两档免费/试用的名字归一成 ZCode 那两个词，其余（专业版 /
-/// 进阶版 / 旗舰版 / 青春版）保留商品名 —— 那几档正是用户要一眼看见的。
+/// 进阶版 / 旗舰版 / 青春版）保留上游包名 —— 那几档正是用户要一眼看见的。
 ///
 /// 企业账号（`kind: enterprise`）返回 `None`：那份读数没有套餐名，也没有
 /// 会到期的包，编一个套餐名出去比空着更容易被读错。
@@ -706,13 +703,32 @@ async fn default_session_token(store: &AccountStore, region: Region) -> Result<S
     }
 }
 
-// ─── 头集合与 URL（从 upstream/request.rs 搬入，语义逐字保持）──────
+// ─── 头集合与 URL ───────────────────────────────────────────
+// （最初从 upstream/request.rs 搬入；会话头族按 5.8.4 抓包升级，见 chat_headers）
 
-/// 客户端身份 + 鉴权 + 会话追踪头（对照 Node 的 buildHeaders）。
+/// 客户端身份 + 鉴权 + 会话追踪头。
 ///
-/// `request_id` 同时充当 X-Request-ID / X-Conversation-Request-ID /
-/// X-Conversation-ID / X-Session-ID —— Node 在没有 conversationId 时就是
-/// 这四者取同一个值（追踪一轮对话用）。
+/// ── 会话头族与身份对齐（2026-10 升级，渠道校验 11-128）────────
+/// 国际版上游上线了「渠道校验」：对话请求缺会话头族（`X-Conversation-ID` /
+/// `-Request-ID` / `-Message-ID` / `-Root-Request-ID`）时回 400 / code 11-128
+/// （`conversation id missing`，displayTips「这次调用没通过渠道校验，可能不是
+/// 官方客户端发出的」）。取值形态按 2026-10-16 对国际版客户端 5.8.4 的
+/// mitmproxy 抓包对齐（参考实现 workbuddy2api-hub #381，两仓同步升级）：
+///
+/// - 会话 / 消息 id **每次请求现生成**：会话 id 是带连字符的 UUID，请求 /
+///   消息 id 是 32 位无连字符 hex（UUIDv7 家族）。上游不拿这些 id 存对话
+///   历史（同一 id 连发两轮、第二轮只带 system+user，模型仍答不出上一轮），
+///   也不做跨请求关联，补的是「有」而不是「稳定」—— 见
+///   `upstream::request::{new_conversation_id, new_message_id}`。
+/// - `X-Conversation-Request-ID` 与 `X-Root-Request-ID` 是同一个值：官方在
+///   一次 user send 开始时生成、该轮所有请求复用。
+/// - 链路头族（`X-Trace-ID` / `traceparent` / `b3` / `X-B3-*`）照抓包补齐；
+///   主请求的 `X-B3-ParentSpanId` 需要真实父子调用关系，不伪造。
+/// - `X-Product` 是产品族 `SaaS`（实测值），不是产品名；`X-IDE-Name` 与
+///   `X-IDE-Type` 同为 `WorkBuddy`。版本号与 UA 走 `edition.chat_ide_version`
+///   / `edition.chat_ua`（国际版 5.8.4 实测值，计费 / 登录链路不受影响）。
+/// - **不再发 `X-Session-ID`**：官方对话请求不带它（只用于反馈上报），此前
+///   发的恒定派生值本身就是一处网关特征。
 ///
 /// ── 客户端身份按 `region` 取（拆家后的口径）────────────────────
 /// 改造前这里读的是 `session.edition`（账号上的字段）。拆家后**provider id
@@ -736,20 +752,64 @@ async fn default_session_token(store: &AccountStore, region: Region) -> Result<S
 pub(super) fn chat_headers(
     session: &Value,
     region: Region,
-    request_id: &str,
     accept: Option<&str>,
 ) -> Vec<(String, String)> {
     let edition = region.edition();
+    let conversation_id = new_conversation_id();
+    let message_id = new_message_id();
+    let conversation_request_id = new_message_id();
+    let trace_id = new_message_id();
+    let span_id = new_span_id();
+    // Origin / Referer 跟着会话生效端点走（staging / 自建反代账号的落点），
+    // 与 `chat_completions_url` 共用同一份解析规则。
+    let origin = session_endpoint(session, region);
+    let authority = origin
+        .split_once("://")
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_else(|| origin.clone());
+    let accept_language = match region {
+        Region::Intl => "en-US",
+        Region::Cn => "zh-CN",
+    };
     let product = identity::product_of(session);
-    let mut headers = identity::identity_headers(product, edition, request_id);
+    let mut headers = identity::identity_headers(product, edition);
+    headers.extend([
+        ("X-Agent-Purpose".to_string(), "conversation".to_string()),
+        ("X-Agent-Type".to_string(), "main".to_string()),
+        ("X-Private-Data".to_string(), "true".to_string()),
+        // 会话头族（渠道校验的判据，见函数头）
+        ("X-Conversation-ID".to_string(), conversation_id),
+        (
+            "X-Conversation-Request-ID".to_string(),
+            conversation_request_id.clone(),
+        ),
+        ("X-Root-Request-ID".to_string(), conversation_request_id),
+        ("X-Conversation-Message-ID".to_string(), message_id.clone()),
+        ("X-Request-ID".to_string(), message_id),
+        // 链路头族（5.8.4 对话请求随带的观测头）
+        ("X-Trace-ID".to_string(), trace_id.clone()),
+        ("traceparent".to_string(), format!("00-{trace_id}-{span_id}-01")),
+        ("b3".to_string(), format!("{trace_id}-{span_id}-1")),
+        ("X-B3-TraceId".to_string(), trace_id),
+        ("X-B3-SpanId".to_string(), span_id.clone()),
+        ("X-B3-Sampled".to_string(), "1".to_string()),
+        (
+            "Accept-Language".to_string(),
+            accept_language.to_string(),
+        ),
+        ("X-Requested-With".to_string(), "XMLHttpRequest".to_string()),
+        ("X-CodeBuddy-Request".to_string(), "1".to_string()),
+        ("Origin".to_string(), origin.clone()),
+        ("Referer".to_string(), format!("{origin}/")),
+    ]);
     for (key, value) in AuthService::build_auth_headers(session) {
-        if headers
-            .iter()
-            .any(|(existing, _)| existing.eq_ignore_ascii_case(&key))
-        {
-            continue;
+        if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case(&key)) {
+            headers.push((key, value));
         }
-        headers.push((key, value));
+    }
+    // 替代身份的 X-Domain 优先于登录态；默认身份保留登录态域，缺失才按生效端点补。
+    if !headers.iter().any(|(key, _)| key.eq_ignore_ascii_case("X-Domain")) {
+        headers.push(("X-Domain".to_string(), authority));
     }
     if let Some(accept) = accept {
         headers.push(("Accept".to_string(), accept.to_string()));
@@ -775,22 +835,37 @@ pub(super) fn chat_headers(
 /// 活跃保活）复用同一个 URL 构造 —— WB 默认身份走的是 else 回落链，与拆家
 /// 前的 URL 逻辑逐字相同，因此保活拿到的 URL 与真对话一致。
 pub(super) fn chat_completions_url(session: &Value, region: Region) -> String {
-    let edition = region.edition();
-    let product = identity::product_of(session);
-    let endpoint = if let Some(overridden) = identity::identity_endpoint(edition, product) {
-        overridden.to_string()
-    } else {
-        let fallback = region
-            .env_endpoint_override()
-            .unwrap_or_else(|| region.default_endpoint().to_string());
-        session
-            .get("endpoint")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(crate::server::core::endpoints::normalize_endpoint)
-            .unwrap_or_else(|| crate::server::core::endpoints::normalize_endpoint(&fallback))
-    };
-    format!("{endpoint}/v2/chat/completions")
+    format!("{}/v2/chat/completions", session_endpoint(session, region))
+}
+
+/// 网页通道 agent 会话 URL：`{endpoint}/console/as/conversations/`。
+///
+/// 国际版上游把「当日活跃」（每日 30 积分的判定）记在网页通道的会话上
+/// （issue #277：桌面端 `chat/completions` 调用成功也不计）。网页应用与桌面
+/// 端同源一个站点，端点解析与 `chat_completions_url` 共用同一份规则 ——
+/// 国际版默认端点本来就是 `https://www.workbuddy.ai`（网页应用的域名）。
+pub(super) fn web_conversations_url(session: &Value, region: Region) -> String {
+    format!(
+        "{}/console/as/conversations/",
+        session_endpoint(session, region)
+    )
+}
+
+/// 会话生效端点：国内 VSC 身份覆盖 → 账号 endpoint → 本地区环境覆盖 → 地区默认。
+/// 账号与环境覆盖用于 staging / 自建反向代理；地区始终由适配器而非 session.edition 决定。
+fn session_endpoint(session: &Value, region: Region) -> String {
+    if let Some(endpoint) = identity::identity_endpoint(region.edition(), identity::product_of(session)) {
+        return endpoint.to_string();
+    }
+    let fallback = region
+        .env_endpoint_override()
+        .unwrap_or_else(|| region.default_endpoint().to_string());
+    session
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(crate::server::core::endpoints::normalize_endpoint)
+        .unwrap_or_else(|| crate::server::core::endpoints::normalize_endpoint(&fallback))
 }
 
 /// 首条消息不是 system 时，在头部补一条系统消息（不改原数组，返回新 body）。
@@ -820,6 +895,125 @@ pub fn ensure_leading_system_message(body: &Value) -> Option<Value> {
     with_system.extend(messages.iter().cloned());
     object.insert("messages".to_string(), Value::Array(with_system));
     Some(next)
+}
+
+#[cfg(test)]
+mod merge_regression_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn header<'a>(headers: &'a [(String, String)], key: &str) -> &'a str {
+        headers.iter().find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str()).unwrap_or("")
+    }
+
+    #[test]
+    fn both_regions_and_all_products_keep_identity_auth_and_trace_headers() {
+        for region in Region::ALL {
+            for product in ["wb", "vsc", "cli", "unknown"] {
+                let session = json!({
+                    "product": product, "edition": if region == Region::Cn { "intl" } else { "cn" },
+                    "endpoint": "https://account.example.test/",
+                    "auth": {"accessToken": "offline-token", "domain": "enterprise.example.test"},
+                    "account": {"uid": "offline-user", "enterpriseId": "offline-enterprise", "departmentFullName": "test"}
+                });
+                let headers = chat_headers(&session, region, Some("text/event-stream"));
+                let names: std::collections::HashSet<_> = headers.iter().map(|(key, _)| key.to_ascii_lowercase()).collect();
+                assert_eq!(names.len(), headers.len(), "duplicate headers: {region:?}/{product}");
+                let identity = identity::resolve_product(Some(product));
+                let expected_ide = match identity { identity::Product::Wb => region.edition().ua_platform, identity::Product::Vsc => "VSCode", identity::Product::Cli => "CLI" };
+                assert_eq!(header(&headers, "X-IDE-Type"), expected_ide);
+                assert_eq!(header(&headers, "X-IDE-Name"), expected_ide);
+                if identity == identity::Product::Wb {
+                    assert_eq!(header(&headers, "User-Agent"), region.edition().chat_ua);
+                    assert_eq!(header(&headers, "X-IDE-Version"), region.edition().chat_ide_version);
+                }
+                assert_eq!(header(&headers, "X-Product"), "SaaS");
+                assert_eq!(header(&headers, "X-Agent-Intent"), "craft");
+                assert_eq!(header(&headers, "Authorization"), "Bearer offline-token");
+                assert_eq!(header(&headers, "X-User-Id"), "offline-user");
+                assert_eq!(header(&headers, "X-Enterprise-Id"), "offline-enterprise");
+                assert_eq!(header(&headers, "X-Tenant-Id"), "offline-enterprise");
+                assert_eq!(header(&headers, "X-Department-Info"), "test");
+                assert_eq!(header(&headers, "X-Domain"), if identity == identity::Product::Wb { "enterprise.example.test" } else { identity::identity_domain(region.edition(), identity) });
+                assert_eq!(header(&headers, "Accept-Language"), if region == Region::Cn { "zh-CN" } else { "en-US" });
+                assert_eq!(header(&headers, "Accept"), "text/event-stream");
+                let endpoint = session_endpoint(&session, region);
+                assert_eq!(header(&headers, "Origin"), endpoint);
+                assert_eq!(header(&headers, "Referer"), format!("{endpoint}/"));
+                assert_eq!(chat_completions_url(&session, region), format!("{endpoint}/v2/chat/completions"));
+                assert_eq!(web_conversations_url(&session, region), format!("{endpoint}/console/as/conversations/"));
+                assert_eq!(header(&headers, "X-Conversation-ID").len(), 36);
+                for key in ["X-Conversation-Request-ID", "X-Conversation-Message-ID", "X-Trace-ID"] {
+                    let value = header(&headers, key);
+                    assert_eq!(value.len(), 32);
+                    assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                }
+                assert_eq!(header(&headers, "X-Conversation-Request-ID"), header(&headers, "X-Root-Request-ID"));
+                assert_eq!(header(&headers, "X-Conversation-Message-ID"), header(&headers, "X-Request-ID"));
+                let trace = header(&headers, "X-Trace-ID");
+                let span = header(&headers, "X-B3-SpanId");
+                assert_eq!(span.len(), 16);
+                assert_eq!(header(&headers, "X-B3-TraceId"), trace);
+                assert_eq!(header(&headers, "traceparent"), format!("00-{trace}-{span}-01"));
+                assert_eq!(header(&headers, "b3"), format!("{trace}-{span}-1"));
+                assert_eq!(header(&headers, "X-B3-Sampled"), "1");
+                assert!(!names.contains("x-session-id"));
+                assert!(!names.contains("x-b3-parentspanid"));
+                let next = chat_headers(&session, region, None);
+                assert_ne!(header(&headers, "X-Conversation-ID"), header(&next, "X-Conversation-ID"));
+                assert_eq!(header(&next, "Accept"), "");
+            }
+        }
+    }
+
+    // 环境只传给测试子进程，不修改共享进程环境，避免并行测试读到假凭证。
+    #[tokio::test]
+    async fn endpoint_precedence_and_environment_bypass_are_offline() {
+        const MARKER: &str = "AGENT2API_WORKBUDDY_MERGE_TEST";
+        let mode = std::env::var(MARKER).unwrap_or_default();
+        if mode.is_empty() {
+            for mode in ["default", "split", "legacy"] {
+                let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"));
+                child.arg("endpoint_precedence_and_environment_bypass_are_offline").arg("--nocapture");
+                for key in ["WORKBUDDY_TOKEN", "WORKBUDDY_INTL_TOKEN", "WORKBUDDY_ENDPOINT", "WORKBUDDY_INTL_ENDPOINT", "WORKBUDDY_EDITION"] { child.env_remove(key); }
+                child.env(MARKER, mode);
+                if mode != "default" {
+                    child.env("WORKBUDDY_TOKEN", " offline-cn ").env("WORKBUDDY_ENDPOINT", " https://env-cn.example.test/ ");
+                    if mode == "split" {
+                        child.env("WORKBUDDY_INTL_TOKEN", " offline-intl ").env("WORKBUDDY_INTL_ENDPOINT", " https://env-intl.example.test/ ");
+                    } else {
+                        child.env("WORKBUDDY_EDITION", "intl");
+                    }
+                }
+                let result = child.output().expect("run isolated offline regression");
+                assert!(result.status.success(), "{mode}: {}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            }
+            return;
+        }
+        for region in Region::ALL {
+            let expected = match (mode.as_str(), region) {
+                ("default", _) => region.default_endpoint(),
+                ("split", Region::Intl) => "https://env-intl.example.test",
+                _ => "https://env-cn.example.test",
+            };
+            assert_eq!(session_endpoint(&json!({}), region), expected);
+            assert_eq!(session_endpoint(&json!({"product": "cli", "endpoint": "https://account.example.test/"}), region), "https://account.example.test");
+            let headers = chat_headers(&json!({}), region, None);
+            assert_eq!(header(&headers, "Origin"), expected);
+            assert_eq!(header(&headers, "X-Domain"), expected.strip_prefix("https://").unwrap());
+            let adapter = WorkBuddyAdapter::new(region);
+            assert!(adapter.allows_anonymous_default_session());
+            assert_eq!(adapter.env_credentials_present(), mode != "default");
+            if mode != "default" {
+                // 无数据库仍可取到环境 token，证明旁路不访问账号库或刷新网络。
+                let token = adapter.ensure_access_token(&AccountStore::with_db(None), "").await.expect("environment bypass");
+                assert_eq!(token, if mode == "split" && region == Region::Intl { "offline-intl" } else { "offline-cn" });
+            }
+        }
+        assert_eq!(session_endpoint(&json!({"product": "vsc", "endpoint": "https://account.example.test"}), Region::Cn), "https://www.workbuddy.cn");
+        assert_eq!(session_endpoint(&json!({"product": "vsc", "endpoint": "https://account.example.test"}), Region::Intl), "https://account.example.test");
+    }
 }
 
 /// JS `String(x)`（role 这类字段的容错文本化）

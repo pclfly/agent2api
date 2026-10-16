@@ -172,6 +172,11 @@ pub(crate) async fn forward(
     }
     // 翻译协议在这里分出去（凭证与基址已就绪；chat 路径继续往下走）
     let quirks = ProviderQuirks::from_provider(&provider);
+    // 存量记录里可能还写着 OpenCode 免费档的**旧端点**（`/zen/v1`，2026-10 起
+    // 打它一律 403）—— 提供商记录与账号覆盖项两层都可能是旧值，所以在**解析出
+    // 最终地址之后**再过一次读侧迁移（提供商层已在 `custom_providers::item_of`
+    // 过了一遍，账号覆盖项只在这里能碰到）。
+    let base_url = quirks.outbound_base_url(&base_url);
     if let Some(kind) = kind {
         return forward_translated(
             kind,
@@ -216,9 +221,6 @@ pub(crate) async fn forward(
         cross.as_ref().map(|(next, _)| next).unwrap_or(body),
     );
     let body: &Value = &stripped;
-    // 免费档基址的读取侧迁移（`/zen/v1` → `/inference/v1`，见
-    // `ProviderQuirks::outbound_base_url`）：只对开了伪装、且基址逐字等于旧值的记录生效
-    let base_url = quirks.outbound_base_url(&base_url);
     let url = format!(
         "{}/chat/completions{}",
         base_url.trim_end_matches('/'),
@@ -237,14 +239,15 @@ pub(crate) async fn forward(
     // 放在 `rewrite_body` 之后、序列化之前 —— 会话种子取自**改写后**的体，
     // 与最终发出去的字节同源（模型名换了不影响 messages，两种取法等价，
     // 但同源更不容易在将来改坏）
-    quirks.apply_emulation_to_body(&mut outbound);
+    quirks.apply_emulation_to_body(&mut outbound, &base_url);
     let payload = serde_json::to_string(&outbound)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
     // ── 出站头（三段拼装，顺序不可换）────────────────────────────
     //   ① 默认头：**只有 apiKey 非空才带凭证头** —— 无需鉴权的上游
     //      （`noAuth` 账号）拿到一个空 `Bearer ` 会当成凭证错误，
     //      与「这家不要凭证」的语义正好相反；
-    //   ② 伪装头（OpenCode）：补齐官方客户端的头与匿名凭证 `public`；
+    //   ② 伪装头（OpenCode 两个面，按端点分派）：免费档面补齐官方客户端的头
+    //      与匿名凭证 `public`；Go 面只补会话头与产品 UA（见方法说明）；
     //   ③ 记录上的静态额外头（`quirks.apply_to`）：用户手写的最优先。
     let api_key = credential.api_key.trim();
     let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
@@ -254,7 +257,7 @@ pub(crate) async fn forward(
             format!("Bearer {api_key}"),
         ));
     }
-    quirks.apply_emulation_headers(&mut headers, api_key, &outbound);
+    quirks.apply_emulation_headers(&mut headers, api_key, &outbound, &base_url);
     quirks.apply_to(&mut headers);
 
     logging::verbose(
@@ -433,16 +436,29 @@ impl ProviderQuirks {
     ///
     /// **调用顺序**：默认头 → 本函数 → `apply_to`（静态额外头）。放在 `apply_to`
     /// 之前是刻意的：手写在记录上的头优先级最高，伪装不该盖掉用户的显式选择。
+    ///
+    /// ── 两个面（按 `base_url` 分派，判据见 `custom_providers::is_opencode_go_endpoint`）──
+    ///   - **Go 面**（`/zen/go/v1`）：只补会话头与产品 UA（见
+    ///     [`emulation::apply_go_headers`]）。它**不套伪装开关** —— 那条要求是
+    ///     端点自身公开的路由要求，不是伪装；用户就算把开关打开（或关掉），
+    ///     Go 面该发的会话头照发、该走自己的 Key 照走；
+    ///   - **免费档面**（其余端点）：四会话头 + 匿名/账号凭证的完整伪装，
+    ///     仍然只在开关打开时生效。
     fn apply_emulation_headers(
         &self,
         headers: &mut Vec<(String, String)>,
         api_key: &str,
         body: &Value,
+        base_url: &str,
     ) {
+        let session = emulation::session_id(&emulation::conversation_seed(body));
+        if custom_providers::is_opencode_go_endpoint(base_url) {
+            emulation::apply_go_headers(headers, &session);
+            return;
+        }
         if !self.emulate_opencode {
             return;
         }
-        let session = emulation::session_id(&emulation::conversation_seed(body));
         emulation::apply_headers(headers, api_key, &session);
     }
 
@@ -455,18 +471,16 @@ impl ProviderQuirks {
     /// [`emulation::preferred_base_url`]），用户手改过的基址一律不动。
     /// 上游若把免费档再挪一次，改一行即可。
     fn outbound_base_url(&self, base_url: &str) -> String {
-        if !self.emulate_opencode {
-            return base_url.to_string();
-        }
-        emulation::preferred_base_url(base_url)
-            .map(str::to_string)
-            .unwrap_or_else(|| base_url.to_string())
+        custom_providers::migrate_base_url(base_url, self.emulate_opencode)
     }
 
     /// 请求体补成「智能体形态」（`stream: true` + 官方形状的 `read` / `shell`）。
     /// 未开启伪装时**一个字节都不动** —— 透传是自定义家的默认语义。
-    fn apply_emulation_to_body(&self, body: &mut Value) {
-        if !self.emulate_opencode {
+    ///
+    /// **Go 面同样一个字节都不动**：它拒绝被塞桩工具的请求（社区实测
+    /// #44300/#44382），那条桩工具逻辑只属于免费档面。
+    fn apply_emulation_to_body(&self, body: &mut Value, base_url: &str) {
+        if !self.emulate_opencode || custom_providers::is_opencode_go_endpoint(base_url) {
             return;
         }
         let _ = emulation::ensure_agent_shape(body);
@@ -506,10 +520,8 @@ async fn forward_translated(
         .to_string();
     let (mut outbound_chat, rewrite) = rewrite_body(body, provider_id, &requested);
     // 客户端形态伪装：与 chat 分支同一时机（改写后、翻译前）—— 桩工具要由
-    // 转换器一起翻成上游协议的形态（anthropic 的 tools 数组）
-    quirks.apply_emulation_to_body(&mut outbound_chat);
-    // 免费档基址的读取侧迁移：与 chat 分支同一口径（见 `outbound_base_url`）
-    let base_url = &quirks.outbound_base_url(base_url);
+    // 转换器一起翻成上游协议的形态（anthropic 的 tools 数组）；Go 面不改请求体
+    quirks.apply_emulation_to_body(&mut outbound_chat, base_url);
     // 发给上游的真名 = 改写后的 model 字段（rewrite_body 的产物；请求没带
     // model 时是空串，与 chat 分支「没有回写答案」的口径一致）
     let wire_model = outbound_chat
@@ -543,7 +555,7 @@ async fn forward_translated(
             if has_key {
                 headers.push(("Authorization".to_string(), format!("Bearer {api_key}")));
             }
-            quirks.apply_emulation_headers(&mut headers, api_key, &outbound_chat);
+            quirks.apply_emulation_headers(&mut headers, api_key, &outbound_chat, base_url);
             quirks.apply_to(&mut headers);
             (url, headers, payload)
         }
@@ -591,7 +603,7 @@ async fn forward_translated(
             if has_key {
                 headers.push(("x-api-key".to_string(), api_key.to_string()));
             }
-            quirks.apply_emulation_headers(&mut headers, api_key, &outbound_chat);
+            quirks.apply_emulation_headers(&mut headers, api_key, &outbound_chat, base_url);
             quirks.apply_to(&mut headers);
             (url, headers, payload)
         }
@@ -1103,6 +1115,51 @@ mod opencode_error_tests {
     }
 
     #[test]
+    fn go_endpoint_keeps_body_and_credentials_with_emulation_on_or_off() {
+        for emulation in ["", "opencode"] {
+            let quirks = ProviderQuirks::from_provider(&serde_json::json!({"clientEmulation": emulation}));
+            for base_url in [custom_providers::OPENCODE_GO_BASE_URL, "HTTPS://OPENCODE.AI/ZEN/GO/V1/"] {
+                let original = serde_json::json!({"messages": [{"role": "user", "content": "offline"}], "stream": false});
+                let mut body = original.clone();
+                quirks.apply_emulation_to_body(&mut body, base_url);
+                assert_eq!(body, original, "Go must not receive free-tier stub tools");
+                let mut headers = vec![("Authorization".to_string(), "Bearer offline-paid-key".to_string())];
+                quirks.apply_emulation_headers(&mut headers, "offline-paid-key", &body, base_url);
+                assert_eq!(headers.iter().find(|(key, _)| key == "Authorization").unwrap().1, "Bearer offline-paid-key");
+                assert!(headers.iter().any(|(key, value)| key == "User-Agent" && value.starts_with("agent2api/")));
+                let expected_session = emulation::session_id(&emulation::conversation_seed(&body));
+                assert!(headers.iter().any(|(key, value)| key == emulation::GO_SESSION_HEADER && value == &expected_session));
+                assert!(!headers.iter().any(|(key, _)| key == "x-opencode-client" || key == "x-opencode-session-id"));
+                let mut no_key = Vec::new();
+                quirks.apply_emulation_headers(&mut no_key, "", &body, base_url);
+                assert!(!no_key.iter().any(|(key, _)| key.eq_ignore_ascii_case("Authorization")));
+            }
+        }
+    }
+
+    #[test]
+    fn free_tier_shape_is_opt_in_and_go_matching_is_exact() {
+        let original = serde_json::json!({"messages": [{"role": "user", "content": "offline"}]});
+        for base_url in [custom_providers::OPENCODE_BASE_URL, "https://proxy.example.test/zen/go/v1"] {
+            let plain = ProviderQuirks::from_provider(&serde_json::json!({}));
+            let mut body = original.clone();
+            plain.apply_emulation_to_body(&mut body, base_url);
+            let mut headers = Vec::new();
+            plain.apply_emulation_headers(&mut headers, "", &body, base_url);
+            assert_eq!(body, original);
+            assert!(headers.is_empty());
+        }
+        let enabled = ProviderQuirks::from_provider(&serde_json::json!({"clientEmulation": "opencode"}));
+        let mut body = original;
+        enabled.apply_emulation_to_body(&mut body, custom_providers::OPENCODE_BASE_URL);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        let mut headers = Vec::new();
+        enabled.apply_emulation_headers(&mut headers, "", &body, custom_providers::OPENCODE_BASE_URL);
+        assert!(headers.iter().any(|(key, value)| key == "Authorization" && value == "Bearer public"));
+    }
+
+    #[test]
     fn opencode_free_tier_restriction_is_not_reported_as_bad_credentials() {
         for raw in [
             FREE_TIER_RESTRICTION.to_string(),
@@ -1326,6 +1383,24 @@ fn describe_proxy(proxy: Option<&ResolvedProxy>) -> String {
         Some(proxy) => proxy.host.clone(),
         None => "直连".to_string(),
     }
+}
+
+/// 这条**账号公开形态**是不是「轮询出网」档（`proxy.config.source == "rotate"`）。
+///
+/// 编排层（`attempt_custom`）用它决定「429 时要不要原地换出口」：轮询档的 429
+/// 是**按 IP** 判的（这个出口的免费额度用完，见 `core::proxy_rotate` 的模块头），
+/// 换一个出口重发往往就过了；别的档没有这层语义，429 就是账号/模型的限额。
+///
+/// 判据读账号公开形态里的 `proxy.config`（路由层拿到的就是它，形状见
+/// `core::proxies` 的模块头）而不是转发用的 `ResolvedProxy`：解析结果里
+/// `source` 是候选条目自己的来源（pool / clash / custom），轮询取用后已经看不出
+/// 「这是轮询档」了。
+pub fn is_rotate_account(account: Option<&Value>) -> bool {
+    account
+        .and_then(|item| item.get("proxy"))
+        .and_then(|proxy| proxy.get("config"))
+        .map(crate::server::core::proxies::is_rotate_config)
+        .unwrap_or(false)
 }
 
 /// 这一轮的**限额冷却键**（该家实际收到的上游真名；编排层 `attempt_custom` 用）。

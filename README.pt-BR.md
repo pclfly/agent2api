@@ -1,12 +1,42 @@
-# Agent2API · Gateway local multi-provedor
+<div align="center">
+
+# Agent2API
+
+**Transforme o estado de login de vários clientes de desktop de IA em um gateway de API compatível com OpenAI local**
 
 [简体中文](./README.md) | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | [한국어](./README.ko.md) | **Português (BR)**
 
-Empacota o estado de login de vários clientes de desktop de IA em um **gateway de API compatível com OpenAI** local, expondo um único `base_url` e trazendo junto gerenciamento de contas multi-provedor, gerenciamento de modelos (ativar / excluir / mapear), mascaramento de impressão digital de saída, proxy de saída e relatórios de requisições — além de um aplicativo desktop Tauri pronto para usar. Qualquer cliente OpenAI que aceite um `base_url` personalizado pode chamar a cota de modelos desses provedores por `http://127.0.0.1:3065/v1` — sem API key e sem alterar o código do cliente.
+[![license](https://img.shields.io/badge/license-MIT%20%2B%20Aviso-green)](./LICENSE)
+[![release](https://img.shields.io/github/v/release/aimod-cc/agent2api?include_prereleases)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
+[![stars](https://img.shields.io/github/stars/aimod-cc/agent2api?style=flat&color=yellow)](https://github.com/aimod-cc/agent2api/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/aimod-cc/agent2api/releases/latest)
+
+[✨ Principais recursos](#-principais-recursos) • [🤝 Provedores compatíveis](#-provedores-compatíveis) • [🚀 Início rápido](#-início-rápido) • [🐳 Implantação com Docker](#-implantação-com-docker) • [📸 Capturas de tela](#-capturas-de-tela) • [🔧 Desenvolvimento e build](#-desenvolvimento-e-build) • [📜 Aviso de uso](#-aviso-de-uso)
+
+</div>
+
+---
+
+Expõe um único `base_url` com gerenciamento de contas multi-provedor, gerenciamento de modelos, proxy de saída e relatórios de requisições, além de um aplicativo desktop Tauri pronto para usar. Qualquer cliente OpenAI que aceite um `base_url` personalizado pode chamar a cota de modelos desses provedores por `http://127.0.0.1:3065/v1` — **sem API key do upstream, sem alterar o cliente**.
+
+## ✨ Principais recursos
+
+- 🔌 **Endpoints compatíveis com OpenAI** — um único gateway expondo `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (incl. `count_tokens`) e `/v1/models`; qualquer cliente conecta sem ajustes
+- 🏪 **17 provedores integrados** — WorkBuddy, 小浣熊, CatPaw, AutoClaw, Qoder, Cline, Accio, ZCode, CodeArts, Trae, Loomy, KukuAI, MonkeyCode, Command Code, Antigravity, OfficeAce (alguns nas edições China / global), além de provedores personalizados em passthrough (Chat / Responses / Anthropic)
+- 🔁 **Credenciais com manutenção totalmente automática** — renovação automática de token com deduplicação single-flight, renovação em lote de credenciais prestes a vencer, catálogos de modelos atualizados remotamente com fallback estático
+- 🪂 **Encaminhamento estável** — fila global de contas por prioridade, cooldown de limite por modelo, fallback automático em 429, falhas determinísticas são puladas rápido em vez de esperar à toa
+- 🛡️ **Segurança e mascaramento** — proxies de saída, mascaramento de impressão digital de saída, várias chaves de gateway, fail-closed, verificação humana no login
+- 📊 **Relatórios de requisições** — requisições / taxa de sucesso / tokens, tendências de 24 horas de taxa de acerto de cache e consumo, top modelos e contas, mapa de calor de atividade de 365 dias
+- ⏰ **Tarefas agendadas** — check-in automático, manutenção de credenciais, atualização do catálogo de modelos e mais; ativação / intervalo / último resultado gerenciados em uma página
+- 💰 **Saldos à vista** — saldo / uso exibido na linha de cada conta, consultas concorrentes entre contas com snapshots agendados
+- 🖥️ **Duas formas de implantação** — aplicativo desktop Tauri (residente na bandeja, sem runtime de Node) / Docker headless (painel + gateway na mesma porta); interface do painel em seis idiomas
+
+## 🤝 Provedores compatíveis
 
 Panorama dos recursos de proxy reverso por plataforma (✓ suportado · ✗ não suportado · — não se aplica):
 
-| Plataforma | Requisições LLM | Renovação automática do token | Lista de modelos (atualização remota) | Consulta de saldo | Check-in | Resgates |
+| Plataforma | Requisições LLM | Renovação automática do token | Lista de modelos | Consulta de saldo | Check-in | Resgates |
 | --- | :--: | :--: | :--: | :--: | :--: | :--: |
 | WorkBuddy (China) | ✓ | ✓ | ✓ remota + fallback estático | ✓ | ✓ check-in diário | — |
 | WorkBuddy (global) | ✓ | ✓ | ✓ remota + fallback estático | ✓ | ✗ sem evento de check-in | — |
@@ -27,29 +57,15 @@ Panorama dos recursos de proxy reverso por plataforma (✓ suportado · ✗ não
 | OfficeAce (Huawei Cloud, OfficeClaw) | ✓ | ✓ renovação automática do plano de controle | ✓ somente remota | ✓ saldo de pontos | ✓ bônus diário (check-in + presente de boas-vindas) | — |
 | Provedores personalizados | ✓ passthrough de chat / Responses / Anthropic | — | ✓ registro manual + busca no servidor | — | — | — |
 
-Os três pontos de entrada de conversa (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, além de `/v1/messages/count_tokens`) e `/v1/models` funcionam igual para todas as plataformas; as diferenças acima dizem respeito apenas ao que cada upstream consegue fazer. Mapeamento de modelos, fila global de prioridade, fallback em 429, proxy de saída, mascaramento de impressão digital e relatórios de requisições valem para todas as plataformas.
+`/v1/chat/completions`, `/v1/responses`, `/v1/messages` (incl. `count_tokens`) e `/v1/models` funcionam igual para todas as plataformas; mapeamento de modelos, fila global de prioridade, fallback em 429, proxy de saída, mascaramento de impressão digital de saída e relatórios de requisições valem para todas as plataformas.
 
-> **Este projeto é apenas para aprendizado e troca de conhecimento.** Ele reutiliza o estado de login das suas contas na forma de um cliente não oficial, o que pode violar os termos dos serviços upstream; os riscos (inclusive banimento da conta) são seus. Uso comercial e contorno de cobrança são proibidos. Veja o [Aviso de uso](#aviso-de-uso) e a [LICENSE](./LICENSE).
+> **Este projeto é apenas para aprendizado e troca de conhecimento.** Ele reutiliza o estado de login das suas contas na forma de um cliente não oficial, o que pode violar os termos dos serviços upstream; os riscos (inclusive banimento da conta) são seus. Uso comercial e contorno de cobrança são proibidos. Veja o [Aviso de uso](#-aviso-de-uso) e a [LICENSE](./LICENSE).
 >
-> Este é um projeto pessoal de ferramenta de proxy local, sem vínculo com qualquer fornecedor upstream ou seus produtos oficiais (a lista está no [Aviso de uso](#aviso-de-uso)); os formatos de interface vêm da observação do tráfego dos clientes, e o upstream pode mudar a qualquer momento.
+> Este é um projeto pessoal de ferramenta de proxy local, sem vínculo com qualquer fornecedor upstream ou seus produtos oficiais (a lista está no [Aviso de uso](#-aviso-de-uso)); os formatos de interface vêm da observação do tráfego dos clientes, e o upstream pode mudar a qualquer momento.
 
----
+## 🚀 Início rápido
 
-## Índice
-
-- [Início rápido](#início-rápido)
-- [Implantação com Docker](#implantação-com-docker)
-- [Capturas de tela](#capturas-de-tela)
-- [Estrutura do projeto](#estrutura-do-projeto)
-- [Desenvolvimento e build](#desenvolvimento-e-build)
-- [Aviso de uso](#aviso-de-uso)
-- [Licença](#licença)
-
----
-
-## Início rápido
-
-Baixe o instalador na página de Releases (NSIS, chinês simplificado, instala por padrão em `C:\Program Files\Agent2API` e exige aprovação de administrador durante a instalação) e basta iniciá-lo — **não é necessário instalar Node nem qualquer outro runtime**.
+Baixe o instalador na página de [Releases](https://github.com/aimod-cc/agent2api/releases/latest) (NSIS, chinês simplificado, instala por padrão em `C:\Program Files\Agent2API` e exige aprovação de administrador durante a instalação) e basta iniciá-lo — **não é necessário instalar Node nem qualquer outro runtime**.
 
 1. Na primeira execução, o gateway local (porta 3065) sobe dentro do processo do aplicativo e a janela principal abre. Se um diretório ou arquivo de dados de uma versão antiga for encontrado, um diálogo orienta a migração — basta seguir as instruções.
 2. Clique em "Adicionar conta" na página de Contas, escolha um provedor e siga o diálogo: entre ou preencha as credenciais (login pela web / código por SMS / colar credenciais / importar o estado de login desta máquina).
@@ -89,9 +105,7 @@ print(resp.choices[0].message.content)
 
 Por padrão o gateway escuta apenas `127.0.0.1`. Ao ativar "Configurações → Geral → Acesso pela rede local" ele passa a escutar todos os adaptadores e os dispositivos da rede só precisam apontar o endereço da API para o IP desta máquina (a interface mostra o endereço completo). Por segurança, é obrigatório registrar um administrador do painel antes de ativar: a API de gerenciamento passa a exigir sessão de administrador ou uma Gateway Key e, sem chave ativa, a API de encaminhamento também recusa (o fluxo cria uma chave "padrão" automaticamente). O painel web pode ser exposto à rede local opcionalmente (fechado por padrão). As mudanças valem após reiniciar.
 
----
-
-## Implantação com Docker
+## 🐳 Implantação com Docker
 
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
@@ -99,7 +113,7 @@ docker run -d --name agent2api --restart unless-stopped \
   aimodcc/agent2api:latest
 ```
 
-Abra `http://<host>:3065` no navegador: a primeira visita guia o **cadastro do administrador** (usado nos logins seguintes); depois de entrar, crie uma API key na página "Gateway Keys" para os clientes — `http://<host>:3065/v1` é o endpoint compatível com OpenAI; sem nenhuma chave ele recusa o encaminhamento e, após criar a primeira, volta a funcionar sozinho. Todo o estado (banco SQLite / configuração / logs) fica em um único volume `./data`.
+Abra `http://<host>:3065` no navegador: a primeira visita guia o **cadastro do administrador**; depois de entrar, crie uma API key na página "Gateway Keys" para os clientes — `http://<host>:3065/v1` é o endpoint compatível com OpenAI (sem nenhuma chave ele recusa o encaminhamento). Todo o estado (banco SQLite / configuração / logs) fica em um único volume `./data`.
 
 Para quem usa compose (há imagens amd64 e arm64):
 
@@ -115,7 +129,7 @@ services:
       - ./data:/data
 ```
 
-Variáveis de ambiente (todas opcionais — nada precisa ser predefinido):
+Variáveis de ambiente (todas opcionais):
 
 | Variável | Descrição |
 | --- | --- |
@@ -124,14 +138,41 @@ Variáveis de ambiente (todas opcionais — nada precisa ser predefinido):
 | `AGENT2API_HOST` / `AGENT2API_PROXY_PORT` | Endereço de escuta (padrão `0.0.0.0`) / porta (padrão `3065`) |
 | `AGENT2API_ALLOW_NO_KEY` | `1` desativa o fail-closed (serve `/v1` mesmo sem chave configurada — só para redes internas) |
 | `AGENT2API_CAPTCHA_ENABLED` | Widget de verificação humana na tela de login: `1` ativado (padrão), `0` desativado |
+| `AGENT2API_SELF_UPDATE` | Ponto de atualização dentro do contêiner: `1` ativado por padrão (o painel oferece "Baixar e atualizar"); `0` desativa e deixa apenas a atualização manual |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Avançado: aponte "verificar atualizações / baixar atualizações" para a sua própria fonte. O primeiro troca o repositório (por padrão segue o upstream `aimod-cc/agent2api`; em fork, sobrescreva), o segundo troca a raiz da API (padrão `https://api.github.com`; deve devolver um JSON de release no formato do GitHub). Com uma fonte própria configurada, a lista de permissões de download passa a aceitar, além disso, apenas **o próprio host dessa fonte** (o esquema segue a fonte: uma fonte `http://` também permite download em texto puro — só para ensaios locais / espelhos internos) |
 
 Compilar a partir do código: clone o repositório e rode `docker compose up -d --build` (a imagem contém apenas o gateway e o painel, sem toolchain Rust).
 
+<details>
+<summary><b>Atualização e reversão</b> (clique para expandir)</summary>
+
+**Pelo painel**: Configurações → Atualização do software → Verificar atualizações; se houver versão nova, clique em "Baixar e atualizar" e, quando o pacote estiver pronto, em "Instalar e reiniciar". O servidor verifica o sha256, substitui o executável e os arquivos de interface dentro do contêiner e reinicia o processo — o contêiner volta a subir pelo `restart: unless-stopped` (o mesmo contêiner, seu volume de dados intacto) e a página se atualiza sozinha alguns segundos depois. Para voltar, use "Reverter para a versão anterior" no mesmo painel (ele restaura o backup deixado pela atualização).
+
+Três coisas que vale saber:
+
+- **Ela atualiza os arquivos dentro do contêiner, não a sua imagem local**: a tag `image:` no seu compose continua a mesma e o `docker inspect` ainda mostra a tag antiga; um `docker compose pull && docker compose up -d` posterior (que recria o contêiner) volta para a versão da imagem. Para manter os dois alinhados, atualize a tag no seu compose após atualizar e rode `docker compose pull && up -d` mais uma vez.
+- O ponto de atualização só aparece em contêineres (`AGENT2API_SELF_UPDATE=1`, já definido na imagem); com `0` você volta ao caminho manual abaixo.
+- Os pacotes vêm do GitHub Releases (`agent2api-server-linux-<arch>.tar.gz` mais um `.sha256` irmão). O download usa a rota de saída configurada em "Configurações de atualização" (compartilhada com a verificação de atualizações) — escolha um proxy ali ou adicione um token do GitHub se o acesso direto estiver instável.
+
+**Atualização manual** (vale para qualquer forma de implantação):
+
+```bash
+# compose (usando o compose deste repositório)
+docker compose pull && docker compose up -d
+
+# docker run: baixe a imagem nova e recrie o contêiner (seus dados ficam em ./data)
+docker pull aimodcc/agent2api:latest
+docker rm -f agent2api
+# depois rode de novo o comando original "docker run" de cima
+```
+
+Compilado a partir do código: `git pull && docker compose up -d --build`.
+
+</details>
+
 **Diferenças de recursos no painel web** (todas decorrem de "não haver cliente de desktop local"): login pela web (WorkBuddy / Qoder / Cline), código por SMS e credenciais coladas funcionam plenamente; logins pela web que exigem callback nesta máquina (AutoClaw / CatPaw / Accio / CodeArts / Trae) e a "importação do estado de login local" não estão disponíveis — use credenciais coladas.
 
----
-
-## Capturas de tela
+## 📸 Capturas de tela
 
 ### Contas
 
@@ -139,7 +180,7 @@ Todas as contas ficam em uma fila única (a segunda coluna é a prioridade) e po
 
 ![Página de contas: fila global, cooldown de limite por modelo, validade e saldo](./assets/screenshots/accounts.png)
 
-Escolha o provedor e entre; o mesmo fornecedor pode manter várias versões de conta (ex.: WorkBuddy China / global) e o encaminhamento escolhe pelo nome do modelo:
+Escolha o provedor e entre; o mesmo fornecedor pode manter várias versões de conta (ex.: WorkBuddy China / global):
 
 ![Adicionar conta: escolha o provedor e a versão, depois faça login pela web](./assets/screenshots/add-account.png)
 
@@ -159,11 +200,12 @@ As tarefas de segundo plano ficam todas nesta página (ativar / intervalo / últ
 
 ![Página de tarefas agendadas: ativação e intervalos de check-in, manutenção de credenciais, atualização do catálogo de modelos e mais](./assets/screenshots/scheduled-tasks.png)
 
----
+## 🧱 Estrutura do projeto
 
-## Estrutura do projeto
+O backend é um servidor HTTP Rust em processo dentro de `src-tauri/`, e o frontend é HTML/CSS/JS puro em `ui/`.
 
-O gateway e o aplicativo desktop ficam ambos em `desktop-tauri/`: o backend é um servidor HTTP Rust em processo dentro de `src-tauri/`, e o frontend é HTML/CSS/JS puro em `ui/`.
+<details>
+<summary>Árvore completa de diretórios (clique para expandir)</summary>
 
 ```
 agent2api/
@@ -200,7 +242,7 @@ agent2api/
 │  │  │  │  │  ├─ qoder/        Qoder: adapter / endpoints (endereços dos dois sites) / oauth (autorização por dispositivo) /
 │  │  │  │  │  │                auth / cosy (assinatura COSY e codificação do body) / protocol (decodificação do envelope) /
 │  │  │  │  │  │                chat (encaminhamento em estilo sessão) / stream / machine (PKCE e identificação da máquina) /
-│  │  │  │  │  │                credentials / refresh / models / balance
+│  │  │  │  │  │                credentials / refresh / models / balance / risk (componentes de controle de risco UMID)
 │  │  │  │  │  ├─ cline/        Cline: adapter (Bearer + cabeçalhos de produto) / credentials (prefixo workos:
 │  │  │  │  │  │                + estado de login do desktop + parsing do nome) / login (autorização de dispositivo WorkOS) /
 │  │  │  │  │  │                refresh (renovação single-flight) / models (dois pools de cota + sementes de mapeamento padrão) /
@@ -251,9 +293,9 @@ agent2api/
 │  │  │  │  │  │                fingerprint (impressão digital determinística do dispositivo + relatório a cada 8h) / models /
 │  │  │  │  │  │                plan (envelope de 8 chaves e reescrita de params, derivação do session id)
 │  │  │  │  │  ├─ antigravity/  Antigravity (Google, Gemini): oauth (renovação por refresh token + single-flight) /
-│  │  │  │  │                   project (descoberta loadCodeAssist → onboardUser) / credentials /
-│  │  │  │  │                   endpoints (bases dos três ambientes e conjunto de cabeçalhos) / login /
-│  │  │  │  │                   models (fetchAvailableModels + fallback interno + mapeamento do nome real no upstream) / adapter
+│  │  │  │  │  │                project (descoberta loadCodeAssist → onboardUser) / credentials /
+│  │  │  │  │  │                endpoints (bases dos três ambientes e conjunto de cabeçalhos) / login /
+│  │  │  │  │  │                models (fetchAvailableModels + fallback interno + mapeamento do nome real no upstream) / adapter
 │  │  │  │  │  └─ officeace/    OfficeAce (Huawei Cloud, OfficeClaw): oauth (login self-service PKCE + P-256 DPoP) /
 │  │  │  │  │                   signer (assinaturas SDK-HMAC e V11-HMAC + fixtures de vetores) /
 │  │  │  │  │                   credentials (Basic do gateway + AK/SK temporárias do plano de controle) /
@@ -296,6 +338,7 @@ agent2api/
 │  │  ├─ bridge.rs               Script de ponte injetado como window.workbuddyDesktop
 │  │  └─ update.rs / settings.rs / state.rs / tray.rs
 │  ├─ ui/                        Frontend (HTML/CSS/JS puro, sem framework)
+│  ├─ i18n/                      Fonte dos dicionários da interface e scripts de build (seis idiomas)
 │  └─ src-tauri/tauri.conf.json  Configuração de empacotamento (NSIS)
 ├─ build/make-icon.mjs           Gera a imagem-fonte do ícone do aplicativo
 ├─ assets/screenshots/           Imagens usadas nos READMEs (capturas da interface)
@@ -304,14 +347,14 @@ agent2api/
 └─ package.json                  Entradas dos scripts de build (tauri:dev / tauri:build / build:icon)
 ```
 
----
+</details>
 
-## Desenvolvimento e build
+## 🔧 Desenvolvimento e build
 
 ### Requisitos
 
 - Rust >= 1.77 e o toolchain do Tauri 2 (para compilar o app desktop; no Windows também é preciso o runtime WebView2)
-- Node.js >= 18.17 (apenas para rodar `npm run tauri:*` e scripts de build do frontend, como `build/make-icon.mjs`; o app desktop não depende de Node em tempo de execução e não empacota nenhum artefato de Node)
+- Node.js >= 18.17 (apenas para rodar `npm run tauri:*` e scripts de build do frontend; o app desktop não depende de Node em tempo de execução)
 
 ### Scripts comuns
 
@@ -323,11 +366,9 @@ npm run tauri:build        # Compila o instalador do desktop
 npm run build:icon         # Gera a imagem-fonte do ícone (rode após mudar o design do ícone e depois rode tauri icon)
 ```
 
-O projeto raiz não tem dependências de runtime; o `package.json` apenas fornece os atalhos de script acima. O artefato de build é `target/release/bundle/nsis/Agent2API_<versão>_x64-setup.exe` (hoje com cerca de 3,0 MB; o `src-tauri/.cargo/config.toml` aponta o `target-dir` do cargo para o `target/` na raiz do projeto).
+O artefato de build é `target/release/bundle/nsis/Agent2API_<versão>_x64-setup.exe` (hoje com cerca de 3,0 MB; o `src-tauri/.cargo/config.toml` aponta o `target-dir` do cargo para o `target/` na raiz do projeto).
 
----
-
-## Aviso de uso
+## 📜 Aviso de uso
 
 ### Apenas para aprendizado e discussão
 
@@ -349,17 +390,13 @@ Este projeto armazena as credenciais das contas (`accessToken` / `refreshToken` 
 
 Este projeto é fornecido "como está"; o autor não faz qualquer promessa sobre disponibilidade, estabilidade, segurança ou adequação a um propósito específico. As interfaces do upstream podem mudar a qualquer momento, e o projeto pode parar de funcionar e ficar sem manutenção a qualquer momento. Os termos completos estão na [LICENSE](./LICENSE). As formas de interface, campos de protocolo e outras informações deste projeto vêm da observação e organização do tráfego de rede publicamente visível dos clientes oficiais; as marcas e serviços relacionados pertencem aos seus respectivos donos. Se um detentor de direitos considerar este projeto inadequado, entre em contato com o autor, e ele será ajustado ou removido prontamente.
 
----
-
-## Licença
+## 📄 Licença
 
 Este projeto é distribuído sob a [MIT License](./LICENSE); você pode usá-lo, modificá-lo e distribuí-lo livremente desde que mantenha o aviso de copyright.
 
 Uma ressalva: a LICENSE traz um **Aviso de uso** após o texto da MIT, cujo item 3 **adiciona restrições** à MIT (proibição de uso comercial, proibição de redistribuição com fins lucrativos, proibição de operação de contas em massa). Portanto este projeto **não** é MIT puro — **os termos da MIT e o Aviso de uso juntos formam a licença completa**, e onde os dois chegam a conclusões diferentes sobre o mesmo ato, prevalece o mais restritivo. É também por isso que o `Cargo.toml` aponta `license-file` para a LICENSE em vez de declarar o identificador SPDX `"MIT"`.
 
----
-
-## Star History
+## ⭐ Star History
 
 <a href="https://star-history.com/#aimod-cc/agent2api&Date">
   <picture>
@@ -368,3 +405,11 @@ Uma ressalva: a LICENSE traz um **Aviso de uso** após o texto da MIT, cujo item
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
   </picture>
 </a>
+
+<div align="center">
+
+**[Baixe a versão mais recente](https://github.com/aimod-cc/agent2api/releases/latest)** • **[Reporte um problema](https://github.com/aimod-cc/agent2api/issues)**
+
+Se este projeto for útil para você, uma ⭐️ Star é muito bem-vinda!
+
+</div>

@@ -9,7 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@ui'
-import { handleExternalClick, isWebPanel, markdownHtml, shared, type UpdateInfo } from './update-shared'
+import { canManageUpdate, handleExternalClick, markdownHtml, shared, type UpdateInfo } from './update-shared'
 import { t } from '../i18n'
 
 /**
@@ -67,10 +67,10 @@ export function showUpdateModal(
   info: UpdateInfo | null | undefined,
   onGoUpdate: (info: UpdateInfo) => Promise<void>,
 ): void {
-  if (!info || info.hasUpdate !== true) return
-  // 网页面板不弹：弹窗的「去更新」会开始下载并安装，而网页端那条链是明确拒绝的
-  // （见 update-shared 的 isWebPanel）。版本号与更新日志在设置页面板里照样能看。
-  if (isWebPanel()) return
+  if (!info || info.hasUpdate !== true || !canManageUpdate(info)) return
+  // 更新已应用到容器里、只差重启（容器内更新）：此刻弹「去更新」是条死路 ——
+  // 面板上的那颗按钮已经换成「立即重启」，重启入口在那里
+  if (info.pendingRestart === true) return
   const latest = String(info.latestVersion || '').trim()
   if (!latest) return
   if (shared().wbApp?.currentPage === 'settings') return

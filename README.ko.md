@@ -1,12 +1,42 @@
-# Agent2API · 멀티 프로바이더 로컬 게이트웨이
+<div align="center">
+
+# Agent2API
+
+**여러 AI 데스크톱 클라이언트의 로그인 상태를 하나의 로컬 OpenAI 호환 API 게이트웨이로**
 
 [简体中文](./README.md) | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | [日本語](./README.ja.md) | **한국어** | [Português (BR)](./README.pt-BR.md)
 
-여러 AI 데스크톱 클라이언트의 로그인 상태를 로컬 **OpenAI 호환 API 게이트웨이**로 묶어 하나의 `base_url`로 제공합니다. 멀티 프로바이더 계정 관리, 모델 관리(활성화 / 삭제 / 매핑), 아웃바운드 핑거프린트 마스킹, 이그레스 프록시, 요청 리포트를 갖추고 있으며 바로 쓸 수 있는 Tauri 데스크톱 앱도 함께 제공합니다. 사용자 지정 `base_url`을 지원하는 OpenAI 클라이언트라면 무엇이든 `http://127.0.0.1:3065/v1`을 엔드포인트로 삼아 이들 각 사의 모델 한도를 호출할 수 있습니다 — API 키도 필요 없고, 클라이언트 소스 수정도 필요 없습니다.
+[![license](https://img.shields.io/badge/license-MIT%20%2B%20고지-green)](./LICENSE)
+[![release](https://img.shields.io/github/v/release/aimod-cc/agent2api?include_prereleases)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
+[![stars](https://img.shields.io/github/stars/aimod-cc/agent2api?style=flat&color=yellow)](https://github.com/aimod-cc/agent2api/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/aimod-cc/agent2api/releases/latest)
+
+[✨ 핵심 기능](#-핵심-기능) • [🤝 지원 공급자](#-지원-공급자) • [🚀 빠른 시작](#-빠른-시작) • [🐳 Docker 배포](#-docker-배포) • [📸 화면 미리보기](#-화면-미리보기) • [🔧 개발 및 빌드](#-개발-및-빌드) • [📜 사용 고지](#-사용-고지)
+
+</div>
+
+---
+
+하나의 `base_url`로 멀티 프로바이더 계정 관리, 모델 관리, 이그레스 프록시, 요청 리포트를 제공하고 바로 쓸 수 있는 Tauri 데스크톱 앱도 함께 제공합니다. 사용자 지정 `base_url`을 지원하는 OpenAI 클라이언트라면 무엇이든 `http://127.0.0.1:3065/v1`로 이들 각 사의 모델 한도를 호출할 수 있습니다 — **업스트림 API 키도 필요 없고, 클라이언트 수정도 필요 없습니다**.
+
+## ✨ 핵심 기능
+
+- 🔌 **OpenAI 호환 엔드포인트** — `/v1/chat/completions`, `/v1/responses`, `/v1/messages`(`count_tokens` 포함)와 `/v1/models`를 하나의 게이트웨이로 제공. 어떤 클라이언트든 그대로 연결됩니다
+- 🏪 **내장 공급자 17개 사** — WorkBuddy, 小浣熊, CatPaw, AutoClaw, Qoder, Cline, Accio, ZCode, CodeArts, Trae, Loomy, KukuAI, MonkeyCode, Command Code, Antigravity, OfficeAce(일부는 중국판 / 국제판 2종)에 더해 사용자 지정 패스스루 공급자(Chat / Responses / Anthropic)도 지원
+- 🔁 **자격 증명 완전 자동 관리** — 토큰 자동 갱신(싱글플라이트 중복 제거), 만료 임박 자격 증명 일괄 갱신, 모델 카탈로그 원격 갱신 + 정적 폴백
+- 🪂 **안정적인 전달** — 전역 우선순위 계정 큐, 모델별 한도 쿨다운, 429 자동 폴백, 결정적 실패는 빈 대기 없이 즉시 건너뜀
+- 🛡️ **보안과 마스킹** — 이그레스 프록시, 아웃바운드 핑거프린트 마스킹, 다중 게이트웨이 키, fail-closed, 로그인 사람 확인
+- 📊 **요청 리포트** — 요청 수 / 성공률 / 토큰 총량, 24시간 캐시 적중률과 소비 추세, 상위 모델과 계정, 365일 활동 히트맵
+- ⏰ **예약 작업** — 자동 출석, 자격 증명 유지 관리, 모델 카탈로그 갱신 등 백그라운드 작업을 켜기/끄기 · 간격 · 지난 결과로 한 페이지에서 관리
+- 💰 **잔액이 한눈에** — 계정 행 안의 잔액 / 사용량 표시, 계정 횡단 동시 조회와 정기 스냅샷
+- 🖥️ **두 가지 배포 형태** — Tauri 데스크톱 앱(트레이 상주, Node 런타임 불필요) / Docker headless(패널 + 게이트웨이 같은 포트). 패널 UI는 6개 언어 지원
+
+## 🤝 지원 공급자
 
 플랫폼별 리버스 프록시 지원 현황(✓ 지원 · ✗ 미지원 · — 해당 없음):
 
-| 플랫폼 | LLM 요청 | 토큰 자동 갱신 | 모델 목록(원격 갱신) | 잔액 조회 | 출석 | 수령 항목 |
+| 플랫폼 | LLM 요청 | 토큰 자동 갱신 | 모델 목록 | 잔액 조회 | 출석 | 수령 항목 |
 | --- | :--: | :--: | :--: | :--: | :--: | :--: |
 | WorkBuddy 중국판 | ✓ | ✓ | ✓ 원격 + 정적 폴백 | ✓ | ✓ 일일 출석 | — |
 | WorkBuddy 국제판 | ✓ | ✓ | ✓ 원격 + 정적 폴백 | ✓ | ✗ 출석 이벤트 없음 | — |
@@ -27,29 +57,15 @@
 | OfficeAce(Huawei Cloud, OfficeClaw) | ✓ | ✓ 제어 영역 자동 갱신 | ✓ 원격만 | ✓ 포인트 잔액 | ✓ 일일 보너스(출석 + 신규 혜택) | — |
 | 사용자 지정 프로바이더 | ✓ Chat 패스스루 / Responses / Anthropic | — | ✓ 수동 등록 + 서버 측 가져오기 | — | — | — |
 
-세 가지 대화 프로토콜 진입점(`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, 그리고 `/v1/messages/count_tokens`)과 `/v1/models`는 모든 플랫폼에 동일하게 적용되며, 차이는 각 업스트림이 표의 항목을 할 수 있는지에만 있습니다. 모델 매핑, 전역 우선순위 큐, 429 폴백, 이그레스 프록시, 아웃바운드 핑거프린트 마스킹, 요청 리포트 역시 전 플랫폼 공통입니다.
+`/v1/chat/completions`, `/v1/responses`, `/v1/messages`(`count_tokens` 포함)와 `/v1/models`는 모든 플랫폼에 동일하게 적용됩니다. 모델 매핑, 전역 우선순위 큐, 429 폴백, 이그레스 프록시, 아웃바운드 핑거프린트 마스킹, 요청 리포트 역시 전 플랫폼 공통입니다.
 
-> **이 프로젝트는 학습과 교류 목적으로만 제공됩니다.** 비공식 클라이언트 형태로 자신의 계정 로그인 상태를 재사용하므로 업스트림 서비스 약관에 부합하지 않을 수 있습니다. 위험(계정 정지 등 포함)은 사용자가 부담하며, 상업적 사용과 과금 우회는 금지됩니다. 자세한 내용은 [사용 고지](#사용-고지)와 [LICENSE](./LICENSE)를 참고하세요.
+> **이 프로젝트는 학습과 교류 목적으로만 제공됩니다.** 비공식 클라이언트 형태로 자신의 계정 로그인 상태를 재사용하므로 업스트림 서비스 약관에 부합하지 않을 수 있습니다. 위험(계정 정지 등 포함)은 사용자가 부담하며, 상업적 사용과 과금 우회는 금지됩니다. 자세한 내용은 [사용 고지](#-사용-고지)와 [LICENSE](./LICENSE)를 참고하세요.
 >
-> 이 프로젝트는 개인용 로컬 프록시 도구로, 각 업스트림 벤더 및 공식 제품과 아무런 관련이 없습니다(목록은 [사용 고지](#사용-고지) 참고). 인터페이스 형태는 각 사 클라이언트 통신을 관찰한 것이며 업스트림은 언제든 바뀔 수 있습니다.
+> 이 프로젝트는 개인용 로컬 프록시 도구로, 각 업스트림 벤더 및 공식 제품과 아무런 관련이 없습니다(목록은 [사용 고지](#-사용-고지) 참고). 인터페이스 형태는 각 사 클라이언트 통신을 관찰한 것이며 업스트림은 언제든 바뀔 수 있습니다.
 
----
+## 🚀 빠른 시작
 
-## 목차
-
-- [빠른 시작](#빠른-시작)
-- [Docker 배포](#docker-배포)
-- [화면 미리보기](#화면-미리보기)
-- [프로젝트 구조](#프로젝트-구조)
-- [개발 및 빌드](#개발-및-빌드)
-- [사용 고지](#사용-고지)
-- [라이선스](#라이선스)
-
----
-
-## 빠른 시작
-
-Releases에서 설치 프로그램(NSIS, 중국어 간체, 기본 설치 경로 `C:\Program Files\Agent2API`, 설치 시 관리자 권한 필요)을 내려받아 설치 후 실행하면 됩니다. **Node나 다른 런타임은 필요하지 않습니다.**
+[Releases](https://github.com/aimod-cc/agent2api/releases/latest)에서 설치 프로그램(NSIS, 중국어 간체, 기본 설치 경로 `C:\Program Files\Agent2API`, 설치 시 관리자 권한 필요)을 내려받아 설치 후 실행하면 됩니다. **Node나 다른 런타임은 필요하지 않습니다.**
 
 1. 첫 실행 시 앱 프로세스 안에서 로컬 게이트웨이(포트 3065)가 시작되고 메인 창이 열립니다. 이전 버전의 데이터 디렉터리나 데이터 파일이 발견되면 마이그레이션 안내 대화상자가 표시되며, 안내에 따라 진행하면 됩니다.
 2. "계정" 페이지에서 "계정 추가"를 누르고 프로바이더를 고른 뒤, 대화상자 안내대로 로그인하거나 자격 증명을 입력하면 됩니다(웹 로그인 / SMS 인증 코드 / 자격 증명 붙여넣기 / 이 PC 로그인 상태 가져오기).
@@ -89,9 +105,7 @@ print(resp.choices[0].message.content)
 
 기본적으로 `127.0.0.1`만 수신합니다. "설정 → 일반 → LAN 접근"을 켜면 모든 네트워크 어댑터에서 수신하고, LAN 기기는 API 주소를 이 PC의 IP로 지정하기만 하면 됩니다(화면에 전체 주소 표시). 보안을 위해 켜기 전에 패널 관리자 등록이 필요합니다. 관리 API는 관리자 세션 또는 게이트웨이 키를 요구하며, 활성화된 키가 없으면 전달 API도 거부합니다(켜는 과정에서 "기본" 키가 자동 추가됩니다). 웹 패널의 LAN 공개도 선택할 수 있습니다(기본 비공개). 변경은 재시작 후 적용됩니다.
 
----
-
-## Docker 배포
+## 🐳 Docker 배포
 
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
@@ -99,7 +113,7 @@ docker run -d --name agent2api --restart unless-stopped \
   aimodcc/agent2api:latest
 ```
 
-브라우저에서 `http://<호스트>:3065`를 열면 첫 방문 시 **관리자 계정 등록**으로 안내합니다(이후 로그인에 사용). 로그인 후 "게이트웨이 키" 페이지에서 클라이언트용 API 키를 만들면 됩니다 — `http://<호스트>:3065/v1`이 OpenAI 호환 엔드포인트이며, 키를 만들기 전에는 전달을 거부하고 첫 키를 만들면 자동으로 복구됩니다. 모든 상태(SQLite 데이터베이스 / 설정 / 로그)는 `./data` 볼륨 하나에 저장됩니다.
+브라우저에서 `http://<호스트>:3065`를 열면 첫 방문 시 **관리자 계정 등록**으로 안내합니다. 로그인 후 "게이트웨이 키" 페이지에서 클라이언트용 API 키를 만들면 됩니다 — `http://<호스트>:3065/v1`이 OpenAI 호환 엔드포인트이며, 키를 만들기 전에는 전달을 거부합니다. 모든 상태(SQLite 데이터베이스 / 설정 / 로그)는 `./data` 볼륨 하나에 저장됩니다.
 
 compose 사용자용(amd64 / arm64 이미지 모두 제공):
 
@@ -115,7 +129,7 @@ services:
       - ./data:/data
 ```
 
-환경 변수(모두 선택 사항이며, 미리 준비할 것은 없습니다):
+환경 변수(모두 선택 사항):
 
 | 변수 | 설명 |
 | --- | --- |
@@ -124,14 +138,41 @@ services:
 | `AGENT2API_HOST` / `AGENT2API_PROXY_PORT` | 수신 주소(기본 `0.0.0.0`) / 포트(기본 `3065`) |
 | `AGENT2API_ALLOW_NO_KEY` | `1`이면 fail-closed 해제(키 미설정이어도 `/v1` 허용, 순수 내부망 한정) |
 | `AGENT2API_CAPTCHA_ENABLED` | 로그인 페이지 사람 확인 위젯: 기본 `1`(켜짐), `0`은 끔 |
+| `AGENT2API_SELF_UPDATE` | 컨테이너 안의 업데이트 창구: 기본 `1`(켜짐. 패널에서 "다운로드 후 업데이트" 가능). `0`이면 꺼지고 수동 업그레이드만 가능 |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 심화: "업데이트 확인 / 업데이트 다운로드"를 자체 소스로 교체합니다. 전자는 저장소를 바꾸고(기본값은 업스트림 `aimod-cc/agent2api`, fork 후 변경 가능), 후자는 API 루트를 바꿉니다(기본 `https://api.github.com`, GitHub와 같은 형태의 release JSON을 반환해야 함). 자체 소스 설정 후 다운로드 허용 목록은 **그 소스 자신의 호스트**만 추가로 허용합니다(스킴은 소스를 따름: `http://`를 설정하면 평문 다운로드도 허용. 로컬 연습 / 내부 미러용) |
 
 소스에서 빌드하려면: 이 저장소를 클론한 뒤 `docker compose up -d --build`(이미지에는 게이트웨이와 패널만 들어가며 Rust 도구 체인은 포함되지 않습니다).
 
+<details>
+<summary><b>업그레이드와 롤백</b> (펼치기)</summary>
+
+**패널에서 바로 업그레이드**: 설정 → 소프트웨어 업데이트 → 업데이트 확인 후 새 버전이 보이면 "다운로드 후 업데이트"를, 패키지 내려받기가 끝나면 "설치 후 재시작"을 누릅니다. 서버는 sha256을 검증하고 컨테이너 안의 실행 파일과 UI 파일을 교체한 뒤 프로세스를 재시작합니다 — 컨테이너는 `restart: unless-stopped`에 의해 다시 뜨고(같은 컨테이너, 데이터 볼륨은 그대로) 페이지는 몇 초 뒤 자동으로 새로고침됩니다. 이전 버전으로 돌아가려면 같은 패널의 "이전 버전으로 롤백"을 사용하세요(업데이트 때 남긴 백업을 복원합니다).
+
+알아둘 세 가지:
+
+- **업데이트되는 것은 컨테이너 안의 파일이지 로컬 이미지가 아닙니다**: compose의 `image:` 태그는 그대로이고 `docker inspect`는 여전히 이전 태그를 표시합니다. 이후 `docker compose pull && docker compose up -d`(컨테이너 재생성)를 하면 이미지의 버전으로 돌아갑니다. 양쪽을 맞추려면 업그레이드 후 compose의 태그를 새 버전 번호로 바꾸고 `docker compose pull && up -d`를 한 번 더 실행하세요.
+- 업데이트 창구는 컨테이너 안에서만 나타납니다(`AGENT2API_SELF_UPDATE=1`, 이미지에 기본 설정됨). `0`으로 두면 아래의 수동 방식으로 돌아갑니다.
+- 패키지는 GitHub Release에서 가져옵니다(`agent2api-server-linux-<arch>.tar.gz` + 같은 이름의 `.sha256`). 다운로드는 "업데이트 설정"에서 구성한 이그레스 경로(업데이트 확인과 공유)를 사용합니다. 국내에서 직접 접속이 원활하지 않으면 거기서 프록시를 지정하거나 GitHub 토큰을 채우세요.
+
+**수동 업그레이드**(어떤 배포 형태에도 적용):
+
+```bash
+# compose(이 저장소의 compose를 쓰는 경우)
+docker compose pull && docker compose up -d
+
+# docker run: 새 이미지를 받아 컨테이너를 다시 만들기(데이터는 ./data 볼륨에 그대로)
+docker pull aimodcc/agent2api:latest
+docker rm -f agent2api
+# 위의 "docker run" 명령을 다시 실행
+```
+
+소스에서 빌드한 경우: `git pull && docker compose up -d --build`.
+
+</details>
+
 **웹 패널 기능 차이**(이 PC에 데스크톱 클라이언트가 없음에서 비롯됩니다): 웹 로그인(WorkBuddy / Qoder / Cline), SMS 인증 코드, 자격 증명 붙여넣기는 완전히 사용 가능합니다. 이 PC 콜백이 필요한 웹 로그인(AutoClaw / CatPaw / Accio / CodeArts / Trae)과 "이 PC 로그인 상태 가져오기"는 사용할 수 없으니 자격 증명 붙여넣기를 쓰세요.
 
----
-
-## 화면 미리보기
+## 📸 화면 미리보기
 
 ### 계정
 
@@ -139,7 +180,7 @@ services:
 
 ![계정 관리 페이지: 전역 큐, 모델별 한도 쿨다운, 유효기간과 잔액](./assets/screenshots/accounts.png)
 
-프로바이더를 고르고 로그인하면 끝. 같은 프로바이더의 여러 버전 계정을 보관할 수 있고(예: WorkBuddy 중국판 / 국제판) 전달 시 모델 이름으로 자동 선택됩니다:
+프로바이더를 고르고 로그인하면 끝. 같은 프로바이더의 여러 버전 계정을 보관할 수 있습니다(예: WorkBuddy 중국판 / 국제판):
 
 ![계정 추가: 프로바이더와 버전을 고른 뒤 웹 로그인](./assets/screenshots/add-account.png)
 
@@ -159,11 +200,12 @@ services:
 
 ![예약 작업 페이지: 자동 출석, 자격 증명 유지 관리, 모델 카탈로그 갱신 등 백그라운드 작업의 켜기/끄기와 간격](./assets/screenshots/scheduled-tasks.png)
 
----
+## 🧱 프로젝트 구조
 
-## 프로젝트 구조
+백엔드는 `src-tauri/` 아래의 Rust 인프로세스 HTTP 서버이고, 프런트엔드는 `ui/` 아래의 순수 HTML/CSS/JS입니다.
 
-게이트웨이와 데스크톱 앱은 모두 `desktop-tauri/`에 있습니다. 백엔드는 `src-tauri/` 아래의 Rust 인프로세스 HTTP 서버이고, 프런트엔드는 `ui/` 아래의 순수 HTML/CSS/JS입니다.
+<details>
+<summary>전체 디렉터리 트리 (펼치기)</summary>
 
 ```
 agent2api/
@@ -200,7 +242,7 @@ agent2api/
 │  │  │  │  │  ├─ qoder/        Qoder: adapter / endpoints(두 사이트 주소) / oauth(기기 인증) /
 │  │  │  │  │  │                auth / cosy(COSY 서명과 body 인코딩) / protocol(엔벨로프 디코딩) /
 │  │  │  │  │  │                chat(세션 방식 전달) / stream / machine(PKCE와 기기 식별) /
-│  │  │  │  │  │                credentials / refresh / models / balance
+│  │  │  │  │  │                credentials / refresh / models / balance / risk(UMID 리스크 관리 구성요소)
 │  │  │  │  │  ├─ cline/        Cline: adapter(Bearer + 제품면 헤더) / credentials(workos: 접두사
 │  │  │  │  │  │                + 데스크톱 로그인 상태 + 이름 파싱) / login(WorkOS 기기 인증) /
 │  │  │  │  │  │                refresh(싱글플라이트 갱신) / models(두 할당량 풀 + 기본 매핑 시드) /
@@ -251,9 +293,9 @@ agent2api/
 │  │  │  │  │  │                fingerprint(결정적 기기 핑거프린트와 8h 보고) / models /
 │  │  │  │  │  │                plan(8키 엔벨로프와 params 재작성, session id 파생)
 │  │  │  │  │  ├─ antigravity/  Antigravity(Google, Gemini): oauth(refresh token 갱신 + 싱글플라이트) /
-│  │  │  │  │                   project(loadCodeAssist → onboardUser 탐색) / credentials /
-│  │  │  │  │                   endpoints(3개 환경 베이스와 헤더 집합) / login /
-│  │  │  │  │                   models(fetchAvailableModels + 내장 폴백 + 업스트림 실제 이름 매핑) / adapter
+│  │  │  │  │  │                project(loadCodeAssist → onboardUser 탐색) / credentials /
+│  │  │  │  │  │                endpoints(3개 환경 베이스와 헤더 집합) / login /
+│  │  │  │  │  │                models(fetchAvailableModels + 내장 폴백 + 업스트림 실제 이름 매핑) / adapter
 │  │  │  │  │  └─ officeace/    OfficeAce(Huawei Cloud, OfficeClaw): oauth(PKCE + P-256 DPoP 셀프 서비스 로그인)/
 │  │  │  │  │                   signer(SDK-HMAC 과 V11-HMAC 두 가지 서명 + 벡터 픽스처)/
 │  │  │  │  │                   credentials(게이트웨이 Basic + 제어 영역 임시 AK/SK)/
@@ -296,6 +338,7 @@ agent2api/
 │  │  ├─ bridge.rs               window.workbuddyDesktop 을 주입하는 브리지 스크립트
 │  │  └─ update.rs / settings.rs / state.rs / tray.rs
 │  ├─ ui/                        프런트엔드(순수 HTML/CSS/JS, 프레임워크 없음)
+│  ├─ i18n/                      UI 사전 소스와 빌드 스크립트(6개 언어)
 │  └─ src-tauri/tauri.conf.json  패키징 설정(NSIS)
 ├─ build/make-icon.mjs           앱 아이콘 소스 이미지 생성
 ├─ assets/screenshots/           README 용 이미지(UI 스크린샷)
@@ -304,14 +347,14 @@ agent2api/
 └─ package.json                  빌드 스크립트 진입점(tauri:dev / tauri:build / build:icon)
 ```
 
----
+</details>
 
-## 개발 및 빌드
+## 🔧 개발 및 빌드
 
 ### 요구 사항
 
 - Rust >= 1.77 와 Tauri 2 도구 체인(데스크톱 앱 본체 컴파일용. Windows 에서는 WebView2 런타임도 필요)
-- Node.js >= 18.17(`npm run tauri:*` 와 `build/make-icon.mjs` 같은 프런트엔드 빌드 스크립트 실행용. 데스크톱 앱은 실행 시 Node 에 의존하지 않으며 Node 산출물도 포함하지 않습니다)
+- Node.js >= 18.17(`npm run tauri:*` 과 프런트엔드 빌드 스크립트 실행용. 데스크톱 앱은 실행 시 Node 에 의존하지 않습니다)
 
 ### 자주 쓰는 스크립트
 
@@ -323,11 +366,9 @@ npm run tauri:build        # 데스크톱 설치 프로그램 빌드
 npm run build:icon         # 아이콘 소스 이미지 생성(아이콘 디자인을 바꾼 뒤 실행하고, 이어서 tauri icon 실행)
 ```
 
-루트 프로젝트 자체에는 런타임 의존성이 없고, `package.json` 은 위 단축 스크립트 진입점만 제공합니다. 패키징 산출물은 `target/release/bundle/nsis/Agent2API_<버전>_x64-setup.exe`(현재 약 3.0 MB. `src-tauri/.cargo/config.toml` 이 cargo 의 `target-dir` 을 프로젝트 루트의 `target/` 으로 지정합니다).
+패키징 산출물은 `target/release/bundle/nsis/Agent2API_<버전>_x64-setup.exe`(현재 약 3.0 MB. `src-tauri/.cargo/config.toml` 이 cargo 의 `target-dir` 을 프로젝트 루트의 `target/` 으로 지정합니다).
 
----
-
-## 사용 고지
+## 📜 사용 고지
 
 ### 학습과 교류 목적에 한정
 
@@ -349,17 +390,13 @@ npm run build:icon         # 아이콘 소스 이미지 생성(아이콘 디자�
 
 이 프로젝트는 "있는 그대로" 제공되며, 작성자는 가용성, 안정성, 보안성, 특정 목적 적합성에 대해 어떤 보증도 하지 않습니다. 업스트림 인터페이스는 언제든 바뀔 수 있고 이 프로젝트는 예고 없이 동작하지 않게 되어 유지 보수가 중단될 수 있습니다. 전체 조건은 [LICENSE](./LICENSE)를 참고하세요. 이 프로젝트의 인터페이스 형태와 프로토콜 필드 등의 정보는 각 공식 클라이언트의 공개된 네트워크 통신을 관찰·정리한 것이며, 관련 상표와 서비스의 권리는 각 소유자에게 있습니다. 권리자가 이 프로젝트가 부적절하다고 판단하면 작성자에게 연락해 주세요. 즉시 조정하거나 삭제하겠습니다.
 
----
-
-## 라이선스
+## 📄 라이선스
 
 이 프로젝트는 [MIT License](./LICENSE)로 배포되며, 저작권 표시를 유지하는 한 자유롭게 사용·수정·배포할 수 있습니다.
 
 유의할 점은 LICENSE 본문 뒤에 **사용 고지**가 붙어 있고, 그 제3조가 MIT 위에 **제한을 추가**한다는 것입니다(상업적 사용 금지, 이익을 위한 재배포 금지, 대량 계정 운영 금지). 따라서 이 프로젝트는 **순수한 MIT가 아닙니다** — **MIT 조건과 사용 고지가 함께 완전한 라이선스와 사용 조건을 이루며**, 같은 행위에 대해 둘이 다른 결론을 내면 더 엄격한 쪽이 우선합니다. 이 때문에 `Cargo.toml` 이 SPDX `"MIT"` 를 선언하지 않고 `license-file` 로 LICENSE 를 가리킵니다.
 
----
-
-## Star History
+## ⭐ Star History
 
 <a href="https://star-history.com/#aimod-cc/agent2api&Date">
   <picture>
@@ -368,3 +405,11 @@ npm run build:icon         # 아이콘 소스 이미지 생성(아이콘 디자�
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
   </picture>
 </a>
+
+<div align="center">
+
+**[최신 버전 내려받기](https://github.com/aimod-cc/agent2api/releases/latest)** • **[문제 보고](https://github.com/aimod-cc/agent2api/issues)**
+
+이 프로젝트가 도움이 되었다면 ⭐️ Star 를 눌러 주세요!
+
+</div>

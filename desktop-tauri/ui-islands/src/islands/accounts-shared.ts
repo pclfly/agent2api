@@ -1,4 +1,5 @@
 import { t } from '../i18n'
+import type { BalanceQueryPublic } from './balance-query'
 
 /**
  * 账号页各文件共用的**类型与全局桥读取**（非岛：`.ts` 不被 import.meta.glob 当岛加载）。
@@ -22,11 +23,20 @@ export type ProxyConfig = {
   label?: string
   /** 解析失败的原因：转发时回退直连，界面上整格标红 */
   error?: string
+  /**
+   * 轮询档（`source === 'rotate'`，只对 OpenCode Zen 开放）的展示读数：
+   * 候选条数与其中可用的条数（后端 `proxy_rotate::summary`）。
+   */
+  rotate?: { all?: boolean; total?: number; usable?: number } | null
   config?: {
     source?: string
     listenerUid?: string
     /** `source === 'pool'` 时的池条目 id（见 PoolItem） */
     proxyId?: string
+    /** `source === 'rotate'`：true = 轮询池里全部启用的出口 */
+    all?: boolean
+    /** `source === 'rotate' && all !== true`：要轮询的池条目 id */
+    proxyIds?: string[]
     protocol?: string
     host?: string
     port?: number
@@ -132,6 +142,22 @@ export type AccountRecord = {
   hasApiKey?: boolean
   /** 自定义账号：是否声明了「该上游无需鉴权」（与 `hasApiKey` 互斥，见后端 `state::no_auth`） */
   noAuth?: boolean
+  /**
+   * 自定义账号：账号级 **baseUrl 覆盖项**（记录里写了这个键才透出；缺省表示
+   * 回落到提供商的 baseUrl）。出网「轮询」档与后端 `is_opencode_zen_account`
+   * 都要看它 —— 两层都可能指着 OpenCode Go 端点，只看提供商那一层会漏判。
+   */
+  baseUrl?: string
+  /**
+   * 自定义账号：**余额查询配置**（后端只在这家登记了余额方案时注入；见
+   * `providers::custom::balance` 与 `balance-query.tsx`）。
+   *
+   * 形状恒定的三件事：方案 id（只读事实）、两个非密字段的值（`userId` /
+   * `username`）、三个密字段的**存在标记**（`hasAccessToken` / `hasPassword` /
+   * `hasToken` —— 值绝不透出）。没有这个键 = 这一家不查余额，「查询设置」段
+   * 里也就没有方案字段。
+   */
+  balanceQuery?: BalanceQueryPublic
   maxConcurrent?: number
   /** 出站身份（WorkBuddy 系两家共有，缺省 `wb`）：`wb` / `vsc` / `cli` —— 见 identity-dialog.tsx */
   product?: string
@@ -338,12 +364,16 @@ export type PoolItem = {
   name?: string
   /** manual | clash | subscription（表单里按它标来源） */
   source?: string
-  /** 条目自身的启用位：手动条目由表单决定，镜像条目**跟随上游**（Clash / 订阅） */
+  /** 有效启用（来源启用且本地未禁用）。 */
   enabled?: boolean
-  /** 用户禁用位（与 enabled 分开，见后端 `proxy_pool::is_usable`）：只由用户开关写，同步不覆盖 */
+  sourceEnabled?: boolean
+  localDisabled?: boolean
+  /** 本地禁用位的兼容别名。 */
   disabled?: boolean
-  /** 两个字段的合取结果（后端算好的）：false = 账号引用它会回退直连 */
+  /** 与 enabled 相同的有效可用性。 */
   usable?: boolean
+  /** 订阅节点的监听端口；null = 未分配（lazy listeners，见网络代理页） */
+  port?: number | null
   /** 解析后的出口（Clash 条目的端口在这里是实时值）；不受控字段按 unknown 收 */
   resolved?: { protocol?: string; host?: string; port?: number | null; label?: string } | null
   /** 解析失败的原因（引用了已删除的 Clash 监听器等） */
@@ -364,6 +394,11 @@ export type PoolItem = {
  * 取不到（解析失败 / 字段缺失）时回落 `resolved.label`，再没有就是空串。
  */
 export function poolItemAddress(item: PoolItem): string {
+  // lazy listeners：订阅节点可能还没有分配监听端口（未引用 / 引用刚保存
+  // 内核还没重建完）—— 在这里标注出来，下拉与地址列都能看到原因
+  if (item.source === 'subscription' && (item.port === null || item.port === undefined)) {
+    return t('未分配端口')
+  }
   const resolved = item.resolved
   if (resolved?.protocol && resolved.host && resolved.port) {
     return `${String(resolved.protocol).toUpperCase()} ${resolved.host}:${resolved.port}`
@@ -383,11 +418,8 @@ export function poolItemAddress(item: PoolItem): string {
 export function poolItemLabel(item: PoolItem): string {
   const name = item.name || item.id
   const address = item.resolveError ? t('解析失败') : poolItemAddress(item)
-  // 可用性只认后端算好的 `usable`（enabled 与 disabled 的合取）：缺字段的旧
-  // 形态回落到只判 `disabled`，不再看 `enabled` —— 镜像条目的 enabled 是上游
-  // 的事，而「这条能不能用」是用户开关的结果，两者混在一起就会把
-  // 「Clash 里禁用了」说成「你禁用了它」
-  const usable = item.usable ?? !item.disabled
+  // 有效可用性优先读 usable，缺少时兼容 enabled 与两种本地禁用字段。
+  const usable = item.usable ?? (item.enabled !== false && !item.localDisabled && !item.disabled)
   const parts = [address, usable ? '' : t('已禁用')].filter(Boolean)
   return parts.length ? t('{name}（{parts}）', { name, parts: parts.join(' · ') }) : name
 }
@@ -425,7 +457,13 @@ export type SharedWindow = {
   wbProviders?: {
     labelOf?: (id: string) => string
     all?: () => Array<{ id?: string; label?: string }>
-    customList?: () => Array<{ id?: string; name?: string; protocol?: string; baseUrl?: string }>
+    customList?: () => Array<{
+      id?: string; name?: string; protocol?: string; baseUrl?: string
+      /** 客户端形态伪装（`'opencode'` = 按 OpenCode 官方 CLI 形状补齐请求）。
+       *  账号设置里判断「这家是不是 OpenCode Zen」的第二半判据，见 accounts-domain
+       *  的 `isOpencodeZenProvider`。 */
+      clientEmulation?: string
+    }>
     customRequest?: (method: string, path: string, body?: unknown) => Promise<unknown>
     PROTOCOL_OPTIONS?: Array<{ value: string; label: string }>
   }

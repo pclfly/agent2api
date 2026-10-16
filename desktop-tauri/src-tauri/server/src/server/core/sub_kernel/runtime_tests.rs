@@ -6,6 +6,7 @@ fn provider(id: &str) -> ProviderInput {
         name: format!("订阅 {id}"),
         url: "https://example.invalid/subscription".to_string(),
         kind: crate::server::core::subscriptions::KIND_URL.to_string(),
+        content: String::new(),
     }
 }
 
@@ -16,6 +17,7 @@ fn file_provider(id: &str) -> ProviderInput {
         name: format!("本地配置 {id}"),
         url: String::new(),
         kind: crate::server::core::subscriptions::KIND_FILE.to_string(),
+        content: "proxies: [{name: node, type: ss}]".to_string(),
     }
 }
 
@@ -24,12 +26,13 @@ fn node(provider_id: &str, name: &str, port: u16) -> NodeTarget {
         provider_id: provider_id.to_string(),
         sub_name: format!("订阅 {provider_id}"),
         node: name.to_string(),
-        port,
+        port: Some(port),
     }
 }
 
 fn config(providers: &[ProviderInput], nodes: &[NodeTarget]) -> Value {
-    let yaml = build_config(providers, 19090, "synthetic-controller-secret", nodes)
+    let defs = nodes.iter().map(|target| (node_key(&target.provider_id, &target.node), json!({"name": target.node, "type": "ss"}))).collect();
+    let yaml = build_config(providers, 19090, "synthetic-controller-secret", 19080, nodes, &defs)
         .expect("合成配置应能序列化");
     serde_yaml::from_str(&yaml).expect("输出应为有效 YAML")
 }
@@ -70,7 +73,7 @@ fn listeners_resolve_provider_nodes_through_registered_groups() {
     ];
     let cfg = config(&providers, &nodes);
     let listeners = cfg["listeners"].as_array().expect("listeners");
-    assert_eq!(listeners.len(), nodes.len());
+    assert_eq!(listeners.len(), nodes.len() + 1);
     for (listener, target) in listeners.iter().zip(&nodes) {
         let matched = matching_nodes(&cfg, listener, &nodes);
         assert_eq!(matched.len(), 1);
@@ -133,7 +136,7 @@ fn disappeared_node_fails_closed_instead_of_using_another_exit() {
     let cfg = config(&providers, &nodes);
     let others = [node("one", "another", 19102), node("two", "gone", 19103)];
     assert!(matching_nodes(&cfg, &cfg["listeners"][0], &others).is_empty());
-    for group in cfg["proxy-groups"].as_array().expect("groups") {
+    for group in cfg["proxy-groups"].as_array().expect("groups").iter().filter(|group| group["name"] != TEST_GROUP_NAME) {
         assert_eq!(group["type"], "select");
         assert_eq!(group["empty-fallback"], "REJECT");
         assert!(group.get("proxies").is_none(), "不能附带其他出口作为候选");
@@ -171,26 +174,14 @@ fn routing_fix_preserves_loopback_ports_and_subscription_settings() {
 
 #[test]
 fn historical_ports_survive_reordered_nodes_and_subscription_names() {
-    let mut providers = [provider("one"), provider("two")];
-    providers[0].name = "重命名后的订阅".to_string();
     let ports = json!({"one::alpha": 19123, "one::beta": 19147, "two::alpha": 19162});
-    let reordered = [
-        ("two".to_string(), vec!["alpha".to_string()]),
-        (
-            "one".to_string(),
-            vec!["beta".to_string(), "alpha".to_string()],
-        ),
-    ];
-    // 所有节点都有历史端口，此用例不进行端口探测、不启动监听器。
-    let targets = allocate_listeners(&providers, ports.as_object().expect("ports"), &reordered)
-        .expect("应沿用历史端口");
-    assert_eq!(targets.len(), 3);
-    for target in targets {
-        assert_eq!(
-            json!(target.port),
-            ports[node_key(&target.provider_id, &target.node)]
-        );
-    }
+    let mut state = json!({"ports": ports});
+    let targets = [node("two", "alpha", 19162), node("one", "beta", 19147)];
+    // 纯端口注册表测试，不探测真实端口或访问内核。
+    write_ports(&mut state, &targets);
+    assert_eq!(state["ports"], ports);
+    prune_ports(&mut state, &[provider("one")]);
+    assert_eq!(state["ports"], json!({"one::alpha": 19123, "one::beta": 19147}));
 }
 
 #[test]
@@ -213,6 +204,39 @@ fn bootstrap_without_cached_nodes_has_no_dangling_groups() {
 /// —— 「本地配置不参与定时刷新」就落在这一点上（http provider 才有 interval
 /// 与 health-check）。同时确认两者用的是同一个缓存路径：导入时写进去的文件
 /// 就是内核读到的文件。
+#[test]
+fn unified_test_port_uses_exact_groups_without_allocating_node_ports() {
+    let mut nodes = [node("one", "same`[name]", 19101), node("two", "same`[name]", 19102)];
+    nodes[0].port = None;
+    nodes[1].port = None;
+    let cfg = config(&[file_provider("one"), provider("two")], &nodes);
+    assert_eq!(cfg["listeners"].as_array().unwrap().len(), 1);
+    assert_eq!(cfg["listeners"][0]["name"], TEST_LISTENER_NAME);
+    assert_eq!(cfg["listeners"][0]["port"], 19080);
+    let test = cfg["proxy-groups"].as_array().unwrap().iter()
+        .find(|group| group["name"] == TEST_GROUP_NAME).unwrap();
+    assert_eq!(test["proxies"].as_array().unwrap().len(), 2);
+    for target in &nodes {
+        let alias = group_of_key(&node_key(&target.provider_id, &target.node));
+        assert!(test["proxies"].as_array().unwrap().contains(&json!(alias)));
+        let matched = matching_nodes(&cfg, &json!({"proxy": alias}), &nodes);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].provider_id, target.provider_id);
+    }
+    assert!(cfg.get("proxies").is_none(), "不能留下过期的内联节点定义");
+}
+
+#[test]
+fn legacy_file_without_content_never_becomes_http() {
+    let mut legacy = file_provider("legacy");
+    legacy.kind = "file".to_string();
+    legacy.content.clear();
+    let cfg = config(&[legacy], &[]);
+    assert_eq!(cfg["proxy-providers"]["sub_legacy"]["type"], "file");
+    assert!(cfg["proxy-providers"]["sub_legacy"].get("url").is_none());
+    assert!(cfg["proxy-providers"]["sub_legacy"].get("interval").is_none());
+}
+
 #[test]
 fn local_file_provider_has_no_refresh_interval() {
     let cfg = config(&[provider("link"), file_provider("local")], &[]);

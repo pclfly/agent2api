@@ -50,6 +50,17 @@ export type UpdateInfo = {
   checkedAt?: number
   /** 仅 getUpdateStatus 有：后端定时任务还没查过时为 false */
   checked?: boolean
+  /* ── 容器内更新（Linux headless / Docker 专有，桌面端恒为 false/null）──
+   * 与上面 asset 是两条路：asset 是桌面安装包（下完由壳跑安装程序），
+   * 下面这几个是「在本容器里原地替换程序与界面」的形态。 */
+  /** 本部署能不能原地更新（平台 + AGENT2API_SELF_UPDATE 开关），与具体版本无关 */
+  selfUpdate?: boolean
+  /** 这一版 release 里对应本机架构的更新包；null = 该版本没提供（面板退回手动升级提示） */
+  serverAsset?: { url?: string; name?: string; size?: number } | null
+  /** 存在上一版本的备份（更新过的部署才有），回滚按钮的显隐依据 */
+  backupAvailable?: boolean
+  /** 更新已应用到容器内、只差重启（面板据此把按钮换成「立即重启」） */
+  pendingRestart?: boolean
 }
 
 /** 下载任务快照（downloadUpdate / updateProgress 的返回） */
@@ -129,6 +140,23 @@ export type UpdateBridge = {
     path: string,
     restart: boolean,
   ): Promise<{ launched?: boolean; path?: string; restart?: boolean } | null | undefined>
+  /* ── 容器内更新（Linux headless / Docker）：这三条只有网页桥实现 ──
+   * 桌面壳没有它们（桌面的安装是 runInstaller 跑安装包），所以调用点都用
+   * 可选调用 + selfUpdate 判定兜住。 */
+  /** 校验并应用已下载的更新包（替换二进制与 ui 目录；重启后生效） */
+  installUpdate?(): Promise<{
+    applied?: boolean
+    version?: string
+    needRestart?: boolean
+    uiUpdated?: boolean
+  } | null | undefined>
+  /** 回滚到上一版本（用上次 install 留下的备份） */
+  rollbackUpdate?(): Promise<{
+    restored?: boolean
+    needRestart?: boolean
+  } | null | undefined>
+  /** 请求重启进程（容器由 restart 策略拉起，页面随后自动刷新） */
+  restartService?(): Promise<{ restarting?: boolean } | null | undefined>
   /** 打开外链的唯一出口（只放行 http(s)，见 commands.rs） */
   openReleasePage(url: string): Promise<{ url?: string } | null | undefined>
 }
@@ -169,16 +197,14 @@ export function toast(message: string, kind?: 'err' | 'ok'): void {
   shared().wbApp?.toast?.(message, kind)
 }
 
-/**
- * 是否 headless 网页面板（Docker / 自托管，`platform === 'web'`）。
- *
- * 网页端只**读**版本号，不提供下载与安装：那条链是壳命令（download_update /
- * run_installer），web_shim 里明确拒绝。界面据此收起下载按钮与「检测到更新」
- * 弹窗，免得给出一个点了必然报错的入口。桥拿不到 platform（浏览器直开）时按
- * 非网页端处理，与 settings-state 的 readPanelLogin 同一取向。
- */
+/** 是否 headless 网页面板；更新能力另外由服务端 selfUpdate 声明决定。 */
 export function isWebPanel(): boolean {
   return shared().workbuddyDesktop?.platform === 'web'
+}
+
+/** Web 默认只读；只有后端明确开放 selfUpdate 才能下载、安装或重启。 */
+export function canManageUpdate(info: UpdateInfo | null | undefined): boolean {
+  return !isWebPanel() || info?.selfUpdate === true
 }
 
 export function errorMessage(error: unknown): string {

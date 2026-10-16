@@ -4,7 +4,7 @@
 //!
 //! | 身份 | X-IDE-Type | X-Product | UA 形态 | 端点（国内版） |
 //! |------|-----------|-----------|---------|----------------|
-//! | WB（默认） | WorkBuddy | WorkBuddy / WorkBuddy AI | `WorkBuddy/… WorkBuddy AI/… CLI/…` | copilot.tencent.com |
+//! | WB（默认） | WorkBuddy | SaaS | `WorkBuddy/… WorkBuddy AI/… CLI/…` | copilot.tencent.com |
 //! | VSC | VSCode | SaaS | `VSCode/1.119.0 WorkBuddy/4.9.…` | **www.workbuddy.cn** |
 //! | CLI | CLI | SaaS | `CLI/2.117.2 CodeBuddy/2.117.2` | copilot.tencent.com |
 //!
@@ -106,34 +106,25 @@ pub fn identity_domain(edition: &EditionInfo, product: Product) -> &'static str 
 
 /// 构造**身份头**（不含鉴权与会话追踪之外的业务头）。
 ///
-/// `request_id` 是本次转发的追踪 id（调用方生成）——三个身份都把它同时用作
-/// 会话与请求追踪（与 `chat_headers` 的既有口径一致）。
-///
-/// ── 与 hub 的一处刻意差异 ───────────────────────────────────
-/// WB 身份**沿用 agent2api 既有头集**（`X-Agent-Intent: craft` + 四个追踪头），
-/// 不照抄 hub 的 `X-Agent-Purpose: conversation`：既有头集是 Node 版逐字移植
-/// 并经线上验证的，换头有回归风险；VSC / CLI 才按 hub 的新口径构造。
+/// 只负责 UA / IDE / 产品身份。会话与链路追踪由 `chat_headers` 统一生成，
+/// 三种身份共用 5.8.4 会话头族；桌面身份使用地区的 chat 专用版本与 UA，
+/// VSC / CLI 保留各自版本和域名，不能被桌面端指纹覆盖。
 pub fn identity_headers(
     product: Product,
     edition: &EditionInfo,
-    request_id: &str,
 ) -> Vec<(String, String)> {
     match product {
         Product::Wb => vec![
             ("Content-Type".to_string(), "application/json".to_string()),
             (
                 "User-Agent".to_string(),
-                crate::server::core::endpoints::user_agent_for_edition(Some(edition.id)),
+                edition.chat_ua.to_string(),
             ),
             ("X-IDE-Type".to_string(), edition.ua_platform.to_string()),
-            ("X-IDE-Name".to_string(), edition.product_name.to_string()),
-            ("X-IDE-Version".to_string(), edition.client_version.to_string()),
-            ("X-Product".to_string(), edition.product_name.to_string()),
+            ("X-IDE-Name".to_string(), edition.ua_platform.to_string()),
+            ("X-IDE-Version".to_string(), edition.chat_ide_version.to_string()),
+            ("X-Product".to_string(), "SaaS".to_string()),
             ("X-Agent-Intent".to_string(), "craft".to_string()),
-            ("X-Request-ID".to_string(), request_id.to_string()),
-            ("X-Conversation-Request-ID".to_string(), request_id.to_string()),
-            ("X-Conversation-ID".to_string(), request_id.to_string()),
-            ("X-Session-ID".to_string(), request_id.to_string()),
         ],
         Product::Vsc => vec![
             ("Content-Type".to_string(), "application/json".to_string()),
@@ -152,10 +143,6 @@ pub fn identity_headers(
                 "X-Domain".to_string(),
                 identity_domain(edition, product).to_string(),
             ),
-            ("X-Request-ID".to_string(), request_id.to_string()),
-            ("X-Conversation-Request-ID".to_string(), request_id.to_string()),
-            ("X-Conversation-ID".to_string(), request_id.to_string()),
-            ("X-Conversation-Message-ID".to_string(), request_id.to_string()),
         ],
         Product::Cli => vec![
             ("Content-Type".to_string(), "application/json".to_string()),
@@ -172,10 +159,6 @@ pub fn identity_headers(
                 "X-Domain".to_string(),
                 identity_domain(edition, product).to_string(),
             ),
-            ("X-Request-ID".to_string(), request_id.to_string()),
-            ("X-Conversation-Request-ID".to_string(), request_id.to_string()),
-            ("X-Conversation-ID".to_string(), request_id.to_string()),
-            ("X-Conversation-Message-ID".to_string(), request_id.to_string()),
         ],
     }
 }
@@ -227,13 +210,13 @@ mod tests {
     fn identity_headers_carry_distinct_fingerprints() {
         let cn = resolve_edition(Some("cn"));
         let header = |product, name: &str| -> String {
-            identity_headers(product, cn, "req-1")
+            identity_headers(product, cn)
                 .into_iter()
                 .find(|(key, _)| key == name)
                 .map(|(_, value)| value)
                 .unwrap_or_default()
         };
-        // WB：保持既有头集
+        // WB：使用升级后的桌面身份
         assert_eq!(header(Product::Wb, "X-IDE-Type"), "WorkBuddy");
         assert_eq!(header(Product::Wb, "X-Agent-Intent"), "craft");
         // VSC

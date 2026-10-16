@@ -19,7 +19,7 @@
 .log-filters #req-provider { max-width: 168px; }
 .log-filters #req-model { max-width: 200px; }
 
-/* 十列：时间 / 提供商·账号 / 重试 / 状态 / 模型 / 用时 / 用量 / 消耗 / 错误 / 详情。
+/* 十一列：时间 / 提供商·账号 / 重试 / 状态 / 模型 / 客户端 / 用时 / 用量 / 消耗 / 错误 / 详情。
    时间与用时定宽（等宽数字 + tabular-nums，竖着比对才齐），
    其余占弹性宽度（都是不定长内容，给固定宽度会互相挤）：
    模型 1.3fr（claude-sonnet-4-5 这类名字要放得下），
@@ -28,6 +28,7 @@
    与「用时」同款定宽 —— 竖着比对哪次扣得多。
    状态 96px：进行中的行有两行（阶段徽章 + 阶段计时），而徽章最长是
    「等待响应」四个字（约 76px）—— 68px 那一版会把它压成省略号。
+   客户端 110px：最长的一档是「GitHub Copilot」（约 90px），再留一点余量。
    详情列定宽（只有一个「详情」按钮或一个「-」）。
 
    --req-cols 是用户拖过的列宽（table-columns.js 写在 #req-list 上，靠继承
@@ -40,7 +41,7 @@
 .req-head {
   display: grid;
   grid-template-columns: var(--req-cols,
-    92px minmax(0, 1.1fr) 52px 96px minmax(0, 1.3fr) 96px minmax(0, 1.6fr) 96px minmax(0, 1.2fr) 60px);
+    92px minmax(0, 1.1fr) 52px 96px minmax(0, 1.3fr) 110px 96px minmax(0, 1.6fr) 96px minmax(0, 1.2fr) 60px);
   gap: 12px;
   align-items: center;
   padding: 10px 14px;
@@ -306,6 +307,20 @@
   white-space: nowrap;
 }
 
+/* 客户端：产品名（Codex / Claude Code …），普通文本 + 尾部省略。
+   与提供商 / 账号同档字号，不用等宽（它不是标识符）。 */
+.req-row .req-client {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 无客户端记录（旧行 / 模型测试 / 请求未带 UA）：破折号，与 target 列的占位同一手法 */
+.req-row .req-client.is-empty { color: var(--text-3); }
+
 /* 上下名分行的形态（转发名 ≠ 请求名时，如映射 / 备援改写）：
    ⬆️ 上游实际收到的名字（主读数）在上，⬇️ 下游请求的名字（淡一档）在下 ——
    与用时列的两行结构同一手法；单行请求不受影响（类不出现）。 */
@@ -428,6 +443,7 @@
   .req-head .req-status { grid-row: 1; grid-column: 3 / 4; }
   .req-head .req-retry { grid-row: 1; grid-column: 4 / 5; }
   .req-head .req-target,
+  .req-head .req-client,
   .req-head .req-dur,
   .req-head .req-usage,
   .req-head .req-credit,
@@ -444,6 +460,9 @@
   /* 第三行：用量铺开 + 消耗贴右（用量让出最右一格给消耗，两行读数仍比列宽宽） */
   .req-row .req-usage { grid-row: 3; grid-column: 1 / 4; }
   .req-row .req-credit { grid-row: 3; grid-column: 4 / 5; }
+  /* 第四行：客户端（左，跨到详情按钮之前）+ 详情（贴右）。
+     客户端不挤进第二行 —— 那一行右侧已经给了用时，96px 装不下「GitHub Copilot」 */
+  .req-row .req-client { grid-row: 4; grid-column: 1 / 4; }
   .req-row .req-detail { grid-row: 4; grid-column: 4 / 5; justify-self: end; }
   /* 「-」占位不再独占一行：窄窗口下空行比省略号更难解释 */
   .req-row .req-error-cell { display: none; }

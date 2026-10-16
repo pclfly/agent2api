@@ -9,6 +9,14 @@
 //!   GET  /api/update/token                 GitHub 令牌状态 { filled, origin }（不回显本体）
 //!   POST /api/update/token                 保存 / 清除 GitHub 令牌 { token: string | null }
 //!
+//! ── 容器内更新的三条（Linux headless / Docker 专有）──────────
+//!   POST /api/update/install               校验并应用已下载的更新包（替换二进制与 ui）
+//!   POST /api/update/rollback              回滚到上一版本（用 install 留下的备份）
+//!   POST /api/update/restart               重启进程（容器由 restart 策略拉起）
+//! 三条都要求 `AGENT2API_SELF_UPDATE=1`，否则 400；机制见 `core::update::selfupdate`。
+//! `check` 的 `current` 缺省（网页端不传）时用服务端自己的版本号 —— 桌面壳一定
+//! 会传（后端不知道自己被哪个壳打包，那个口径不能变），所以只有网页端走缺省。
+//!
 //! ── 路由挂法 ────────────────────────────────────────────────
 //! Node 是 `path.startsWith('/api/update/')` 的前缀判定：命中前缀后逐条判
 //! 方法与路径，都不匹配则落到最外层 404（**不带** `success` 信封的
@@ -101,6 +109,16 @@ async fn dispatch(
         };
         let raw = payload.get("proxy").cloned().unwrap_or(Value::Null);
         return match normalize_account_proxy(&raw) {
+            // 轮询档只属于**账号级**出网（逐请求换出口，见 `core::proxy_rotate`）：
+            // 软件更新是一条检查 / 下载动作，没有这个语义。归一放行它（那份归一
+            // 与账号共用）之后必须在这里挡下 —— 否则会存进一条解析不出地址的
+            // 配置，检查更新静默回退直连（界面上却显示「已换线路」）。
+            Ok(Some(value)) if crate::server::core::proxies::is_rotate_config(&value) => {
+                GatewayError::bad_request(
+                    "更新出网线路不支持「轮询」档（轮询用于 OpenCode Zen 账号的出网）",
+                )
+                .into_response()
+            }
             Ok(normalized) => {
                 // 「换」才算数：重复选中当前线路不该被当成换线路（否则就成了
                 // 绕开失败冷却的口子，见下面 clear_check_cooldown 的说明）
@@ -165,6 +183,16 @@ async fn dispatch(
         };
     }
 
+    // 下载入口也遵循部署能力：headless 默认只读，桌面安装器不受此闸门影响。
+    // install / rollback / restart 在 core 层还会逐次检查相同能力。
+    if method == Method::POST
+        && full_path == "/api/update/download"
+        && state.ui_dir().is_some()
+        && !crate::server::core::update::selfupdate::supported()
+    {
+        return management_error(400, "当前部署未开放原地更新，请设置 AGENT2API_SELF_UPDATE=1 并确认平台支持");
+    }
+
     if method == Method::POST && full_path == "/api/update/download" {
         // 非法 JSON 在 Node 里是 JSON.parse 抛错 → errorPayload 500 proxy_error
         // （与 /api/auto-checkin 同一条路径），这里保持一致
@@ -191,6 +219,35 @@ async fn dispatch(
 
     if method == Method::POST && full_path == "/api/update/cancel" {
         return ok_json(state.update().cancel_download());
+    }
+
+    // ── 容器内更新（Linux headless / Docker）────────────────────
+    // 三条都不接受请求体：装什么、回滚到哪儿、重启谁，全部由服务端自己决定
+    // （更新包按固定名从下载目录取，路径不从请求里进 —— 见 core::update::mod）。
+    // 界面目录取自 ServerState（headless 入口 set_ui_dir 装进去的），
+    // 桌面包没有它（None）—— 桌面形态本来也不会走到这三条。
+
+    if method == Method::POST && full_path == "/api/update/install" {
+        let ui_dir = state.ui_dir().map(|path| path.as_path());
+        return match state.update().install_downloaded(ui_dir).await {
+            Ok(data) => ok_json(data),
+            Err(error) => update_error(error),
+        };
+    }
+
+    if method == Method::POST && full_path == "/api/update/rollback" {
+        let ui_dir = state.ui_dir().map(|path| path.as_path());
+        return match state.update().rollback(ui_dir) {
+            Ok(data) => ok_json(data),
+            Err(error) => update_error(error),
+        };
+    }
+
+    if method == Method::POST && full_path == "/api/update/restart" {
+        return match state.update().request_restart() {
+            Ok(data) => ok_json(data),
+            Err(error) => update_error(error),
+        };
     }
 
     // 未命中任何一条 → 全局 404 的文案（Node 落到最外层 `sendJson(res, 404, …)`），

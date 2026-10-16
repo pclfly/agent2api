@@ -49,6 +49,7 @@ import {
   manualTitleOf,
   maxLengthOf,
   methodsOf,
+  platform,
   type FieldSpec,
   type MethodId,
   type ProviderConfig,
@@ -626,6 +627,172 @@ export function ProviderBlock({
   )
 }
 
+/* ─── WorkBuddy 导入凭证文件 ─────────────────── */
+
+/** 官方客户端凭证目录（点「凭证文件在哪」时显示；国内版 / 国际版共用同一目录） */
+const WORKBUDDY_AUTH_PATH = t(
+  '官方客户端凭证目录：Windows 是 C:\\Users\\<你的用户名>\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth，macOS 是 ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth',
+)
+
+/** 备注名输入框的 id（草稿按 id 存，见 add-account-bridge 的 draft 机制） */
+const WORKBUDDY_FILE_NAME_ID = 'workbuddy-file-name'
+
+/**
+ * 从凭证对象取字段：先读嵌套对象（`auth` / `account`，官方 `.info` 与 wb2api
+ * 的嵌套形），读不到再读顶层键（wb2api 的手写扁平形）。键名清单与后端
+ * `store_crud::add_account` 的取值口径一致，前端先挡一道是为了把「粘错文件」
+ * 变成一句人话，而不是后端 400 的「缺少 accessToken」。
+ */
+function credentialFieldOf(
+  record: Record<string, unknown>,
+  keys: string[],
+  nestedKey: string,
+): string {
+  const nested = record[nestedKey]
+  const sources: Array<Record<string, unknown>> = []
+  if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+    sources.push(nested as Record<string, unknown>)
+  }
+  sources.push(record)
+  for (const source of sources) {
+    for (const key of keys) {
+      const value = source[key]
+      if (typeof value === 'string' && value.trim()) return value.trim()
+    }
+  }
+  return ''
+}
+
+/** 按文件内容推断归属：`auth.domain`（官方 .info）或顶层 `domain`（扁平形） */
+function editionFromFile(record: Record<string, unknown>): Edition | null {
+  const domain = credentialFieldOf(record, ['domain'], 'auth')
+  if (/workbuddy\.ai/i.test(domain)) return 'intl'
+  if (/workbuddy\.cn|codebuddy\.cn/i.test(domain)) return 'cn'
+  return null
+}
+
+/**
+ * 「导入凭证文件」段（WorkBuddyBlock 专用）：
+ *   ① 选文件导入 —— 官方客户端登录态（`.info`）或 wb2api 的账号 JSON；
+ *   ② 从本机官方客户端读取 —— 后端扫描官方凭证目录（importDesktop 链路）。
+ * 归属（国内版 / 国际版）优先按文件内容的 domain 推断：文件自己的事实比
+ * 「账号版本」分段更权威，推不出才用分段当前值。
+ */
+function WorkBuddyFileImportSection({ edition }: { edition: Edition }): React.ReactElement {
+  const [busy, setBusy] = React.useState(false)
+  const [hint, setHint] = React.useState('')
+  const fileInput = React.useRef<HTMLInputElement | null>(null)
+
+  async function importParsed(file: File): Promise<void> {
+    await runAdd(setBusy, async () => {
+      try {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(await file.text())
+        } catch {
+          toast(t('选择的文件不是合法 JSON'), 'err')
+          return
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          toast(t('不是有效的凭证文件：内容要是一个 JSON 对象'), 'err')
+          return
+        }
+        const record = parsed as Record<string, unknown>
+        const accessToken = credentialFieldOf(record, ['accessToken', 'token', 'access_token'], 'auth')
+        const uid = credentialFieldOf(record, ['uid'], 'account')
+        if (!accessToken || !uid) {
+          toast(t('不是有效的凭证文件：需要包含 accessToken 与 uid'), 'err')
+          return
+        }
+        const fromFile = editionFromFile(record)
+        const landed = fromFile ?? edition
+        if (fromFile && fromFile !== edition) {
+          toast(
+            t('文件是{edition}凭证，已按该版本导入', {
+              edition: fromFile === 'intl' ? t('国际版') : t('国内版'),
+            }),
+            'warn',
+          )
+        }
+        const remark = readField(WORKBUDDY_FILE_NAME_ID)
+        const payload: Record<string, unknown> = { ...record, provider: workbuddyProviderId(landed) }
+        if (remark) payload.name = remark
+        const data = (await postAccount(payload)) as { account?: AccountRecord } | null
+        setHint('')
+        await afterAdd(addedLabelOf(data?.account), landed === 'intl' ? 'WorkBuddy AI' : 'WorkBuddy')
+      } catch (error) {
+        toast(t('导入失败：{reason}', { reason: describeError(error) }), 'err')
+      }
+    })
+  }
+
+  async function importFromDesktop(): Promise<void> {
+    await runAdd(setBusy, async () => {
+      try {
+        const data = (await postAccount({
+          provider: workbuddyProviderId(edition),
+          importDesktop: true,
+        })) as { account?: AccountRecord } | null
+        await afterAdd(addedLabelOf(data?.account), edition === 'intl' ? 'WorkBuddy AI' : 'WorkBuddy')
+      } catch (error) {
+        // 读不到官方客户端登录态时后端给 400 + 明确原因，原样透出即可
+        toast(t('导入失败：{reason}', { reason: describeError(error) }), 'err')
+      }
+    })
+  }
+
+  return (
+    <DialogSection>
+      <h3>{t('导入凭证文件')}</h3>
+      <Note text={t('选择官方客户端的登录态凭证文件（workbuddy-desktop.info / workbuddy-desktop-ai.info）或 wb2api 导出的账号 JSON（嵌套 / 扁平形均可），也可以直接从本机官方客户端读取。')} />
+      <p className='detail'>
+        <a
+          href='#'
+          onClick={event => {
+            event.preventDefault()
+            setHint(WORKBUDDY_AUTH_PATH)
+          }}
+        >
+          {t('凭证文件在哪？')}
+        </a>
+      </p>
+      <div className='field-row'>
+        <label className='lb-inline' htmlFor={WORKBUDDY_FILE_NAME_ID}>{t('备注名')}</label>
+        <Input
+          id={WORKBUDDY_FILE_NAME_ID}
+          type='text'
+          maxLength={100}
+          placeholder={t('可选，留空则用文件里的昵称')}
+          {...draftProps(WORKBUDDY_FILE_NAME_ID)}
+        />
+      </div>
+      <div className='field-row'>
+        <input
+          ref={fileInput}
+          type='file'
+          accept='.info,.json,application/json'
+          hidden
+          onChange={event => {
+            const file = event.target.files?.[0]
+            // 清空 value：同一份文件改内容后再选一次也要能触发 onChange
+            event.target.value = ''
+            if (file) void importParsed(file)
+          }}
+        />
+        <Button onClick={() => fileInput.current?.click()} disabled={busy}>
+          {busy ? t('导入中…') : t('选择凭证文件导入')}
+        </Button>
+        {platform() !== 'web' ? (
+          <Button variant='outline' onClick={() => void importFromDesktop()} disabled={busy}>
+            {t('从本机导入桌面端登录态')}
+          </Button>
+        ) : null}
+        <span className='detail'>{hint}</span>
+      </div>
+    </DialogSection>
+  )
+}
+
 /**
  * 账号版本 → provider id。
  *
@@ -801,6 +968,8 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
           </span>
         </div>
       </DialogSection>
+
+      <WorkBuddyFileImportSection edition={edition} />
     </div>
   )
 }

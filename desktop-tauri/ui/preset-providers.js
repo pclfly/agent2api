@@ -39,6 +39,17 @@
    *   account  该家账号的默认取值（表单里的初始勾选态，用户可改）：
    *            · noAuth —— 「该上游无需鉴权」预勾选（无需 API Key 的家里预勾上；
    *              用户一填 Key 就自动取消，见 add-custom-provider.tsx）
+   *   placeholder  Base URL 输入框的占位提示（自建面板没有固定地址时给一句
+   *            「填你自己的站点」；缺省按协议算的那句，见 add-custom-provider）
+   *   balance  该家的**余额查询方案**（`{ scheme }`，取值与后端
+   *            `custom_providers::BALANCE_SCHEMES` 逐字一致）：创建时随记录写入
+   *            `balanceScheme`，后端据此选查询链路；界面按方案渲染要补的凭证
+   *            输入框（方案与字段说明见 ui-islands 的 balance-query.tsx）。
+   *            没有这个键的家 = 不查余额（手工新建的家也一样）。
+   *
+   * 六种方案分别对应：sub2api / new_api / deepseek / opencode（OpenCode Go）/
+   * sensenova（商汤日日新）/ zhipu（智谱）。**方案不是用户选的**，是这张卡
+   * 「这一家是谁」的派生事实 —— 所以它写在这里，不在表单里给下拉。
    *
    * ── quirks 的取值（抄自 9Router 各家适配器，后端 customProviders 记录的字段）──
    *   urlSuffix          原样追加到出站 URL 的查询串（GLM / MiniMax 的
@@ -100,17 +111,29 @@
       key: 'deepseek', name: 'DeepSeek', icon: 'deepseek.png',
       protocol: P.openai, baseUrl: 'https://api.deepseek.com',
       hint: wbI18n.t('Anthropic 兼容端点在 https://api.deepseek.com/anthropic（协议换 anthropic 时填它）'),
+      // 余额查询方案（后端 custom_providers::BALANCE_SCHEME_DEEPSEEK）：
+      // 用该账号的 API Key 打 {base}/user/balance，**不需要额外配置** ——
+      // 表单里因此不会多出任何输入框（见 ui-islands 的 balance-query）
+      balance: { scheme: 'deepseek' },
     },
     {
       key: 'glm', name: 'GLM Coding', icon: 'glm.png',
       protocol: P.anthropic, baseUrl: 'https://api.z.ai/api/anthropic',
       hint: wbI18n.t('国际版 z.ai 的 Coding 套餐；OpenAI 兼容地址为 https://api.z.ai/api/coding/paas/v4'),
       quirks: { urlSuffix: '?beta=true', headers: { ...ANTHROPIC_BETA_HEADERS } },
+      // 智谱国际站余额查询（后端 BALANCE_SCHEME_ZHIPU_ZAI）：用该账号的 API Key
+      // 现场铸 SIGN 签名打 api.z.ai 的账户报告接口（美元），**不需要额外配置**
+      //（国内站 glm-cn 走的是另一条控制台令牌链路，两个方案不是一回事）
+      balance: { scheme: 'zhipu_zai' },
     },
     {
       key: 'glm-cn', name: 'GLM 中国', icon: 'glm-cn.png',
       protocol: P.openai, baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
       hint: wbI18n.t('智谱 bigmodel.cn 的 Coding 套餐，Key 在 open.bigmodel.cn/usercenter/apikeys'),
+      // 智谱余额查询（后端 BALANCE_SCHEME_ZHIPU）：打 bigmodel.cn **控制台**
+      // 账户余额（人民币元），用的是控制台令牌而不是这里的 API Key ——
+      // 表单里会出现一个「访问令牌」输入框（见 balance-query 的方案说明）
+      balance: { scheme: 'zhipu' },
     },
     {
       key: 'minimax', name: 'Minimax Coding', icon: 'minimax.png',
@@ -169,8 +192,15 @@
     },
     {
       key: 'opencode-go', name: 'OpenCode Go', icon: 'opencode-go.png',
+      // Go 面与免费档的要求不同：网关按端点自动补上游要求的会话头
+      // （x-opencode-session）与产品 UA，**不需要开伪装开关**（那是 Zen
+      // 免费档的，Go 面拒绝被塞桩工具）。见后端 emulation 的「Go 面」一节。
       protocol: P.openai, baseUrl: 'https://opencode.ai/zen/go/v1',
       hint: wbI18n.t('同地址换 anthropic 协议即走它的 Claude 兼容端点。转发必须填 OpenCode Go 的 API Key（订阅制；获取模型清单不需要 Key，但发请求上游会回 401「Missing API key」）'),
+      // OpenCode Go 余额查询（后端 BALANCE_SCHEME_OPENCODE）：用该账号的
+      // API Key 打 {base}/v1/usage，读滚动 / 每周 / 每月三个窗口的剩余百分比，
+      // **不需要额外配置**（免费档 OpenCode Zen 不在这一列：它没有余额接口）
+      balance: { scheme: 'opencode' },
     },
     {
       key: 'opencode-zen', name: 'OpenCode Zen', icon: 'opencode-zen.png',
@@ -188,6 +218,36 @@
       protocol: P.openai, baseUrl: 'http://localhost:11434/v1',
       hint: wbI18n.t('本机 Ollama 的 OpenAI 兼容端点，无需 API Key（默认已勾上「该上游无需鉴权」，鉴权头一个都不发）'),
       account: { noAuth: true },
+    },
+
+    // ── 自建聚合面板与商汤日日新（随余额查询一起接入）─────────────
+    // 这三家排在末尾：既有的卡片顺序不动（用户对第 1 步的网格已有肌肉记忆），
+    // 新卡按「后到居后」追加。sub2api / NewAPI 是**自建**面板，没有固定
+    // baseUrl —— 预置卡只预填名称 / 协议，地址由用户自己填（`placeholder`
+    // 是给那个输入框的提示，见 add-custom-provider 的预填逻辑）。
+    // 三家的 `balance.scheme` 见文件头的字段说明。
+    // 图标出处：sub2api 取官方仓库（Wei-Shaw/sub2api）的 assets/logo.svg 栅格化；
+    // NewAPI 取官方仓库（QuantumNous/new-api）的 web/public/logo.png；
+    // 商汤日日新取官网 www.sensenova.cn 的 icon.png（商汤品牌方格标）。
+    {
+      key: 'sub2api', name: 'Sub2API', icon: 'sub2api.png',
+      protocol: P.openai, baseUrl: '',
+      placeholder: 'https://你的 Sub2API 站点地址（OpenAI 兼容填到 /v1）',
+      hint: wbI18n.t('自建聚合面板：填你自己的站点地址。余额查询用该账号的 API Key 打 {base}/v1/usage，不需要额外配置'),
+      balance: { scheme: 'sub2api' },
+    },
+    {
+      key: 'newapi', name: 'NewAPI', icon: 'newapi.png',
+      protocol: P.openai, baseUrl: '',
+      placeholder: 'https://你的 NewAPI 站点地址（OpenAI 兼容填到 /v1）',
+      hint: wbI18n.t('自建聚合面板：填你自己的站点地址；余额查询要另填 NewAPI 的个人访问令牌（见下方「余额查询」一段）'),
+      balance: { scheme: 'new_api' },
+    },
+    {
+      key: 'sensenova', name: '商汤日日新', icon: 'sensenova.png',
+      protocol: P.openai, baseUrl: 'https://api.sensenova.cn/compatible-mode/v1',
+      hint: wbI18n.t('商汤日日新的 OpenAI 兼容端点；余额查询走控制台账号密码（见下方「余额查询」一段）'),
+      balance: { scheme: 'sensenova' },
     },
   ];
 

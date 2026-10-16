@@ -99,8 +99,10 @@ const RACCOON: ProviderConfig = {
   label: '小浣熊',
   addButton: t('添加小浣熊账号'),
   // 网页登录（后端 providers::raccoon::oauth）：官方登录页 + 一次性授权码回调。
-  // 桌面端仍优先用内嵌窗口；网页端 / Docker 远程面板会在授权完成后
-  // 提示用户粘贴 office-raccoon:// 回调地址，不依赖本机协议注册。
+  // 桌面端仍优先用内嵌窗口；网页端 / Docker 远程面板会把授权页切到官方
+  // redirect 分支自动回调，前提是浏览器以 127.0.0.1/localhost（http + 端口）
+  // 访问面板 —— 上游白名单如此，不满足时网页端发起前就会弹指引拦下
+  // （见 web_shim 的 raccoonCallbackOriginProblem）。
   webLogin: {
     noteHtml: t('在<strong>内嵌窗口</strong>里完成官方登录，成功后自动加入账号列表。'),
     button: t('打开网页登录'),
@@ -818,6 +820,38 @@ const QWENWORK: ProviderConfig = {
   desktopHint: t('读取 %APPDATA%/QwenWork/auth-v2.dat 与 Local State，仅 Windows'),
 }
 
+/**
+ * OrcaTerm（腾讯云遨驰终端桌面客户端）：一家一个 provider，没有地区之分。
+ *
+ * ── 凭证形态 ────────────────────────────────────────────────
+ * 微信 OAuth 登录后的一枚 JWT（`oauth_access_token`，约 2 小时时效），
+ * `Authorization: Bearer` 直达上游。粘贴支持（与后端 `orcaterm::credentials`
+ * 同口径）：裸 token、`Authorization: Bearer …` 整行、`ot_session=…`（Web 版
+ * Cookie 名），或整个 `data.bin` 的 JSON —— 网关会自己剥出 token。
+ *
+ * ── 导入桌面端 ──────────────────────────────────────────────
+ * 客户端是 Tauri 应用，登录态在 `%APPDATA%\com.orcaterm-desktop.app\data.bin`
+ * （**明文 JSON**，无需解密）。导入即复制当前令牌进账号记录，之后由网关接管。
+ *
+ * ── 有真续期接口 ───────────────────────────────────────────
+ * 上游 `OAuthRefreshToken` 传旧 token 即可换新（2026-10-16 实测），因此账号
+ * 添加后由网关自动续期，用户不需要跟着 2 小时时效手动换令牌（与 KukuAI /
+ * CatPaw「过期只能重登」不同）。令牌丢了（被顶号 / 上游拒认）才需要重新导入。
+ */
+const ORCATERM: ProviderConfig = {
+  provider: 'orcaterm',
+  label: 'OrcaTerm',
+  desktop: true,
+  desktopHint: t('读取本机 OrcaTerm 客户端登录态（%APPDATA%\\com.orcaterm-desktop.app\\data.bin），需已在 OrcaTerm 客户端登录'),
+  desktopNote: t('读本机客户端当前登录的 OAuth 令牌（明文 JSON，无需解密）。导入后由网关自动续期，无需跟随客户端的 2 小时时效手动换令牌。'),
+  manualTitle: t('粘贴 accessToken'),
+  manualNoteHtml: t('粘贴 OrcaTerm 的 OAuth accessToken（JWT，三段点分；从桌面客户端 <code>data.bin</code> 或 Web 版 Cookie <code>ot_session</code> 获取）。直接粘贴含 <code>Bearer</code> / <code>ot_session=</code> 的整行也行，网关会自己剥成裸 token。添加后由网关自动续期（上游有续期接口），无需跟随 2 小时时效手动更换。'),
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: t('JWT（三段点分；也可直接粘贴 Bearer 整行或 data.bin 内容）') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则用账号昵称或 userId') },
+  ],
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -862,6 +896,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   //凭据，排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   OFFICEACE,
   QWENWORK,
+  // OrcaTerm（腾讯云遨驰终端桌面客户端）：粘贴 accessToken / 导入桌面端登录态，
+  // 排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
+  ORCATERM,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

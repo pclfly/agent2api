@@ -166,7 +166,7 @@ pub async fn update_custom_provider(State(_state): State<ServerState>, body: Byt
 /// 两次快照之间**值确实变了**的字段名（只给日志用，不含值 —— apiKey 不在这里，
 /// 这些字段名都可展示）
 fn describe_changes(before: Option<&Value>, after: &Value) -> String {
-    const FIELDS: &[&str] = &["name", "protocol", "baseUrl", "enabled"];
+    const FIELDS: &[&str] = &["name", "protocol", "baseUrl", "enabled", "balanceScheme"];
     let mut changed: Vec<&str> = Vec::new();
     for field in FIELDS {
         let old = before.and_then(|item| item.get(*field));

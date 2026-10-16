@@ -1,12 +1,42 @@
-# Agent2API · マルチプロバイダー対応ローカルゲートウェイ
+<div align="center">
+
+# Agent2API
+
+**複数の AI デスクトップクライアントのログイン状態を、ローカルの OpenAI 互換 API ゲートウェイに**
 
 [简体中文](./README.md) | [English](./README.en.md) | [繁體中文](./README.zh-Hant.md) | **日本語** | [한국어](./README.ko.md) | [Português (BR)](./README.pt-BR.md)
 
-複数の AI デスクトップクライアントのログイン状態を、ローカルの **OpenAI 互換 API ゲートウェイ**としてまとめ、単一の `base_url` で公開します。マルチプロバイダーのアカウント管理、モデル管理（有効化 / 削除 / マッピング）、送信フィンガープリントの秘匿化、外向きプロキシ、リクエストレポートを備え、すぐに使える Tauri デスクトップアプリも同梱しています。カスタム `base_url` に対応した OpenAI クライアントならどれでも、`http://127.0.0.1:3065/v1` をエンドポイントにしてこれら各社のモデル枠を呼び出せます —— API キーは不要、クライアント側のソース改変も不要です。
+[![license](https://img.shields.io/badge/license-MIT%20%2B%20告知-green)](./LICENSE)
+[![release](https://img.shields.io/github/v/release/aimod-cc/agent2api?include_prereleases)](https://github.com/aimod-cc/agent2api/releases/latest)
+[![docker pulls](https://img.shields.io/docker/pulls/aimodcc/agent2api)](https://hub.docker.com/r/aimodcc/agent2api)
+[![stars](https://img.shields.io/github/stars/aimod-cc/agent2api?style=flat&color=yellow)](https://github.com/aimod-cc/agent2api/stargazers)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-blue)](https://github.com/aimod-cc/agent2api/releases/latest)
 
-各プラットフォームのリバースプロキシ対応状況（✓ 対応 · ✗ 非対応 · — 該当なし / 対象外）:
+[✨ 主な機能](#-主な機能) • [🤝 対応プロバイダー](#-対応プロバイダー) • [🚀 クイックスタート](#-クイックスタート) • [🐳 Docker デプロイ](#-docker-デプロイ) • [📸 画面プレビュー](#-画面プレビュー) • [🔧 開発とビルド](#-開発とビルド) • [📜 使用に関する告知](#-使用に関する告知)
 
-| プラットフォーム | LLM リクエスト | トークン自動更新 | モデル一覧（リモート更新） | 残高照会 | チェックイン | 受け取り系 |
+</div>
+
+---
+
+単一の `base_url` を公開し、マルチプロバイダーのアカウント管理、モデル管理、外向きプロキシ、リクエストレポートを備え、すぐに使える Tauri デスクトップアプリも同梱しています。カスタム `base_url` に対応した OpenAI クライアントならどれでも、`http://127.0.0.1:3065/v1` からこれら各社のモデル枠を呼び出せます —— **上流の API キーは不要、クライアントの変更も不要**です。
+
+## ✨ 主な機能
+
+- 🔌 **OpenAI 互換エンドポイント** —— `/v1/chat/completions`、`/v1/responses`、`/v1/messages`（`count_tokens` を含む）と `/v1/models` を 1 つのゲートウェイで公開。どのクライアントでもそのまま接続できます
+- 🏪 **内蔵 17 社のプロバイダー** —— WorkBuddy、小浣熊、CatPaw、AutoClaw、Qoder、Cline、Accio、ZCode、CodeArts、Trae、Loomy、KukuAI、MonkeyCode、Command Code、Antigravity、OfficeAce（一部は中国版 / 国際版の 2 種類）に加え、カスタムのパススループロバイダー（Chat / Responses / Anthropic）にも対応
+- 🔁 **認証情報の全自動メンテナンス** —— トークン自動更新（シングルフライト重複排除）、期限が近い認証情報の一括更新、モデルカタログのリモート更新 + 静的フォールバック
+- 🪂 **安定した転送** —— グローバル優先度アカウントキュー、モデル別レート制限クールダウン、429 自動フォールバック、決定論的な失敗は空待ちせず即スキップ
+- 🛡️ **セキュリティと秘匿化** —— 外向きプロキシ、送信フィンガープリントの秘匿化、複数のゲートウェイキー、fail-closed、ログイン時の人間確認
+- 📊 **リクエストレポート** —— リクエスト数 / 成功率 / トークン量、24 時間のキャッシュヒット率と消費トレンド、トップモデルとアカウント、365 日のアクティビティヒートマップ
+- ⏰ **スケジュールタスク** —— 自動チェックイン、認証情報メンテナンス、モデルカタログ更新などのバックグラウンドタスクを、有効 / 無効・間隔・前回結果を 1 ページで管理
+- 💰 **残高がひと目でわかる** —— アカウント行内の残高 / 使用量表示、アカウント横断の並行照会と定期スナップショット
+- 🖥️ **2 つのデプロイ形態** —— Tauri デスクトップアプリ（トレイ常駐、Node ランタイム不要）/ Docker headless（パネル + ゲートウェイを同一ポートで）。パネル UI は 6 言語対応
+
+## 🤝 対応プロバイダー
+
+各プラットフォームのリバースプロキシ対応状況（✓ 対応 · ✗ 非対応 · — 該当なし）:
+
+| プラットフォーム | LLM リクエスト | トークン自動更新 | モデル一覧 | 残高照会 | チェックイン | 受け取り系 |
 | --- | :--: | :--: | :--: | :--: | :--: | :--: |
 | WorkBuddy 中国版 | ✓ | ✓ | ✓ リモート + 静的フォールバック | ✓ | ✓ デイリーチェックイン | — |
 | WorkBuddy 国際版 | ✓ | ✓ | ✓ リモート + 静的フォールバック | ✓ | ✗ チェックインなし | — |
@@ -27,29 +57,15 @@
 | OfficeAce（Huawei Cloud、OfficeClaw） | ✓ | ✓ コントロールプレーンの自動更新 | ✓ リモートのみ | ✓ ポイント残高 | ✓ デイリーボーナス（チェックイン + 新規特典） | — |
 | カスタムプロバイダー | ✓ Chat パススルー / Responses / Anthropic | — | ✓ 手動登録 + サーバー側取得 | — | — | — |
 
-3 つの対話プロトコルの入口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、および `/v1/messages/count_tokens`）と `/v1/models` はすべてのプラットフォームで同じように扱われ、違いは各アップストリームが表の項目を実現できるかどうかだけです。モデルマッピング、グローバル優先度キュー、429 フォールバック、外向きプロキシ、送信フィンガープリントの秘匿化、リクエストレポートも全プラットフォーム共通です。
+`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（`count_tokens` を含む）と `/v1/models` はすべてのプラットフォームで同じように扱われます。モデルマッピング、グローバル優先度キュー、429 フォールバック、外向きプロキシ、送信フィンガープリントの秘匿化、リクエストレポートも全プラットフォーム共通です。
 
-> **本プロジェクトは学習・交流目的のみです。** 非公式クライアントの形態で自分のアカウントのログイン状態を再利用するため、上流サービスの規約に適合しない可能性があります。リスク（アカウントの凍結などを含む）は利用者自身が負担し、商用利用・課金の回避は禁止です。詳しくは[使用に関する告知](#使用に関する告知)と [LICENSE](./LICENSE) をご覧ください。
+> **本プロジェクトは学習・交流目的のみです。** 非公式クライアントの形態で自分のアカウントのログイン状態を再利用するため、上流サービスの規約に適合しない可能性があります。リスク（アカウントの凍結などを含む）は利用者自身が負担し、商用利用・課金の回避は禁止です。詳しくは[使用に関する告知](#-使用に関する告知)と [LICENSE](./LICENSE) をご覧ください。
 >
-> 本プロジェクトは個人用途のローカルプロキシツールであり、各上流ベンダーおよびその公式製品とは一切関係ありません（一覧は[使用に関する告知](#使用に関する告知)）。インターフェース仕様は各社クライアントの通信の観察によるもので、上流はいつでも変更される可能性があります。
+> 本プロジェクトは個人用途のローカルプロキシツールであり、各上流ベンダーおよびその公式製品とは一切関係ありません（一覧は[使用に関する告知](#-使用に関する告知)）。インターフェース仕様は各社クライアントの通信の観察によるもので、上流はいつでも変更される可能性があります。
 
----
+## 🚀 クイックスタート
 
-## 目次
-
-- [クイックスタート](#クイックスタート)
-- [Docker デプロイ](#docker-デプロイ)
-- [画面プレビュー](#画面プレビュー)
-- [プロジェクト構成](#プロジェクト構成)
-- [開発とビルド](#開発とビルド)
-- [使用に関する告知](#使用に関する告知)
-- [ライセンス](#ライセンス)
-
----
-
-## クイックスタート
-
-Releases からインストーラー（NSIS、簡体字中国語、既定では `C:\Program Files\Agent2API` にインストール、セットアップ時に管理者権限が必要）をダウンロードし、インストール後そのまま起動してください。**Node やその他のランタイムは不要です。**
+[Releases](https://github.com/aimod-cc/agent2api/releases/latest) からインストーラー（NSIS、簡体字中国語、既定では `C:\Program Files\Agent2API` にインストール、セットアップ時に管理者権限が必要）をダウンロードし、インストール後そのまま起動してください。**Node やその他のランタイムは不要です。**
 
 1. 初回起動時に、アプリのプロセス内で本機ゲートウェイ（ポート 3065）が起動し、メインウィンドウが開きます。旧バージョンのデータディレクトリやデータファイルが見つかった場合は、移行を促すダイアログが表示されるので、案内に従って操作してください。
 2. 「アカウント」ページの「アカウントを追加」をクリックし、プロバイダーを選んでダイアログの案内どおりにログインまたは認証情報を入力します（Web ログイン / SMS 認証コード / 認証情報の貼り付け / 本機のログイン状態の取り込み）。
@@ -89,9 +105,7 @@ print(resp.choices[0].message.content)
 
 既定では `127.0.0.1` のみをリッスンします。「設定 → 一般 → LAN アクセス」を有効にするとすべてのネットワークアダプターで待ち受け、LAN 内の機器は API アドレスを本機の IP に向けるだけで（画面に完全なアドレスが表示されます）アカウント群を共有できます。セキュリティのため、有効化の前にパネル管理者の登録が必要です。管理 API は管理者セッションまたはゲートウェイキーを要求し、有効なキーが無い場合は転送 API も拒否します（有効化の流れで「既定」キーが自動追加されます）。Web パネルの LAN 公開も任意で選べます（既定は非公開）。変更は再起動後に有効です。
 
----
-
-## Docker デプロイ
+## 🐳 Docker デプロイ
 
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
@@ -99,7 +113,7 @@ docker run -d --name agent2api --restart unless-stopped \
   aimodcc/agent2api:latest
 ```
 
-ブラウザーで `http://<ホスト>:3065` を開くと、初回は**管理者アカウントの登録**へ案内されます（以降のログインに使います）。ログイン後、「ゲートウェイキー」ページでクライアント用の API キーを作成してください —— `http://<ホスト>:3065/v1` が OpenAI 互換エンドポイントです。キーを作成するまで転送は拒否され、最初の 1 つを作ると自動的に復旧します。すべての状態（SQLite データベース / 設定 / ログ）は `./data` ボリューム 1 つに収まります。
+ブラウザーで `http://<ホスト>:3065` を開くと、初回は**管理者アカウントの登録**へ案内されます。ログイン後、「ゲートウェイキー」ページでクライアント用の API キーを作成してください —— `http://<ホスト>:3065/v1` が OpenAI 互換エンドポイントです（キーを作成するまで転送は拒否されます）。すべての状態（SQLite データベース / 設定 / ログ）は `./data` ボリューム 1 つに収まります。
 
 compose を使う場合（amd64 / arm64 のイメージがあります）:
 
@@ -115,7 +129,7 @@ services:
       - ./data:/data
 ```
 
-環境変数（すべて任意で、事前に用意するものはありません）:
+環境変数（すべて任意）:
 
 | 変数 | 説明 |
 | --- | --- |
@@ -124,14 +138,41 @@ services:
 | `AGENT2API_HOST` / `AGENT2API_PROXY_PORT` | リッスンアドレス（既定 `0.0.0.0`）/ ポート（既定 `3065`） |
 | `AGENT2API_ALLOW_NO_KEY` | `1` で fail-closed を無効化（キー未設定でも `/v1` を許可。純粋な内部ネットワーク限定） |
 | `AGENT2API_CAPTCHA_ENABLED` | ログインページの人間確認ウィジェット: 既定 `1`（有効）、`0` で無効 |
+| `AGENT2API_SELF_UPDATE` | コンテナ内の更新入口: 既定 `1`（有効。パネルから「ダウンロードして更新」可能）。`0` で無効化し手動更新のみに |
+| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 上級: 「更新確認 / 更新ダウンロード」を自前のソースに差し替えます。前者はリポジトリを変更（既定は上流の `aimod-cc/agent2api`。fork 後は変更可）、後者は API ルートを変更（既定 `https://api.github.com`。GitHub と同じ形の release JSON を返す必要があります）。自前ソース設定後、ダウンロードの許可リストは**そのソース自身のホスト**のみを追加で許可します（スキームはソースに従う: `http://` を設定すれば平文ダウンロードも許可。ローカル演習 / 内部ミラー向け） |
 
 ソースからビルドする場合: 本リポジトリをクローンして `docker compose up -d --build`（イメージにはゲートウェイとパネルのみが入り、Rust ツールチェーンは含まれません）。
 
+<details>
+<summary><b>更新とロールバック</b>（クリックで展開）</summary>
+
+**パネルから直接更新**: 設定 → ソフトウェア更新 → 更新を確認し、新しいバージョンが見つかったら「ダウンロードして更新」を、パッケージのダウンロード後は「インストールして再起動」をクリックします。サーバーは sha256 を検証し、コンテナ内の実行ファイルと UI ファイルを置き換えてからプロセスを再起動します —— コンテナは `restart: unless-stopped` によって再び立ち上がり（同じコンテナ、データボリュームはそのまま）、ページは数秒後に自動で再読み込みされます。前のバージョンに戻したいときは、同じパネルの「前のバージョンへロールバック」を使ってください（更新時に残されたバックアップから復元します）。
+
+知っておくべき 3 点:
+
+- **更新されるのはコンテナ内のファイルで、ローカルのイメージではありません**: compose の `image:` タグは変わらず、`docker inspect` は古いタグを表示したままです。後から `docker compose pull && docker compose up -d`（コンテナ再作成）を実行するとイメージのバージョンに戻ります。両者を揃えたい場合は、更新後に compose のタグを新しいバージョン番号に書き換えてから `docker compose pull && up -d` をもう一度実行してください。
+- 更新入口はコンテナ内でのみ現れます（`AGENT2API_SELF_UPDATE=1`。イメージでは既定で設定済み）。`0` にすれば下記の手動方法に戻ります。
+- パッケージは GitHub Release から取得します（`agent2api-server-linux-<arch>.tar.gz` + 同名の `.sha256`）。ダウンロードは「更新設定」で設定した外向き経路（更新確認と共通）を使います。国内からの直接接続が不安定な場合は、そこでプロキシを指定するか GitHub トークンを設定してください。
+
+**手動更新**（どのデプロイ形態でも使えます）:
+
+```bash
+# compose（本リポジトリの compose を使っている場合）
+docker compose pull && docker compose up -d
+
+# docker run: 新しいイメージを取得してコンテナを作り直す（データは ./data ボリュームにあり失われません）
+docker pull aimodcc/agent2api:latest
+docker rm -f agent2api
+# 上の「docker run」のコマンドをもう一度実行
+```
+
+ソースからビルドしている場合: `git pull && docker compose up -d --build`。
+
+</details>
+
 **Web パネルでの機能差**（「本機デスクトップクライアントが無い」ことに起因）: Web ログイン（WorkBuddy / Qoder / Cline）、SMS 認証コード、認証情報の貼り付けは完全に利用できます。本機へのコールバックが必要な Web ログイン（AutoClaw / CatPaw / Accio / CodeArts / Trae）と「本機ログイン状態の取り込み」は利用できないため、認証情報の貼り付けをお使いください。
 
----
-
-## 画面プレビュー
+## 📸 画面プレビュー
 
 ### アカウント
 
@@ -139,7 +180,7 @@ services:
 
 ![アカウント管理ページ: グローバルキュー、モデル別レート制限クールダウン、有効期限と残高](./assets/screenshots/accounts.png)
 
-アカウント追加はプロバイダーを選んでログインするだけ。同じプロバイダーで複数バージョンのアカウントを保持でき（例: WorkBuddy 中国版 / 国際版）、転送時はモデル名で自動選択されます:
+アカウント追加はプロバイダーを選んでログインするだけ。同じプロバイダーで複数バージョンのアカウントを保持できます（例: WorkBuddy 中国版 / 国際版）:
 
 ![アカウント追加: プロバイダーとバージョンを選び、Web ログインへ](./assets/screenshots/add-account.png)
 
@@ -159,11 +200,12 @@ services:
 
 ![スケジュールタスクページ: 自動チェックイン、認証情報メンテナンス、モデルカタログ更新などの有効 / 無効と間隔](./assets/screenshots/scheduled-tasks.png)
 
----
+## 🧱 プロジェクト構成
 
-## プロジェクト構成
+バックエンドは `src-tauri/` 配下の Rust 製インプロセス HTTP サーバー、フロントエンドは `ui/` 配下の素の HTML/CSS/JS です。
 
-ゲートウェイとデスクトップアプリはどちらも `desktop-tauri/` にあります。バックエンドは `src-tauri/` 配下の Rust 製インプロセス HTTP サーバー、フロントエンドは `ui/` 配下の素の HTML/CSS/JS です。
+<details>
+<summary>ディレクトリツリー全体（クリックで展開）</summary>
 
 ```
 agent2api/
@@ -200,7 +242,7 @@ agent2api/
 │  │  │  │  │  ├─ qoder/        Qoder: adapter / endpoints（両サイトのアドレス）/ oauth（デバイス認証）/
 │  │  │  │  │  │                auth / cosy（COSY 署名と body エンコード）/ protocol（エンベロープ復号）/
 │  │  │  │  │  │                chat（セッション方式の転送）/ stream / machine（PKCE とマシン識別）/
-│  │  │  │  │  │                credentials / refresh / models / balance
+│  │  │  │  │  │                credentials / refresh / models / balance / risk（UMID リスク管理コンポーネント）
 │  │  │  │  │  ├─ cline/        Cline: adapter（Bearer + プロダクト面ヘッダー）/ credentials（workos: 接頭辞
 │  │  │  │  │  │                + デスクトップログイン状態 + 氏名解析）/ login（WorkOS デバイス認証）/
 │  │  │  │  │  │                refresh（シングルフライト更新）/ models（2 つのクォータプール + 既定マッピング種）/
@@ -251,9 +293,9 @@ agent2api/
 │  │  │  │  │  │                fingerprint（決定論的デバイスフィンガープリントと 8h レポート）/ models /
 │  │  │  │  │  │                plan（8 キーのエンベロープと params 書き換え、session id の派生）
 │  │  │  │  │  ├─ antigravity/  Antigravity（Google、Gemini）: oauth（refresh token 更新 + シングルフライト）/
-│  │  │  │  │                   project（loadCodeAssist → onboardUser の検出）/ credentials /
-│  │  │  │  │                   endpoints（3 環境のベース URL とヘッダー集合）/ login /
-│  │  │  │  │                   models（fetchAvailableModels + 内蔵フォールバック + 上流の実名マッピング）/ adapter
+│  │  │  │  │  │                project（loadCodeAssist → onboardUser の検出）/ credentials /
+│  │  │  │  │  │                endpoints（3 環境のベース URL とヘッダー集合）/ login /
+│  │  │  │  │  │                models（fetchAvailableModels + 内蔵フォールバック + 上流の実名マッピング）/ adapter
 │  │  │  │  │  └─ officeace/    OfficeAce（Huawei Cloud、OfficeClaw）: oauth（PKCE + P-256 DPoP セルフサービスログイン）/
 │  │  │  │  │                   signer（SDK-HMAC と V11-HMAC の 2 種類の署名 + ベクター fixtures）/
 │  │  │  │  │                   credentials（ゲートウェイ Basic + コントロールプレーンの一時 AK/SK）/
@@ -296,6 +338,7 @@ agent2api/
 │  │  ├─ bridge.rs               window.workbuddyDesktop を注入するブリッジスクリプト
 │  │  └─ update.rs / settings.rs / state.rs / tray.rs
 │  ├─ ui/                        フロントエンド（素の HTML/CSS/JS、フレームワークなし）
+│  ├─ i18n/                      UI 辞書のソースとビルドスクリプト（6 言語）
 │  └─ src-tauri/tauri.conf.json  パッケージ設定（NSIS）
 ├─ build/make-icon.mjs           アプリアイコンのソース画像を生成
 ├─ assets/screenshots/           README 用の画像（UI スクリーンショット）
@@ -304,14 +347,14 @@ agent2api/
 └─ package.json                  ビルドスクリプトの入口（tauri:dev / tauri:build / build:icon）
 ```
 
----
+</details>
 
-## 開発とビルド
+## 🔧 開発とビルド
 
 ### 動作環境
 
 - Rust >= 1.77 と Tauri 2 ツールチェーン（デスクトップアプリ本体のコンパイル用。Windows では WebView2 ランタイムも必要）
-- Node.js >= 18.17（`npm run tauri:*` や `build/make-icon.mjs` といったフロントエンドのビルドスクリプトの実行のみ。デスクトップアプリは実行時に Node へ依存せず、Node の成果物も同梱しません）
+- Node.js >= 18.17（`npm run tauri:*` とフロントエンドのビルドスクリプトの実行のみ。デスクトップアプリは実行時に Node へ依存しません）
 
 ### よく使うスクリプト
 
@@ -323,11 +366,9 @@ npm run tauri:build        # デスクトップのインストーラーをビル
 npm run build:icon         # アイコンのソース画像を生成（アイコン設計を変えた後に実行し、続けて tauri icon を実行）
 ```
 
-ルートプロジェクト自体に実行時の依存はなく、`package.json` は上記のショートカットスクリプトの入口を提供するだけです。パッケージ成果物は `target/release/bundle/nsis/Agent2API_<バージョン>_x64-setup.exe`（現在およそ 3.0 MB。`src-tauri/.cargo/config.toml` が cargo の `target-dir` をプロジェクトルートの `target/` に指定しています）。
+パッケージ成果物は `target/release/bundle/nsis/Agent2API_<バージョン>_x64-setup.exe`（現在およそ 3.0 MB。`src-tauri/.cargo/config.toml` が cargo の `target-dir` をプロジェクトルートの `target/` に指定しています）。
 
----
-
-## 使用に関する告知
+## 📜 使用に関する告知
 
 ### 学習・交流目的に限る
 
@@ -349,17 +390,13 @@ npm run build:icon         # アイコンのソース画像を生成（アイコ
 
 本プロジェクトは「現状のまま」提供され、作者はその可用性、安定性、安全性、特定目的への適合性について一切保証しません。上流のインターフェースはいつでも変更される可能性があり、本プロジェクトは予告なく動作しなくなり、メンテナンスが終了する場合があります。完全な条件は [LICENSE](./LICENSE) を参照してください。本プロジェクトにおけるインターフェース仕様やプロトコルフィールドなどの情報は、各公式クライアントの公開されたネットワーク通信を観察・整理したものであり、関連する商標とサービスの権利はそれぞれの所有者に帰属します。権利者が必要以上のものであるとお考えの場合は作者までご連絡ください。速やかに調整または削除します。
 
----
-
-## ライセンス
+## 📄 ライセンス
 
 本プロジェクトは [MIT License](./LICENSE) に基づき公開されており、著作権表示を保持する限り、自由に使用・改変・配布できます。
 
 注意すべき点として、LICENSE の本文の後に**使用に関する告知**が付されており、その第 3 条が MIT に対して**制限を追加**しています（商用利用の禁止、利益目的の再配布の禁止、大量アカウント運用の禁止）。したがって本プロジェクトは**純粋な MIT ではありません** —— **MIT の条件と使用に関する告知が合わせて完全なライセンスと使用条件を構成し**、同一の行為について両者が異なる結論を出す場合は、より厳しい側が優先されます。これが `Cargo.toml` で SPDX の `"MIT"` を宣言せず、`license-file` で LICENSE を指している理由でもあります。
 
----
-
-## Star History
+## ⭐ Star History
 
 <a href="https://star-history.com/#aimod-cc/agent2api&Date">
   <picture>
@@ -368,3 +405,11 @@ npm run build:icon         # アイコンのソース画像を生成（アイコ
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
   </picture>
 </a>
+
+<div align="center">
+
+**[最新版をダウンロード](https://github.com/aimod-cc/agent2api/releases/latest)** • **[問題を報告](https://github.com/aimod-cc/agent2api/issues)**
+
+このプロジェクトが役に立ったら、⭐️ Star をもらえるとうれしいです！
+
+</div>

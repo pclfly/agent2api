@@ -319,12 +319,13 @@ pub fn panel_router(state: ServerState) -> Router {
         // ── 出网代理（Clash Verge 实时读取 + 出口连通性测试 + 代理池）──
         // /api/proxies 与 /api/proxies/pool* 之外（如 /api/proxies/zzz）不注册
         // → 落到全局 404 兜底，与 Node 版「前缀判定不通过 → 全局兜底」一致。
-        // pool 的六条都是固定路径（id 走 body / query，不用 {id} 段 ——
+        // pool 各条都是固定路径（id 走 body / query，不用 {id} 段 ——
         // 理由见 api::proxies 的模块头），方法判定在 proxies_entry 里。
         .route("/api/proxies", any(api::accounts::proxies_entry))
         .route("/api/proxies/test", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/update", any(api::accounts::proxies_entry))
+        .route("/api/proxies/pool/enable", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/remove", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/test", any(api::accounts::proxies_entry))
         // 用户禁用位：与 update 分开的入口（镜像条目也能改，见 api::proxies 的说明）
@@ -332,6 +333,7 @@ pub fn panel_router(state: ServerState) -> Router {
         // 账号侧代理下拉：只列可用条目（禁用的不进选项）
         .route("/api/proxies/pool/usable", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/sync-clash", any(api::accounts::proxies_entry))
+        .route("/api/proxies/settings", any(api::accounts::proxies_entry))
         // ── 订阅（「网络代理」页的订阅区块：机场订阅 → 内核本地监听器）──
         // 固定路径 + api::subscriptions::entry 按 (方法, 剩余段) 分发（理由同上：
         // 通配段与 404 兜底互相干扰）。内核命令是异步的（重启 / 拉订阅要几秒
@@ -349,7 +351,13 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/subscriptions/replace-file", any(api::subscriptions::entry))
         .route("/api/subscriptions/kernel", any(api::subscriptions::entry))
         .route("/api/subscriptions/kernel/download", any(api::subscriptions::entry))
+        // 停止下载是**独立一条路径**（不是 download 上的查询参数）：它是另一个
+        // 动作，且必须在下载进行中也能到达 —— 与 download 共用一条路径会让
+        // 「按方法区分」的相邻语义（POST=开始）在同一个路径上出现两种含义
+        .route("/api/subscriptions/kernel/download/cancel", any(api::subscriptions::entry))
         .route("/api/subscriptions/kernel/restart", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/stop", any(api::subscriptions::entry))
+        .route("/api/subscriptions/kernel/remove", any(api::subscriptions::entry))
         // ── 积分 / 签到 / 运营活动（对照 server.mjs 871-911 行）──
         // 六条都挂在 protected（Node 版每条都调了 checkApiKey），
         // 失败时的 body 是 OpenAI 风格（那几条在 server.mjs 的大 try 里）
@@ -455,6 +463,17 @@ pub fn panel_router(state: ServerState) -> Router {
         // 结论失败也返回 2xx（上游的错误放在响应体的 status / error 里，
         // 理由见 api::model_test 模块头）
         .route("/api/models/test", post(api::model_test::run_model_test))
+        // ── AI 助手（侧边栏「AI 助手」页 + 设置页「AI 助手」分类）──
+        // 对话那条会**真打上游、消耗额度**（与 /v1/chat/completions、
+        // /api/models/test 同一量级），设置那条写配置，三条一起挂 protected。
+        // 对话做成流式（SSE），前端必须绕开桌面壳的桥（桥无流式且 60 秒超时）
+        // 直接 fetch —— 挂在面板路由而不是 /v1/*，是为了不要求用户打开
+        // 网关面的 CORS 开关，理由见 api::assistant 模块头。
+        .route(
+            "/api/assistant/config",
+            get(api::assistant::get_config).put(api::assistant::put_config),
+        )
+        .route("/api/assistant/chat", post(api::assistant::chat))
         // ── 自定义提供商（用户自建上游端点：存储 + 管理）──
         // 与 /api/models/manage 同级敏感：写配置（customProviders 键）且「新建」
         // 会顺带写账号库，挂 protected。账号侧不经这里 —— 客户端走
@@ -528,6 +547,17 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/keepalive-strip",
             get(api::keepalive::get_keepalive_strip).put(api::keepalive::put_keepalive_strip),
+        )
+        // ── 长度截断的自动续写 ──
+        // 与 /api/keepalive-strip 同一族（GET 读 / PUT 写、默认关、改的是客户端
+        // 看得见的行为），比它多一项：一个布尔开关 + 一个有界整数（轮数上限）——
+        // 上限是续写链两道停机里那道硬保险（相似度闸是软判据），两项合起来才
+        // 决定一次请求最多打上游几回，所以挂在同一条端点上。
+        // 挂 protected 的理由与那两者相同：开着它会为一次客户端请求多打若干次
+        // 上游往返、多花账号额度（判据与代价见 core::upstream::continuation）。
+        .route(
+            "/api/auto-continue",
+            get(api::auto_continue::get_auto_continue).put(api::auto_continue::put_auto_continue),
         )
         // ── 机器人校验开关 ──
         // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：
@@ -771,7 +801,8 @@ async fn cors_gateway(request: Request, next: Next) -> Response {
     cors(request, next).await
 }
 
-/// 写入三个 CORS 头（值固定，不会失败；失败时静默跳过而不是 panic）
+/// 写入三个 CORS 头 + 一个 Private Network Access 许可（值固定，不会失败；
+/// 失败时静默跳过而不是 panic）
 fn attach_cors(headers: &mut axum::http::HeaderMap) {
     if let Ok(value) = HeaderValue::from_str("*") {
         headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
@@ -781,6 +812,19 @@ fn attach_cors(headers: &mut axum::http::HeaderMap) {
     }
     if let Ok(value) = HeaderValue::from_str(CORS_HEADERS) {
         headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value);
+    }
+    // Private Network Access（Chromium 的「页面打私有网络要先拿到许可」草案）：
+    // 桌面壳的页面 origin 是自定义协议（`http://tauri.localhost`），从它 fetch 到
+    // `http://127.0.0.1:{port}` 会被 WebView2 判为 private network request，
+    // 没有这个头时请求会被浏览器拦下 —— 页面侧看到的只是一句
+    // `TypeError: Failed to fetch`，什么原因都查不到。多回这一个头对非浏览器
+    // 客户端是空操作（它们不读 CORS 头），对已经在放行的面板路由也不收紧
+    // 任何东西 —— 这条路由的暴露面由上面的 `*` 决定，与这个头无关。
+    if let Ok(value) = HeaderValue::from_str("true") {
+        headers.insert(
+            axum::http::HeaderName::from_static("access-control-allow-private-network"),
+            value,
+        );
     }
 }
 
@@ -868,7 +912,7 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
                 if seen_headers.is_empty() { "无".to_string() } else { seen_headers.join("+") },
             ),
         );
-        return errors::panel_login_required_response();
+        return errors::panel_login_required_response(request.headers());
     }
     // ── 未注册闸门（headless 专属，桌面壳不开启）────────────────
     // 管理员还没注册（也没用环境变量预置）：/api/* 只放行 /api/panel/
@@ -886,7 +930,7 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
         if !path.starts_with("/api/panel/")
             && !(keys.iter().any(|expected| request_matches_key(&request, expected)))
         {
-            return errors::panel_login_required_response();
+            return errors::panel_login_required_response(request.headers());
         }
         return next.run(request).await;
     }

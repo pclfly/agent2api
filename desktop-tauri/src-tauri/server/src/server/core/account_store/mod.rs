@@ -113,6 +113,7 @@ pub mod loomy_accounts;
 pub mod minimax_accounts;
 pub mod monkeycode_accounts;
 pub mod officeace_accounts;
+pub mod orcaterm_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod qwenwork_accounts;
@@ -128,6 +129,7 @@ pub mod store_order;
 pub mod store_util;
 pub mod store_view;
 pub mod trae_accounts;
+pub mod workbuddy_import;
 pub mod zcode_accounts;
 
 pub use store::{AccountStore, AccountStoreError};
