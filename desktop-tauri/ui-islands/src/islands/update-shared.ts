@@ -332,8 +332,13 @@ export async function fetchProxySelection(): Promise<ProxySelection> {
     /* 设置读不到：按直连显示，保存动作会把真实值带回来 */
   }
   try {
-    if (typeof api.getProxyPool !== 'function') throw new Error('桥未提供代理池方法')
-    const items = (await api.getProxyPool())?.items
+    // 优先走「只列可用条目」的那条接口（禁用的节点不进下拉）；旧壳没有它时
+    // 回落整份列表，见 accounts-data 的 proxyPoolOptions
+    const api2 = api as { getUsableProxyPool?: () => Promise<{ items?: PoolItem[] } | null | undefined> }
+    const data = typeof api2.getUsableProxyPool === 'function'
+      ? await api2.getUsableProxyPool()
+      : await api.getProxyPool()
+    const items = data?.items
     // 桥异常时可能 resolve 出 undefined 而不是 reject：不校验会伪装成「池里一条都没有」
     if (!Array.isArray(items)) throw new Error('代理池响应异常')
     selection.pool = items
@@ -428,8 +433,8 @@ export function buildProxyPick(selection: ProxySelection): {
     const prefix = source === 'clash' ? t('Clash 出口：') : source === 'custom' ? t('自定义：') : ''
     items.push({ value: PROXY_OTHER_CURRENT, label: `${prefix}${label}${broken ? t('（不可用）') : ''}` })
   } else if (source === 'pool' && !poolItems.some(item => `${POOL_VALUE_PREFIX}${item.id}` === current)) {
-    // 池引用但条目已不在池里（被删 / Clash 侧删了出口）：补位显示当前值，
-    // 后端解析失败的原因在 title 里
+    // 池引用但条目不在下拉里（被删 / Clash 侧删了出口 / 用户禁用了它）：
+    // 补位显示当前值 —— 绝不能回落成「直连」，那会把「配着但用不了」说成「没配」
     items.push({ value: current, label: `${label}${broken ? t('（不可用）') : ''}` })
   }
   return {

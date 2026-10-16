@@ -54,8 +54,9 @@
 //! 本函数不返回 `UpstreamErrorClass`（那个类型的构造与整条链的接口都收在
 //! `providers::adapter`，自定义家不在那条链上），而是把分类结果**编码进
 //! `GatewayError` 的状态码**，让编排层的两个既有判据原样生效：
-//!   - 401 / 403 → 凭证错误（文案点明是 apiKey 的问题）。自定义账号没有可
-//!     刷新的凭证（key 是用户填的），所以**不映射成 TokenExpired**（那会触发
+//!   - 401 / 403 → 默认按凭证/权限错误展示；明确的 OpenCode 免费层使用范围
+//!     限制另给诊断，不据此认定 apiKey 失效。自定义账号没有可刷新的凭证
+//!     （key 是用户填的），所以**不映射成 TokenExpired**（那会触发
 //!     一次注定失败的刷新重试）—— 按普通失败落到编排层：记入 tried →
 //!     顺延下一个账号；
 //!   - 429 → 限额（`GatewayError::is_quota_limit` 的既有判据只认状态码 429）。
@@ -215,6 +216,9 @@ pub(crate) async fn forward(
         cross.as_ref().map(|(next, _)| next).unwrap_or(body),
     );
     let body: &Value = &stripped;
+    // 免费档基址的读取侧迁移（`/zen/v1` → `/inference/v1`，见
+    // `ProviderQuirks::outbound_base_url`）：只对开了伪装、且基址逐字等于旧值的记录生效
+    let base_url = quirks.outbound_base_url(&base_url);
     let url = format!(
         "{}/chat/completions{}",
         base_url.trim_end_matches('/'),
@@ -422,7 +426,10 @@ impl ProviderQuirks {
     /// 伪装头与匿名凭证（只在 `clientEmulation: "opencode"` 时动手）。
     ///
     /// `api_key` 为空时用匿名凭证 `public` —— 这正是「不填 Key 也能用 OpenCode
-    /// Zen 免费档」的落点；填了 key 就用 key（付费模型必须）。
+    /// 免费档」的落点；填了 key 就用 key（付费模型必须）。
+    ///
+    /// 会话头与 `User-Agent` 一并在这里补齐，并**删掉** `x-opencode-request`
+    /// （上游对带上它的请求一律 403，见 [`emulation::apply_headers`]）。
     ///
     /// **调用顺序**：默认头 → 本函数 → `apply_to`（静态额外头）。放在 `apply_to`
     /// 之前是刻意的：手写在记录上的头优先级最高，伪装不该盖掉用户的显式选择。
@@ -439,7 +446,24 @@ impl ProviderQuirks {
         emulation::apply_headers(headers, api_key, &session);
     }
 
-    /// 请求体补成「智能体形态」（`stream: true` + `bash` / `read` 桩工具）。
+    /// 出站 URL 的**读取侧**迁移：预置卡（或旧版本写下的）`/zen/v1` 基址在
+    /// 拼路径前改写成 `/inference/v1`。
+    ///
+    /// 为什么在读取侧而不是落盘迁移：`customProviders` 是用户可见的配置，
+    /// 「启动时悄悄改用户的配置」比「出站时按上游现状改写一次」更难解释；
+    /// 而且这个改写**只对逐字等于旧基址的记录**生效（见
+    /// [`emulation::preferred_base_url`]），用户手改过的基址一律不动。
+    /// 上游若把免费档再挪一次，改一行即可。
+    fn outbound_base_url(&self, base_url: &str) -> String {
+        if !self.emulate_opencode {
+            return base_url.to_string();
+        }
+        emulation::preferred_base_url(base_url)
+            .map(str::to_string)
+            .unwrap_or_else(|| base_url.to_string())
+    }
+
+    /// 请求体补成「智能体形态」（`stream: true` + 官方形状的 `read` / `shell`）。
     /// 未开启伪装时**一个字节都不动** —— 透传是自定义家的默认语义。
     fn apply_emulation_to_body(&self, body: &mut Value) {
         if !self.emulate_opencode {
@@ -484,6 +508,8 @@ async fn forward_translated(
     // 客户端形态伪装：与 chat 分支同一时机（改写后、翻译前）—— 桩工具要由
     // 转换器一起翻成上游协议的形态（anthropic 的 tools 数组）
     quirks.apply_emulation_to_body(&mut outbound_chat);
+    // 免费档基址的读取侧迁移：与 chat 分支同一口径（见 `outbound_base_url`）
+    let base_url = &quirks.outbound_base_url(base_url);
     // 发给上游的真名 = 改写后的 model 字段（rewrite_body 的产物；请求没带
     // model 时是空串，与 chat 分支「没有回写答案」的口径一致）
     let wire_model = outbound_chat
@@ -940,7 +966,7 @@ fn rewrite_body(body: &Value, provider_id: &str, requested: &str) -> (Value, Opt
 /// 非 2xx 的响应 → 分类后的 `GatewayError`（分类语义见模块头）。
 ///
 /// 三档处理，与 `UpstreamErrorClass` 的对应关系写在模块头：
-///   - 401/403 → 凭证被拒；
+///   - 401/403 → 默认凭证被拒；明确的 OpenCode 免费层限制保留 403 并单独说明；
 ///   - 429 → 限额；`Retry-After` 解析成功时把恢复时间以 UTC+8 文案并进
 ///     message（`rotate::mark_account_limited` 会从文案里再解析一次，
 ///     见模块头的说明）；
@@ -948,6 +974,27 @@ fn rewrite_body(body: &Value, provider_id: &str, requested: &str) -> (Value, Opt
 fn classify_custom_error(status: u16, raw: &str, retry_after: Option<&str>) -> GatewayError {
     let raw = raw.trim();
     let raw = if raw.is_empty() { "上游错误" } else { raw };
+    // 仅修正已明确说明的使用范围限制；不把普通权限/额度错误泛化为免费层限制。
+    // 归一只用于匹配，提示保留上游原文与 403，不改变请求、重试或收费行为。
+    if status == 403 {
+        let normalized = raw
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace('’', "'")
+            .to_ascii_lowercase();
+        if normalized.contains("opencode's free tier can only be used from within opencode.") {
+            return GatewayError::with_status(
+                403,
+                format!(
+                    "OpenCode 免费层使用范围限制（HTTP 403）: {raw}\n\
+                     上游明确要求免费层在 OpenCode 官方客户端内使用，不能据此认定 API Key 失效。\
+                     请使用官方客户端；如需通过网关调用，请按官方文档配置 API Key 与支持 API 调用的模型（可能收费）。\
+                     配置前请确认模型的计费规则。"
+                ),
+            );
+        }
+    }
     match status {
         401 | 403 => GatewayError::with_status(
             i32::from(status),
@@ -1012,6 +1059,104 @@ fn classify_bedrock_error(status: u16, raw: &str, retry_after: Option<&str>) -> 
         );
     }
     classify_custom_error(status, raw, retry_after)
+}
+
+#[cfg(test)]
+mod opencode_error_tests {
+    use super::*;
+
+    const FREE_TIER_RESTRICTION: &str = "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.";
+
+    /// 开了伪装且基址是旧值时改写；其余情形（没开伪装 / 基址已被用户改过 /
+    /// Go 通道）一律原样 —— 这条直接钉在出站 URL 的拼装入口上。
+    #[test]
+    fn the_legacy_free_tier_base_url_is_rewritten_only_when_emulating() {
+        let emulating = ProviderQuirks::from_provider(&serde_json::json!({
+            "clientEmulation": "opencode",
+        }));
+        assert_eq!(
+            emulating.outbound_base_url("https://opencode.ai/zen/v1"),
+            "https://opencode.ai/inference/v1",
+            "旧基址必须改写：它今天对免费请求一律 403"
+        );
+        assert_eq!(
+            emulating.outbound_base_url("https://opencode.ai/inference/v1"),
+            "https://opencode.ai/inference/v1"
+        );
+        assert_eq!(
+            emulating.outbound_base_url("https://opencode.ai/zen/go/v1"),
+            "https://opencode.ai/zen/go/v1",
+            "Go 是订阅通道，不受免费档闸门影响"
+        );
+        assert_eq!(
+            emulating.outbound_base_url("https://my-proxy.example.com/v1"),
+            "https://my-proxy.example.com/v1",
+            "用户自建的中转不许替他改写"
+        );
+
+        let plain = ProviderQuirks::from_provider(&serde_json::json!({}));
+        assert_eq!(
+            plain.outbound_base_url("https://opencode.ai/zen/v1"),
+            "https://opencode.ai/zen/v1",
+            "没开伪装就不该动别人的基址"
+        );
+    }
+
+    #[test]
+    fn opencode_free_tier_restriction_is_not_reported_as_bad_credentials() {
+        for raw in [
+            FREE_TIER_RESTRICTION.to_string(),
+            FREE_TIER_RESTRICTION.to_ascii_uppercase(),
+            FREE_TIER_RESTRICTION.replace('\'', "’"),
+            FREE_TIER_RESTRICTION.replace(' ', "\n  "),
+        ] {
+            let error = classify_custom_error(403, &raw, Some("60"));
+            assert_eq!(error.status_code, 403);
+            assert!(error.message.contains("OpenCode 免费层使用范围限制"));
+            assert!(error.message.contains(&raw));
+            assert!(error.message.contains("不能据此认定 API Key 失效"));
+            assert!(error.message.contains("官方客户端"));
+            assert!(error.message.contains("可能收费"));
+            assert!(!error.message.contains("上游凭证被拒绝"));
+            assert!(!error.is_quota_limit());
+            assert_eq!(error.payload()["error"]["type"], "invalid_request_error");
+            assert!(error.payload()["error"].get("reset_at").is_none());
+            assert!(error.code.is_none());
+        }
+    }
+
+    #[test]
+    fn opencode_other_forbidden_errors_keep_existing_diagnostics() {
+        for raw in [
+            "Invalid API key",
+            "OpenCode account is not allowed to access this model",
+            "OpenCode free tier quota exhausted",
+            "OtherClient's free tier can only be used from within OtherClient.",
+            "Access denied",
+            "",
+        ] {
+            let error = classify_custom_error(403, raw, None);
+            let detail = if raw.is_empty() { "上游错误" } else { raw };
+            assert_eq!(error.status_code, 403);
+            assert_eq!(error.message, format!("上游凭证被拒绝（HTTP 403）: {detail}"));
+            assert!(!error.is_quota_limit());
+        }
+    }
+
+    #[test]
+    fn opencode_restriction_text_does_not_override_non_403_statuses() {
+        for status in [400, 401, 409, 429, 500, 503] {
+            let error = classify_custom_error(status, FREE_TIER_RESTRICTION, None);
+            assert_eq!(error.status_code, i32::from(status));
+            let expected = if status == 401 {
+                format!("上游凭证被拒绝（HTTP 401）: {FREE_TIER_RESTRICTION}")
+            } else {
+                format!("上游返回 {status}: {FREE_TIER_RESTRICTION}")
+            };
+            assert_eq!(error.message, expected);
+            assert_eq!(error.is_quota_limit(), status == 429);
+        }
+    }
 }
 
 #[cfg(test)]

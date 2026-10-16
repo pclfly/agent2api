@@ -551,6 +551,7 @@ impl ServerState {
             // 与 account_bootstrap 同一模式：待迁移旧数据没导入时跳过 ——
             // 跑了会把幂等标记打早，升级完成后由 `api::upgrade_api` 补调。
             request_stats.remap_model_dimension_once();
+            request_stats.backfill_account_credits_once();
         }
 
         let state = Self {

@@ -129,7 +129,7 @@
           return;
         }
         const canceled = await cancelLogin();
-        toast(canceled ? wbI18n.t('已取消登录等待') : wbI18n.t('登录已结束'));
+        if (canceled !== null) toast(canceled ? wbI18n.t('已取消登录等待') : wbI18n.t('登录已结束'));
         await syncShellState();
       },
     };
@@ -145,7 +145,8 @@
       return true;
     } catch (error) {
       toast(wbI18n.t('取消失败：{message}', { message: error.message }), 'err');
-      return false;
+      // Keep the failure warning visible instead of replacing it with “login ended”.
+      return null;
     }
   }
 

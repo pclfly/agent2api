@@ -1253,7 +1253,9 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
     const prefix = source === 'clash' ? t('Clash 出口：') : source === 'custom' ? t('自定义：') : ''
     items.push({ value: PROXY_CUSTOM_CURRENT, label: `${prefix}${label}${broken ? t('（不可用）') : ''}` })
   } else if (source === 'pool' && !poolItems.some(item => `${POOL_VALUE_PREFIX}${item.id}` === current)) {
-    // 池引用但条目已不在池里（被删 / Clash 侧删了出口）：补位显示当前值
+    // 池引用但条目不在下拉里：被删 / Clash 侧删了出口 / **用户把它禁用了**
+    // （禁用项不进选项，见 accounts-data 的 proxyPoolOptions）。补位显示当前值，
+    // 否则用户看到的是一个「没选中任何值」的下拉，而账号实际引用着一个出口
     items.push({ value: current, label: `${label}${broken ? t('（不可用）') : ''}` })
   }
   items.push({ value: PROXY_CUSTOM_EDIT, label: t('自定义代理…') })

@@ -215,6 +215,7 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
   //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
   officeace: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  qwenwork: { usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
 }
 
 /**

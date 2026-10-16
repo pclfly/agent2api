@@ -30,12 +30,16 @@
  *
  * ── 勾选与批量（照账号页那一套）────────────────────────────
  * 表头一列勾选框 + 行内勾选框，勾选后在面板头下方浮出一条 `.batch-bar`
- * （类名与账号页共用，见 page-accounts.css）：批量测试、批量删除、取消选择。
- *   · 批量测试**包含**只读的 Clash 条目（读操作不受只读语义限制）；
- *   · 批量删除**跳过** Clash 条目（会拒绝），并在确认框里说明跳过了几条；
+ * （类名与账号页共用，见 page-accounts.css）：批量测试、批量启用 / 禁用、
+ * 批量删除、取消选择。
+ *   · 批量测试**包含**只读的 Clash / 订阅条目（读操作不受只读语义限制）；
+ *   · 批量启用 / 禁用也**包含**它们 —— 「用不用这条记录」对镜像条目同样成立，
+ *     写的是独立的 `disabled` 字段（见 `proxies-state.ts` 的 `toggleDisabled`）；
+ *     上游自己禁用的条目（`enabled === false`）跳过并计入 skipped；
+ *   · 批量删除**跳过**只读条目（会拒绝），并在确认框里说明跳过了几条；
  *   · 勾选不随列表刷新清空，只有条目从列表里消失（被删 / Clash 侧删了出口）
  *     才收敛 —— 完整口径见 `proxies-state.ts` 的模块头。
- * 批量逐个执行而不是并发：每条删除都会整份重写池（kv 一个键），并发写会互相
+ * 批量逐个执行而不是并发：每次写都会整份重写池（kv 一个键），并发写会互相
  * 覆盖（丢更新）；测试是真实的上游请求，串行也避免瞬间占满建连额度。
  *
  * ── 测试的判据与账号弹窗同一套 ────────────────────────────────
@@ -79,10 +83,11 @@ import {
 } from '@ui'
 import { poolItemAddress } from './accounts-shared'
 import {
-  batchRemove, batchTest, clearSelection, durationText, errorMessage,
+  batchRemove, batchSetDisabled, batchTest, clearSelection, durationText, errorMessage,
   formatTime, getSnapshot, isOrphanSubscriptionItem, isPicked, isReadonlyPoolItem,
-  isSubscriptionItem, items, loadPanel, pickableIds, readonlyHint, removeItem, saveItem,
-  setAllPicked, subscribe, syncClash, testItem, toggleItem, togglePick, toast, wb,
+  isSubscriptionItem, isUsablePoolItem, items, loadPanel, pickableIds, readonlyHint,
+  removeItem, saveItem, setAllPicked, subscribe, syncClash, testItem, toggleDisabled,
+  togglePick, toast, wb,
   type ProxyPoolItem,
 } from './proxies-state'
 import { SubscriptionSection } from './proxies-sub-view'
@@ -170,14 +175,23 @@ function ProxiesPage() {
           <span className='font-mono text-[12px] text-text-2'>{poolItemAddress(item) || '—'}</span>
         )
       case 'state': {
-        // 只读镜像：开关照常显示真实状态（Clash 里禁用了这里也看得见），但不给改
-        const readonly = isReadonlyPoolItem(item)
-        const hint = readonlyHint(item)
+        // 开关表示的是「**用户**要不要用这条出口」（`disabled` 字段），不是镜像
+        // 跟随上游的启用位。所以：
+        //   · 镜像条目也能改（订阅里几十个节点只挑几个用是主要场景）——
+        //     只读指的是名称 / 端口 / 来源跟随上游，不包括「用不用」；
+        //   · 上游自己禁用了（Clash 里关了这个监听器 / 订阅侧失效）时开关
+        //     置灰：那种情况不是用户能在这里开启的，下一次同步还会写回上游值。
+        const upstreamDisabled = item.enabled === false
+        const hint = upstreamDisabled
+          ? readonlyHint(item)
+          : item.disabled
+            ? t('已禁用：引用它的账号会回退直连，点开关启用')
+            : t('启用中：点开关禁用（引用它的账号会回退直连）')
         return (
-          <Switch checked={item.enabled} disabled={locked || readonly}
+          <Switch checked={isUsablePoolItem(item)} disabled={locked || upstreamDisabled}
             aria-label={t('启用「{name}」', { name: item.name || t('未命名') })}
-            title={readonly ? hint : undefined}
-            onCheckedChange={next => void toggleItem(item, next)} />
+            title={hint}
+            onCheckedChange={next => void toggleDisabled(item, next)} />
         )
       }
       case 'test':
@@ -259,13 +273,22 @@ function ProxiesPage() {
         </span>
         {clashPicked ? (
           <span className='batch-hidden'>
-            {t('其中 {n} 条是同步来的只读条目（Clash / 订阅）：可参与批量测试，删除会跳过', { n: clashPicked })}
+            {t('其中 {n} 条是同步来的只读条目（Clash / 订阅）：可参与批量测试与启停，删除会跳过', { n: clashPicked })}
           </span>
         ) : null}
         <div className='batch-actions'>
           <Button variant='outline' disabled={!selectedCount || snapshot.batchBusy}
             onClick={() => void batchTest()}>
             {progress ? t('测试中 {done}/{total}', { done: progress.done, total: progress.total }) : t('批量测试')}
+          </Button>
+          {/* 批量启停：与行内开关同一个动作（写用户禁用位），只读镜像同样适用 */}
+          <Button variant='outline' disabled={!selectedCount || snapshot.batchBusy}
+            onClick={() => void batchSetDisabled(true)}>
+            {t('批量禁用')}
+          </Button>
+          <Button variant='outline' disabled={!selectedCount || snapshot.batchBusy}
+            onClick={() => void batchSetDisabled(false)}>
+            {t('批量启用')}
           </Button>
           <Button variant='destructive' disabled={!selectedCount || snapshot.batchBusy}
             onClick={() => void batchRemove()}>
@@ -335,6 +358,8 @@ function ProxiesPage() {
           {t('这里配的出口可被账号引用（账号弹窗 →「出网代理」→「已保存的代理」）—— 改一次地址、所有引用的账号一起生效。测试的判据是')}
           <b>{t('能否连上上游')}</b>
           {t('， 出口 IP 与耗时是附带读数。')}
+          <b>{t('启用')}</b>
+          {t(' 开关对订阅节点同样可用：关掉的节点不会出现在账号的代理下拉里，引用它的账号回退直连（节点留在池里，随时可再打开）。')}
           <b>Clash Verge</b>
           {t(' 那一类由「同步 Clash Verge」 镜像进来（进入本页时会自动同步一次）：名称、端口、启用都跟随 Clash， 在 Clash 里改或删，这里跟着变 —— 所以它们只读，改请到 Clash Verge 里改。')}
         </span>
@@ -387,7 +412,8 @@ function ProxyModal({
   const [port, setPort] = React.useState(item?.port ? String(item.port) : '')
   const [username, setUsername] = React.useState(item?.username || '')
   const [password, setPassword] = React.useState(item?.password || '')
-  const [enabled, setEnabled] = React.useState(item ? item.enabled : true)
+  /** 用户禁用位（与镜像跟随上游的 `enabled` 分开，见 proxies-state 的 toggleDisabled） */
+  const [disabled, setDisabled] = React.useState(item?.disabled === true)
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
   const [status, setStatus] = React.useState<React.ReactNode>(null)
@@ -411,7 +437,10 @@ function ProxyModal({
         port: portNumber,
         username: username.trim(),
         password,
-        enabled,
+        // 手动条目没有上游含义，启用位恒为 true；「用不用」由 disabled 表达
+        // （两个字段分开的理由见后端 `proxy_pool::is_usable`）
+        enabled: true,
+        disabled,
       },
     }
   }
@@ -528,7 +557,8 @@ function ProxyModal({
           </div>
 
           <div className='flex flex-row items-center gap-2.5'>
-            <Switch checked={enabled} onCheckedChange={setEnabled} aria-label={t('启用这条代理')} />
+            <Switch checked={!disabled} onCheckedChange={next => setDisabled(!next)}
+              aria-label={t('启用这条代理')} />
             <span className='text-[12.5px]'>
               {t('启用（禁用的条目不会被账号使用，被引用时账号回退直连；仍可测试）')}
             </span>

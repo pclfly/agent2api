@@ -40,6 +40,10 @@ use crate::server::core::sub_kernel::{
 };
 use crate::server::logging;
 
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;
+
 /// 控制端口候选范围（避开 Clash Verge 默认的 7897 与常见 9090）
 const CONTROLLER_PORT_BASE: u16 = 19090;
 const CONTROLLER_PORT_END: u16 = 19099;
@@ -271,21 +275,50 @@ fn build_config(
 ) -> Result<String, String> {
     let mut proxy_providers = Map::new();
     for provider in providers {
-        proxy_providers.insert(
-            format!("sub_{}", provider.id),
+        // 缓存路径与 `sub_kernel::provider_cache_file`（本地配置导入时写盘的位置）
+        // 必须同一个值：写成两处字面量时，改一处就会让「导入的文件」与
+        // 「内核读的文件」悄悄错开。
+        let cache_path = crate::server::core::subscriptions::provider_cache_path(&provider.id);
+        // 本地配置文件走 `type: file`：直接读我们自己写的那份 YAML，**不带
+        // interval / health-check 的拉取语义**（file provider 没有定时刷新，
+        // 内容只在我们写入时变 —— 这正是「本地配置不参与定时刷新」）。
+        // 缓存路径与 http provider 同一个（见 `provider_cache_file`）。
+        let entry = if crate::server::core::sub_kernel::is_file_provider(provider) {
+            json!({
+                "type": "file",
+                "path": cache_path,
+            })
+        } else {
             json!({
                 "type": "http",
                 "url": provider.url,
                 "interval": 86400,
-                "path": format!("providers/sub_{}.yaml", provider.id),
+                "path": cache_path,
                 "health-check": {
                     "enable": true,
                     "url": "https://www.gstatic.com/generate_204",
                     "interval": 1800,
                 },
-            }),
-        );
+            })
+        };
+        proxy_providers.insert(format!("sub_{}", provider.id), entry);
     }
+    // provider 内的节点不在 mihomo 的全局 proxies 表里，listener.proxy 不能
+    // 直接引用节点名。每节点注册一个 select 组：只从所属订阅中完整匹配该节点。
+    // 节点尚未加载或已消失时显式拒绝，不能用默认 COMPATIBLE 偷偷回退直连。
+    let proxy_groups: Vec<Value> = listeners
+        .iter()
+        .map(|target| {
+            json!({
+                "name": node_group_name(target),
+                "type": "select",
+                "use": [format!("sub_{}", target.provider_id)],
+                "filter": exact_node_filter(&target.node),
+                "empty-fallback": "REJECT",
+                "hidden": true,
+            })
+        })
+        .collect();
     let listener_list: Vec<Value> = listeners
         .iter()
         .map(|target| {
@@ -294,7 +327,7 @@ fn build_config(
                 "type": "mixed",
                 "port": target.port,
                 "listen": "127.0.0.1",
-                "proxy": target.node,
+                "proxy": node_group_name(target),
             })
         })
         .collect();
@@ -306,10 +339,23 @@ fn build_config(
         "secret": secret,
         "profile": { "store-selected": false },
         "proxy-providers": proxy_providers,
+        "proxy-groups": proxy_groups,
         "rules": ["MATCH,DIRECT"],
         "listeners": listener_list,
     });
     serde_yaml::to_string(&config).map_err(|error| format!("编码内核配置失败: {error}"))
+}
+
+/// 全局出口组名含订阅身份：不同订阅的同名节点不得共用一个出口。
+fn node_group_name(target: &NodeTarget) -> String {
+    format!("wbg_{}", short_hash(&node_key(&target.provider_id, &target.node)))
+}
+
+/// mihomo 的 regexp2 过滤器。先转义正则元字符，再编码其额外的反引号分隔符；
+/// 用绝对起止锚点而非 ^/$，防止含换行的节点名匹配到另一个节点。
+fn exact_node_filter(name: &str) -> String {
+    let escaped = regex::escape(name).replace('`', "\\x60");
+    format!("\\A(?:{escaped})\\z")
 }
 
 /// 节点键（端口注册表与代理池条目共用的稳定标识）
@@ -531,13 +577,21 @@ pub async fn run_refresh(sub_id: &str, providers: &[ProviderInput]) -> Result<()
         .iter()
         .find(|provider| provider.id == sub_id)
         .ok_or_else(|| "订阅不存在".to_string())?;
+    // 本地配置文件的「刷新」 = 让内核重读那份 YAML（file provider 没有远端
+    // 可拉，PUT 会重新加载本地文件 —— 实测节点即时更新）。内容本身由 api 层
+    // 在调用前写好（「立即更新」从原路径重新导入一次），这里只管触发重读。
+    let is_file = crate::server::core::sub_kernel::is_file_provider(provider);
     controller_put(
         controller_port,
         secret,
         &format!("/providers/proxies/sub_{sub_id}"),
     )
     .await?;
-    log_line(&format!("🔄 已强制刷新订阅「{}」", provider.name));
+    log_line(&format!(
+        "🔄 已强制刷新订阅「{}」{}",
+        provider.name,
+        if is_file { "（本地配置文件，重读 YAML）" } else { "" }
+    ));
 
     // 拉取后的节点清单（给几秒的窗口让 provider 写缓存）
     let live = poll_providers(controller_port, secret, &[sub_id.to_string()], 8_000).await;
@@ -555,10 +609,17 @@ pub async fn run_refresh(sub_id: &str, providers: &[ProviderInput]) -> Result<()
     let count = names.len();
     record_provider_sync(sub_id, &provider.name, count);
     if count == 0 {
-        return Err(format!(
-            "订阅「{}」刷新后仍然没有节点（检查链接或流量是否用尽）",
-            provider.name
-        ));
+        return Err(if is_file {
+            format!(
+                "本地配置文件「{}」里没有可用节点（检查文件里有没有 proxies 列表）",
+                provider.name
+            )
+        } else {
+            format!(
+                "订阅「{}」刷新后仍然没有节点（检查链接或流量是否用尽）",
+                provider.name
+            )
+        });
     }
 
     // 节点集合变了 → 重建配置 + 重启（新节点分新端口，消失的摘掉）

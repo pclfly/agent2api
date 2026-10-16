@@ -68,6 +68,17 @@
     return fallback || [];
   }
 
+  // Track only effective names, not counts/order, so main-state refreshes do not
+  // cause unrelated request-table redraws. Both data sources use this notifier.
+  let builtinNames = new Map(all().map(item => [item.id, item.label]));
+  function syncFromAppState() {
+    const next = new Map(all().map(item => [item.id, item.label]));
+    const changed = next.size !== builtinNames.size
+      || [...next].some(([id, name]) => builtinNames.get(id) !== name);
+    builtinNames = next;
+    if (changed) window.dispatchEvent(new Event('wb:provider-labels-changed'));
+  }
+
   // ─── 自定义提供商（custom- 前缀）─────────────
   //
   // 自定义提供商是**运行期数据**：后端注册表（providers::summary_json）只枚举
@@ -138,8 +149,13 @@
             || before.some(([id, name]) => customNames.get(id) !== name);
           // 账号数据还没就绪（首次 refresh 未返回）时不补重绘：那会把列表容器里
           // 的「正在加载…」覆盖成「暂无账号」，等 refresh 自己的那轮渲染即可
-          if (changed && window.wbApp?.getState?.()?.accounts?.accounts?.length) {
-            window.wbAccountsView?.render?.();
+          if (changed) {
+            // React request rows, filters and open details also cache display labels.
+            // Notify without re-fetching log filters or resetting selection/pagination.
+            window.dispatchEvent(new Event('wb:provider-labels-changed'));
+            if (window.wbApp?.getState?.()?.accounts?.accounts?.length) {
+              window.wbAccountsView?.render?.();
+            }
           }
           return customItems;
         })
@@ -195,6 +211,7 @@
         .then(data => {
           const list = normalize(data?.accounts?.providers);
           if (list.length) fallback = list;
+          syncFromAppState();
           return list;
         })
         .finally(() => { inflight = null; });
@@ -211,7 +228,10 @@
    */
   async function load({ force = false } = {}) {
     const live = fromAppState();
-    if (live.length && !force) return live;
+    if (live.length && !force) {
+      syncFromAppState();
+      return live;
+    }
     try {
       const fetched = await fetchProviders();
       return fetched.length ? fetched : all();
@@ -230,6 +250,7 @@
     all,
     labelOf,
     load,
+    syncFromAppState,
     // 自定义提供商目录（custom- 前缀）：列表缓存、刷新与通用管理 API 调用。
     // 添加 / 编辑表单与账号页的管理弹窗都从这里取数，保证同一份目录只有一处实现
     customList,

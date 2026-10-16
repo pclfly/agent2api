@@ -314,6 +314,9 @@ pub struct RequestEntry {
     /// 纪律：新加的列排在结构体末尾，不牵动前面所有 `row.get(n)` 的序号。
     #[serde(default)]
     pub credit: Option<f64>,
+    /// Source is persisted: estimates must not become reported debits after restart.
+    #[serde(rename = "creditSource", default)]
+    pub credit_source: String,
 }
 
 /// 一个被命中的敏感词及其次数（存储契约）。
@@ -429,6 +432,7 @@ impl RequestEntry {
         copy.cache_read_tokens = 0;
         // 积分消耗同口径清零（清成 None 而不是 0，理由见 `normalize` 里的 credit）
         copy.credit = None;
+        copy.credit_source.clear();
         copy
     }
 }
@@ -460,6 +464,7 @@ pub struct NewRequestEntry {
     /// 本次请求消耗的积分（上游 usage.credit；`None` = 上游没报这个字段）。
     /// 见 `RequestEntry::credit` 与 `core::upstream::usage::UsageTokens::credit`。
     pub credit: Option<f64>,
+    pub credit_source: String,
     /// 实际承载本次请求的 provider id（Agent2API 改造 W2b-T3 新增填入，
     /// W4 接上持久化：见 `normalize` 末尾的透传）。
     ///
@@ -505,6 +510,7 @@ impl NewRequestEntry {
             total_tokens: 0,
             cache_read_tokens: 0,
             credit: None,
+            credit_source: String::new(),
             provider: None,
             client_model: String::new(),
             upstream_model: String::new(),
@@ -544,7 +550,10 @@ impl NewRequestEntry {
         // 上游报错时 credit 通常缺失；万一某条错误响应带了半截 usage，清成
         // 「没报」比记成「失败了但消耗 0 积分」更准确 —— 后者会让报表把一次
         // 失败的请求读成「确认没花钱」，而事实是我们不知道它扣没扣。
-        let credit = if failed { None } else { self.credit };
+        let credit = if failed { None } else { self.credit.filter(|n| n.is_finite()) };
+        let credit_source = if credit.is_none() { String::new() }
+            else if self.credit_source == "estimate" { "estimate".to_string() }
+            else { "reported".to_string() };
         // provider 从入参透传到记账条目（W2b 留的丢弃点在此接上）。
         // `None`（转发链没走到选路就失败）与空串（上游返回了空 id）都归一成
         // **空串**：两者在报表语义上都是「未知承载者」，多一种表示只会让
@@ -574,6 +583,7 @@ impl NewRequestEntry {
             total_tokens: token(self.total_tokens),
             cache_read_tokens: token(self.cache_read_tokens),
             credit,
+            credit_source,
             provider,
             // 双名透传（trim 的理由与 provider 相同：空白不该造出一个
             // 「看起来不同的名字」）；空串语义 = 没有点名 / 没有发出去
@@ -813,12 +823,19 @@ pub struct ProviderAccum {
 ///
 /// 两个字段都为空表示「不知道是谁承载的」：走默认登录态转发（未配置账号列表）
 /// 或旧版本写出的行。与 provider 的空串同一口径，由展示层给占位文案。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AccountAccum {
     #[serde(rename = "accountId", default)]
     pub account_id: String,
     #[serde(rename = "accountName", default)]
     pub account_name: String,
+    /// Only collected values are summed; None is not a measured zero.
+    #[serde(default)]
+    pub credit: Option<f64>,
+    #[serde(rename = "creditRequests", default)]
+    pub credit_requests: i64,
+    #[serde(rename = "creditEstimated", default)]
+    pub credit_estimated: bool,
     #[serde(default)]
     pub requests: i64,
     #[serde(default)]

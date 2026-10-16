@@ -71,5 +71,10 @@
   "近 30 天": "Últimos 30 dias",
   "近 365 天活跃热力图": "Mapa de calor de atividade dos últimos 365 dias",
   "近 365 天，按天 Token 用量着色（档位按本窗口峰值自动定）": "Últimos 365 dias, coloridos pelo uso diário de Token (as faixas são definidas automaticamente pelo pico desta janela)",
-  "近 7 天": "Últimos 7 dias"
+  "近 7 天": "Últimos 7 dias",
+  "积分消耗": "Créditos consumidos",
+  "未采集积分，不代表零消耗": "Créditos não registrados; isso não significa consumo zero",
+  "包含按 Token 用量计算的预估值，并非上游实际扣费": "Inclui estimativas baseadas em tokens, não cobranças reais do provedor",
+  "部分采集：{measured}/{total} 次成功请求": "Cobertura parcial: {measured}/{total} solicitações bem-sucedidas",
+  "≈ 预估 · * 部分采集 · — 未采集；仅统计成功请求": "≈ Estimado · * Parcial · — Não registrado; apenas solicitações bem-sucedidas"
 }

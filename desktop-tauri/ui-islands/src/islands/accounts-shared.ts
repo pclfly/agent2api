@@ -275,6 +275,8 @@ export type AccountsBridge = {
   /** 代理池列表（「网络代理」页维护的命名代理）：账号代理表单的
    *  「已保存的代理」下拉读它；写侧（增删改）只有那一页用，不在这份桥里 */
   getProxyPool(): Promise<{ items?: PoolItem[] } | null | undefined>
+  /** 只列**可用**条目（禁用的不进下拉）；旧壳没有这个方法时回落 `getProxyPool` */
+  getUsableProxyPool?(): Promise<{ items?: PoolItem[] } | null | undefined>
   /** 测一条池条目（账号表单里选中池引用时的「测试出口」）：
    *  结果会记进那条代理的「上次测试」，与代理页那颗按钮同一个动作 */
   testProxyPoolItem(id: string): Promise<{
@@ -334,9 +336,14 @@ export type ClashSnapshot = {
 export type PoolItem = {
   id: string
   name?: string
-  /** manual | clash（表单里按它标「手动 / Clash Verge」） */
+  /** manual | clash | subscription（表单里按它标来源） */
   source?: string
+  /** 条目自身的启用位：手动条目由表单决定，镜像条目**跟随上游**（Clash / 订阅） */
   enabled?: boolean
+  /** 用户禁用位（与 enabled 分开，见后端 `proxy_pool::is_usable`）：只由用户开关写，同步不覆盖 */
+  disabled?: boolean
+  /** 两个字段的合取结果（后端算好的）：false = 账号引用它会回退直连 */
+  usable?: boolean
   /** 解析后的出口（Clash 条目的端口在这里是实时值）；不受控字段按 unknown 收 */
   resolved?: { protocol?: string; host?: string; port?: number | null; label?: string } | null
   /** 解析失败的原因（引用了已删除的 Clash 监听器等） */
@@ -376,7 +383,12 @@ export function poolItemAddress(item: PoolItem): string {
 export function poolItemLabel(item: PoolItem): string {
   const name = item.name || item.id
   const address = item.resolveError ? t('解析失败') : poolItemAddress(item)
-  const parts = [address, item.enabled === false ? t('已禁用') : ''].filter(Boolean)
+  // 可用性只认后端算好的 `usable`（enabled 与 disabled 的合取）：缺字段的旧
+  // 形态回落到只判 `disabled`，不再看 `enabled` —— 镜像条目的 enabled 是上游
+  // 的事，而「这条能不能用」是用户开关的结果，两者混在一起就会把
+  // 「Clash 里禁用了」说成「你禁用了它」
+  const usable = item.usable ?? !item.disabled
+  const parts = [address, usable ? '' : t('已禁用')].filter(Boolean)
   return parts.length ? t('{name}（{parts}）', { name, parts: parts.join(' · ') }) : name
 }
 

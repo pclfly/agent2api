@@ -204,7 +204,7 @@ pub(super) fn summarize(
 /// 进行中行 —— 没有它，重算会把一条「还没跑完」的请求凭空加进当天请求数
 /// （token 还是 0），日报与明细口径立刻分裂。
 pub(super) fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
-    if item.status == 0 {
+    if item.status == 0 || item.is_test {
         return;
     }
     let success = item.is_success();
@@ -234,6 +234,10 @@ pub(super) fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
         i64::from(success),
         item.total_tokens,
     );
+    if success {
+        super::report::push_account_credit(&mut day.account_stats, &item.account_id,
+            item.credit, i64::from(item.credit.is_some()), item.credit_source == "estimate");
+    }
 }
 
 /// 报表按模型聚合用的**统计键**：上游真名优先，请求名回落。
@@ -257,5 +261,158 @@ fn model_stat_key(item: &RequestEntry) -> &str {
         &item.model
     } else {
         &item.upstream_model
+    }
+}
+
+/// Fill account credits only when the complete terminal, non-test history is still available.
+pub(super) fn backfill_account_credits(
+    conn: &mut rusqlite::Connection,
+) -> rusqlite::Result<Vec<String>> {
+    const MARKER: &str = "accountCreditsBackfilled";
+    if legacy::marker_present(conn, MARKER)? {
+        return Ok(Vec::new());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let days: Vec<(String, i64)> = {
+        let mut stmt = tx.prepare("SELECT date, requests FROM request_daily")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut changed = Vec::new();
+    for (key, expected) in days {
+        let Ok(day) = NaiveDate::parse_from_str(&key, "%Y-%m-%d") else {
+            continue;
+        };
+        if expected <= 0 {
+            continue;
+        }
+        let start = local_midnight_ms(day);
+        let end = local_midnight_ms(day + ChronoDuration::days(1));
+        let actual: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM requests WHERE ts >= ?1 AND ts < ?2 AND status <> 0 AND is_test = 0",
+            rusqlite::params![start, end], |row| row.get(0))?;
+        if actual == expected {
+            rebuild_day(&tx, day)?;
+            changed.push(key);
+        }
+    }
+    tx.execute("INSERT INTO kv (key, value) VALUES (?1, 'true') ON CONFLICT(key) DO UPDATE SET value = excluded.value", [MARKER])?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+#[cfg(test)]
+mod credit_tests {
+    use super::super::record::{AccountAccum, NewRequestEntry};
+    use super::*;
+    use crate::server::db::test_temp::TempDb;
+
+    fn entry(
+        date: &str,
+        id: &str,
+        name: &str,
+        credit: Option<f64>,
+        estimated: bool,
+    ) -> RequestEntry {
+        let mut e = NewRequestEntry::new("demo", 200);
+        e.ts =
+            Some(local_midnight_ms(NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap()) + 60_000);
+        e.id = id.into();
+        e.account_id = "account-a".into();
+        e.account_name = name.into();
+        e.total_tokens = 100;
+        e.credit = credit;
+        e.credit_source = if estimated { "estimate" } else { "reported" }.into();
+        e.normalize()
+    }
+    #[test]
+    fn credit_cross_day_rename_coverage_and_zero() {
+        let mut first = DailyEntry::new("2026-10-13".into());
+        fold_into_daily(
+            &mut first,
+            &entry("2026-10-13", "1", "Old", Some(0.125), false),
+        );
+        fold_into_daily(&mut first, &entry("2026-10-13", "2", "Old", None, false));
+        let mut next = DailyEntry::new("2026-10-14".into());
+        fold_into_daily(
+            &mut next,
+            &entry("2026-10-14", "3", "New", Some(0.0), false),
+        );
+        fold_into_daily(
+            &mut next,
+            &entry("2026-10-14", "4", "New", Some(0.25), true),
+        );
+        let days = BTreeMap::from([(first.date.clone(), first), (next.date.clone(), next)]);
+        let totals = range_totals(&days, "2026-10-13", "2026-10-14");
+        let rows = build_accounts(&totals.account_totals);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["label"], "New");
+        assert_eq!(rows[0]["credit"], 0.375);
+        assert_eq!(rows[0]["creditRequests"], 3);
+        assert_eq!(rows[0]["success"], 4);
+        assert_eq!(rows[0]["creditEstimated"], true);
+        let old: AccountAccum = serde_json::from_value(
+            json!({"accountId":"old","requests":1,"successful":1,"tokens":10}),
+        )
+        .unwrap();
+        assert_eq!(old.credit, None);
+        assert_eq!(old.credit_requests, 0);
+    }
+    #[test]
+    fn failed_running_and_test_entries_do_not_add_credit() {
+        let mut day = DailyEntry::new("2026-10-13".into());
+        let mut e = entry("2026-10-13", "1", "A", Some(1.0), true);
+        e.is_test = true;
+        fold_into_daily(&mut day, &e);
+        e.is_test = false;
+        e.status = 0;
+        fold_into_daily(&mut day, &e);
+        assert_eq!(day.requests, 0);
+        e.status = 500;
+        fold_into_daily(&mut day, &e);
+        assert_eq!(day.requests, 1);
+        assert_eq!(day.account_stats[0].credit, None);
+        let mut failed = NewRequestEntry::new("demo", 200);
+        failed.error = Some("stream interrupted".into());
+        failed.credit = Some(1.0);
+        failed.credit_source = "estimate".into();
+        let failed = failed.normalize();
+        assert_eq!(failed.credit, None);
+        assert!(failed.credit_source.is_empty());
+    }
+    #[test]
+    fn backfill_only_complete_terminal_days_and_is_idempotent() {
+        let (db, _guard) = TempDb::open("account-credit-backfill");
+        db.with_mut(|conn| {
+            let mut complete = DailyEntry::new("2026-10-13".into());
+            complete.requests = 2;
+            complete.successful = 2;
+            complete.tokens = 200;
+            let mut partial = DailyEntry::new("2026-10-14".into());
+            partial.requests = 20;
+            partial.successful = 20;
+            partial.tokens = 2000;
+            daily::upsert_daily(conn, &complete).unwrap();
+            daily::upsert_daily(conn, &partial).unwrap();
+            sql::insert_request(conn, &entry("2026-10-13", "1", "A", Some(0.5), true)).unwrap();
+            sql::insert_request(conn, &entry("2026-10-13", "2", "A", Some(0.0), false)).unwrap();
+            let mut extra = entry("2026-10-13", "test", "A", Some(500.0), false);
+            extra.is_test = true;
+            sql::insert_request(conn, &extra).unwrap();
+            extra.id = "running".into();
+            extra.is_test = false;
+            extra.status = 0;
+            sql::insert_request(conn, &extra).unwrap();
+            sql::insert_request(conn, &entry("2026-10-14", "3", "A", Some(1.0), false)).unwrap();
+            assert_eq!(backfill_account_credits(conn).unwrap(), vec!["2026-10-13"]);
+            let days = daily::select_daily_map(conn).unwrap();
+            assert_eq!(days["2026-10-13"].account_stats[0].credit, Some(0.5));
+            assert_eq!(days["2026-10-13"].account_stats[0].credit_requests, 2);
+            assert!(days["2026-10-13"].account_stats[0].credit_estimated);
+            assert_eq!(days["2026-10-14"].tokens, 2000);
+            assert!(days["2026-10-14"].account_stats.is_empty());
+            assert!(backfill_account_credits(conn).unwrap().is_empty());
+        })
+        .unwrap();
     }
 }

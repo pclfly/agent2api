@@ -712,6 +712,7 @@ async function refresh() {
   try {
     const next = await api.getState();
     state = next;
+    window.wbProviders?.syncFromAppState?.();
     // 拿到状态即清掉上一次的失败说明（见下面 catch 的注释）
     stateError = '';
     // 清掉已删除账号的本地缓存；代理可选项也可能在 Clash 侧改过，下次打开弹窗重读
@@ -721,6 +722,7 @@ async function refresh() {
     render();
   } catch (error) {
     state = null;
+    window.wbProviders?.syncFromAppState?.();
     stateError = error.message;
     render();
     // 「本地代理状态」卡片与会话状态卡片都已删除，加载失败的说明改挂到顶栏状态区的
@@ -799,6 +801,7 @@ api.onStateChanged(next => {
   if (!next?.accounts && !next?.session && !next?.health) return;
   // 合并：旧 state + 新字段
   state = { ...(state || {}), ...next };
+  window.wbProviders?.syncFromAppState?.();
   render();
 });
 

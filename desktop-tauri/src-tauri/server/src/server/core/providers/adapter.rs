@@ -247,6 +247,8 @@ pub enum UpstreamResponse {
     /// 走翻译层的理由同上：账号轮换、限额冷却、退避重试、usage 记账与取消处理
     /// 全部留在编排层，只有字节形态在翻译器里变。
     AntigravityGemini,
+    /// QwenWork direct/enveloped chat SSE, with explicit estimated credit metadata.
+    QwenWorkSse,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
@@ -1169,6 +1171,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
         // `officeace/mod.rs` 的模块头）
         ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
+        ProviderKind::QwenWork => &super::qwenwork::QWENWORK_ADAPTER,
     }
 }
 
@@ -1269,6 +1272,7 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
         // 进本列表才会被后台目录刷新调度
         ProviderKind::OfficeAce,
+        ProviderKind::QwenWork,
     ]
 }
 

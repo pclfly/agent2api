@@ -59,6 +59,8 @@ use crate::gateway;
 use crate::login_profile::LoginProfile;
 use crate::state::ActiveLogin;
 
+mod start_request;
+
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -871,6 +873,8 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // `providers::minimax::oauth`），壳侧只负责开窗口与轮询 —— 与 Qoder /
         // Cline 的设备授权同一条路。
         "minimax" => Ok("minimax"),
+        // Official device confirmation uses the system browser; no callback capture.
+        "qwenwork" => Ok("qwenwork"),
         // Antigravity：授权地址由**后端适配器**本地拼（Google OAuth 授权码，
         // 见 `providers::antigravity::oauth::build_authorize_url`），壳侧只负责
         // 开窗口与轮询 —— 与 CodeArts 同一条路。回调落在
@@ -928,12 +932,16 @@ pub async fn start_autoclaw_oauth(
     {
         let state_guard = app.state::<crate::state::AppState>();
         let mut guard = state_guard.login.lock().map_err(|_| "登录状态锁不可用")?;
-        *guard = Some(ActiveLogin {
+        if let Err(error) = start_request::reserve(&mut guard, ActiveLogin {
             state: state.clone(),
             edition: "intl".into(),
             mode: mode_id.into(),
             provider: "autoclaw-intl".to_string(),
-        });
+        }) {
+            let rejected_state = state.clone();
+            tauri::async_runtime::spawn(async move { let _ = cancel_server_login(&rejected_state).await; });
+            return Err(error);
+        }
     }
     emit_login_state(
         app,
@@ -1050,20 +1058,33 @@ fn task_gone(message: &str) -> bool {
     message.contains("登录任务不存在") || message.contains("已过期")
 }
 
-/// 通知后端中止轮询；用于用户关窗/点取消
+/// A local reservation has no backend state yet. Its late response owns cleanup.
+async fn cancel_server_login(state: &str) -> Result<(), String> {
+    if state.starts_with(start_request::PREFIX) { return Ok(()); }
+    tokio::time::timeout(Duration::from_secs(2), gateway::call(
+        "POST", "/api/session/login/cancel", Some(&json!({ "state": state })),
+    )).await.map_err(|_| "已停止本地等待，但未确认服务端取消；请勿继续授权，任务将自动过期".to_string())?
+        .map(|_| ())
+}
+
+/// 通知后端中止轮询；用于用户关窗/点取消。
 pub async fn cancel(app: &AppHandle) -> Result<(), String> {
-    let active = current_login(app);
+    // Take under the same lock used by promotion: cancellation cannot miss a
+    // local-start -> server-state transition between a snapshot and clear.
+    let active = {
+        let state = app.state::<crate::state::AppState>();
+        let mut guard = state.login.lock().map_err(|_| "登录状态锁不可用")?;
+        let active = guard.take();
+        if active.is_some() {
+            emit_login_state(app, LoginState { active: false, mode: None, edition: None, provider: None });
+        }
+        active
+    };
     if let Some(active) = active {
         if let Some(window) = app.get_webview_window(&login_window_label(&active.state)) {
             let _ = window.destroy();
         }
-        clear_active_login(app, &active.state);
-        let _ = gateway::call(
-            "POST",
-            "/api/session/login/cancel",
-            Some(&json!({ "state": active.state })),
-        )
-        .await;
+        cancel_server_login(&active.state).await?;
     }
     Ok(())
 }
@@ -1126,7 +1147,7 @@ pub async fn start(
         // 里，这里只把它翻成标题/日志用的地区名。面板仍会同时传 `edition`
         // （同一块里的分段控件），两者一致时无所谓，不一致时**以 provider 为准**
         // —— 与后端 `login_start` 的口径相同（见 api::session 的说明）。
-        "workbuddy-intl" => "intl",
+        "workbuddy-intl" | "qwenwork" => "intl",
         _ => {
             if edition == "intl" { "intl" } else { "cn" }
         }
@@ -1136,44 +1157,53 @@ pub async fn start(
     // （轮询上游 auth/token、轮询设备令牌、轮询设备授权），浏览器在哪登录都行。
     // 小浣熊**只有内嵌窗口**能收回调（自定义协议深链要靠系统注册，见模块头），
     // 给它这个选项只会制造一个永远等不到回调的卡死。
-    let use_external = mode == "external" && provider != "raccoon";
+    let use_external = (mode == "external" || provider == "qwenwork") && provider != "raccoon";
 
-    let started = gateway::call(
-        "POST",
-        "/api/session/login/start",
-        Some(&json!({ "edition": edition_id, "provider": provider })),
-    )
-    .await?;
-    let login_state = started
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("后端未返回登录状态")?
-        .to_string();
-    let auth_url = started
-        .get("authUrl")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("后端未返回登录链接，请检查网络")?
-        .to_string();
-
+    // Reserve BEFORE /start: modal-close can cancel a round that has no server state yet.
+    static NEXT_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let local_state = format!("{}{}", start_request::PREFIX, NEXT_START.fetch_add(1, Ordering::Relaxed));
+    let mode_id = if use_external { "external" } else { "embedded" };
     {
         let state = app.state::<crate::state::AppState>();
         let mut guard = state.login.lock().map_err(|_| "登录状态锁不可用")?;
-        *guard = Some(ActiveLogin {
-            state: login_state.clone(),
-            edition: edition_id.to_string(),
-            mode: if use_external { "external".into() } else { "embedded".into() },
-            provider: provider.to_string(),
+        start_request::reserve(&mut guard, ActiveLogin {
+            state: local_state.clone(), edition: edition_id.into(), mode: mode_id.into(), provider: provider.into(),
+        })?;
+        emit_login_state(app, LoginState {
+            active: true, mode: Some(mode_id.into()), edition: Some(edition_id.into()), provider: Some(provider.into()),
         });
     }
-    emit_login_state(
-        app,
-        LoginState {
-            active: true,
-            mode: Some(if use_external { "external".into() } else { "embedded".into() }),
-            edition: Some(edition_id.to_string()),
-            provider: Some(provider.to_string()),
+    let request_body = json!({ "edition": edition_id, "provider": provider });
+    let started = start_request::wait(
+        async move { gateway::call("POST", "/api/session/login/start", Some(&request_body)).await },
+        || login_is_current(app, &local_state),
+        |started| async move {
+            if let Some(state) = started.get("state").and_then(serde_json::Value::as_str) {
+                let _ = cancel_server_login(state).await;
+            }
         },
-    );
+    ).await;
+    let started = match started {
+        Ok(Some(started)) => started,
+        Ok(None) => return Ok(json!({ "canceled": true })),
+        Err(error) => { clear_active_login(app, &local_state); return Err(error); }
+    };
+    let login_state = started.get("state").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).unwrap_or("").to_string();
+    let auth_url = started.get("authUrl").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).unwrap_or("").to_string();
+    if login_state.is_empty() || auth_url.is_empty() {
+        clear_active_login(app, &local_state);
+        if !login_state.is_empty() { let _ = cancel_server_login(&login_state).await; }
+        return Err("后端未返回登录状态或授权链接，请重新发起".into());
+    }
+    let promoted = {
+        let state = app.state::<crate::state::AppState>();
+        let mut guard = state.login.lock().map_err(|_| "登录状态锁不可用")?;
+        start_request::promote(&mut guard, &local_state, &login_state)
+    };
+    if !promoted {
+        let _ = cancel_server_login(&login_state).await;
+        return Ok(json!({ "canceled": true }));
+    }
 
     // 窗口标题里的品牌名。缺省 WorkBuddy 是历史契约（老客户端只走那一家），
     // 其余家各自点名 —— 少写一家只会让标题显示成「登录 WorkBuddy 国内版账号」
@@ -1201,6 +1231,7 @@ pub async fn start(
         "lobsterai" => "LobsterAI",
         // MiniMax 只有一家（当前只接中国版；国际版将来另立 provider id）
         "minimax" => "MiniMax",
+        "qwenwork" => "QwenWork",
         // Antigravity（Google 的 AI IDE）只有一家，没有地区之分
         // （本仓 `providers::antigravity` 的模块头：端点全球统一）
         "antigravity" => "Antigravity",
@@ -1215,7 +1246,7 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "lobsterai" | "minimax" | "officeace"
+        | "qoder-intl" | "antigravity" | "lobsterai" | "minimax" | "officeace" | "qwenwork"
     ) {
         format!("登录 {provider_label} 账号")
     } else {
@@ -1241,11 +1272,10 @@ pub async fn start(
         run_embedded(app, provider, &auth_url, &title, &login_state, social_restore, None, false).await
     };
 
-    if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
-        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": login_state }))).await;
-    }
     clear_active_login(app, &login_state);
-    result
+    // Bound cleanup as well as the cancellation command; a stalled /cancel must
+    // not retain the original IPC call (and therefore the renderer's busy lock).
+    start_request::finish(result, || cancel_server_login(&login_state), Duration::from_secs(2)).await
 }
 
 /// 小浣熊网页登录：内嵌窗口 + 回调由窗口自己捕获提交（见模块头）。
@@ -1465,17 +1495,21 @@ async fn open_external(
     edition_label: &str,
     login_state: &str,
 ) -> Result<serde_json::Value, String> {
+    if !login_is_current(app, login_state) { return Ok(json!({ "canceled": true })); }
     if std::env::var("WORKBUDDY_SKIP_OPEN_BROWSER").as_deref() != Ok("1") {
         open_in_browser(auth_url)?;
     }
     let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(POLL_INTERVAL).await;
-        // 已被取消（关弹窗/点取消）：停止轮询，不当作错误
-        if !login_is_current(app, login_state) {
+        if start_request::while_current(tokio::time::sleep(POLL_INTERVAL),
+            || login_is_current(app, login_state), deadline).await?.is_none() {
             return Ok(json!({ "ok": false, "canceled": true }));
         }
-        match poll_once(login_state).await {
+        let Some(outcome) = start_request::while_current(poll_once(login_state),
+            || login_is_current(app, login_state), deadline).await? else {
+            return Ok(json!({ "ok": false, "canceled": true }));
+        };
+        match outcome {
             PollOutcome::Pending => continue,
             PollOutcome::Done(payload) => {
                 return Ok(json!({ "ok": true, "external": true, "payload": payload }))

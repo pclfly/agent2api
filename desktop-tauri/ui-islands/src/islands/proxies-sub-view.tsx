@@ -44,9 +44,10 @@ import {
   Switch,
 } from '@ui'
 import {
-  addSubscription, decodeQrImage, downloadKernel, errorMessage, kernel, loadSection,
-  refreshSubscription, removeSubscription, restartKernel, saveSubscription, subs, subscribe,
-  getSnapshot, toast, toggleSubscription, wb, type KernelStatus, type SubscriptionItem,
+  addFileSubscription, addSubscription, decodeQrImage, downloadKernel, errorMessage, kernel,
+  loadSection, pickSubscriptionFile, refreshSubscription, removeSubscription, replaceSubscriptionFile,
+  restartKernel, saveSubscription, subs, subscribe, getSnapshot, toast, toggleSubscription, wb,
+  type ImportedFile, type KernelStatus, type SubscriptionItem,
 } from './proxies-sub-state'
 import { formatTime } from './proxies-state'
 import { t } from '../i18n'
@@ -89,8 +90,9 @@ export function SubscriptionSection() {
       <div className='models-table-wrap'>
         <table className='models-table'>
           <colgroup>
-            <col className='w-[22%]' />
-            <col className='w-[36%]' />
+            <col className='w-[18%]' />
+            <col className='w-[8%]' />
+            <col className='w-[32%]' />
             <col className='w-[9%]' />
             <col className='w-[13%]' />
             <col className='w-[8%]' />
@@ -99,6 +101,7 @@ export function SubscriptionSection() {
           <thead>
             <tr>
               <th>{t('名称')}</th>
+              <th className='ta-center'>{t('来源')}</th>
               <th>{t('订阅链接')}</th>
               <th className='ta-center'>{t('节点')}</th>
               <th>{t('上次同步')}</th>
@@ -109,19 +112,41 @@ export function SubscriptionSection() {
           <tbody>
             {items.length ? items.map(item => {
               const sync = kernelStatus?.providerSync?.[item.id]
+              const isFile = item.kind === 'file'
               return (
                 <tr key={item.id} className={item.enabled ? '' : 'off'}>
                   <td><b>{item.name || t('未命名')}</b></td>
-                  {/* 链接列：hover 出复制按钮（clipboard.js 的全局委托契约 ——
-                      `data-copy` 给文本、`.copy-btn` 类换「⧉ → ✓」反馈，见 docs-page
-                      文件头的说明；岛内不自己写剪贴板逻辑） */}
+                  {/* 来源列：本地配置不参与定时刷新，这一点必须在表格里看得见 ——
+                      否则用户会以为它跟链接订阅一样每天自动更新 */}
+                  <td className='ta-center'>
+                    {isFile
+                      ? <Badge variant='secondary' title={t('本地配置文件：不参与定时刷新，改文件后在行内点「重新导入」')}>{t('本地文件')}</Badge>
+                      : <Badge title={t('内核按 24 小时间隔拉取')}>{t('链接')}</Badge>}
+                  </td>
+                  {/* 链接列：本地配置显示原路径（title 里给完整路径），链接订阅显示主机段 */}
                   <td className='group'>
                     <div className='flex items-center gap-1'>
-                      <span className='font-mono text-[12px] text-text-2'
-                        title={item.url}>{shortUrl(item.url)}</span>
-                      <Button variant='ghost' size='icon-xs'
-                        className='copy-btn size-[21px] rounded-[var(--r-xs)] opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100'
-                        data-copy={item.url} title={t('复制订阅链接')}>⧉</Button>
+                      {isFile ? (
+                        <>
+                          <span className='font-mono text-[12px] text-text-2'
+                            title={item.sourcePath || t('未记录原路径（网页端导入）')}>
+                            {item.sourcePath ? shortPath(item.sourcePath) : t('未记录原路径')}
+                          </span>
+                          {item.sourcePath ? (
+                            <Button variant='ghost' size='icon-xs'
+                              className='copy-btn size-[21px] rounded-[var(--r-xs)] opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100'
+                              data-copy={item.sourcePath} title={t('复制文件路径')}>⧉</Button>
+                          ) : null}
+                        </>
+                      ) : (
+                        <>
+                          <span className='font-mono text-[12px] text-text-2'
+                            title={item.url}>{shortUrl(item.url)}</span>
+                          <Button variant='ghost' size='icon-xs'
+                            className='copy-btn size-[21px] rounded-[var(--r-xs)] opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100'
+                            data-copy={item.url} title={t('复制订阅链接')}>⧉</Button>
+                        </>
+                      )}
                     </div>
                   </td>
                   {/* 节点列只放读数；同步时间归「上次同步」列（两列各就各位）。
@@ -152,8 +177,19 @@ export function SubscriptionSection() {
                     <div className='row-actions'>
                       <Button size='sm' variant='ghost' disabled={snapshot.pending || snapshot.refreshing !== null}
                         onClick={() => void refreshSubscription(item)}>
-                        {snapshot.refreshing === item.id ? t('更新中…') : t('立即更新')}
+                        {snapshot.refreshing === item.id
+                          ? t('更新中…')
+                          : isFile ? t('重新导入') : t('立即更新')}
                       </Button>
+                      {/* 换文件：本地文件订阅独有的入口（原地替换，id 不变）。
+                          链接订阅没有这一项 —— 改链接在「编辑」里改。 */}
+                      {isFile ? (
+                        <Button size='sm' variant='ghost' disabled={snapshot.pending}
+                          title={t('换一份配置文件替换当前内容（订阅 id 不变，账号引用不会断）')}
+                          onClick={() => void replaceLocalFile(item)}>
+                          {t('换文件')}
+                        </Button>
+                      ) : null}
                       <Button size='sm' variant='ghost' disabled={snapshot.pending}
                         onClick={() => setModal({ item })}>{t('编辑')}</Button>
                       <Button size='sm' variant='destructive' disabled={snapshot.pending}
@@ -164,12 +200,13 @@ export function SubscriptionSection() {
               )
             }) : (
               <tr>
-                <td colSpan={6} className='empty'>
+                <td colSpan={7} className='empty'>
                   {ready ? (
                     /* 空态内嵌主操作按钮（视线不用跳到右上角）：一句话 + 按钮 +
-                       一句「接下来会发生什么」的副提示 */
+                       一句「接下来会发生什么」的副提示。本地配置导入在弹窗里
+                       （它要一起填名字），空态只指向弹窗那一个入口。 */
                     <div className='flex flex-col items-center gap-2 py-3'>
-                      <span>{t('还没有订阅：粘贴订阅链接，或从图片识别二维码导入。')}</span>
+                      <span>{t('还没有订阅：粘贴订阅链接、从图片识别二维码，或导入本机已有的 Clash / mihomo 配置文件。')}</span>
                       <Button size='sm' variant='outline' disabled={snapshot.pending}
                         onClick={() => setModal({ item: null })}>{t('＋ 新增订阅')}</Button>
                       <span className='text-[11px] text-subtle'>
@@ -187,6 +224,9 @@ export function SubscriptionSection() {
       <div className='panel-foot'>
         <span>
           {t('订阅里的节点会被内核起成本地监听器，镜像到下方代理池（账号按 id 引用，与本页其它出口同一用法）。内核只在用到订阅时按需下载（约 20-40MB），不随安装包分发。')}
+        </span>
+        <span>
+          {t('两种来源的刷新方式不同：链接订阅由内核每 24 小时自动拉取；本地配置文件不参与定时刷新，改完文件在行内点「重新导入」即可；换成另一份文件点「换文件」（原地替换，订阅 id 不变，账号引用不会断）。')}
         </span>
         {snapshot.error ? (
           <span className='text-destructive'>{t('读取失败：{reason}', { reason: snapshot.error })}</span>
@@ -285,6 +325,12 @@ function shortUrl(url: string): string {
   }
 }
 
+/** 路径截断（只留末两段；title 里有完整路径） */
+function shortPath(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean)
+  return parts.length <= 2 ? path : `…/${parts.slice(-2).join('/')}`
+}
+
 /**
  * 节点数：优先内核状态里的**实时**同步结果，回落条目上的注入快照。
  *
@@ -297,6 +343,30 @@ function liveNodeCount(
   item: SubscriptionItem,
 ): number {
   return sync?.count ?? item.nodeCount
+}
+
+/**
+ * 换一份本地配置文件：弹选文件框 → 直接原地替换（不改名字、不重建条目）。
+ *
+ * 为什么不进「编辑」弹窗：那个弹窗的职责是改名字 / 启用位，而换文件是一次
+ * 「选文件 + 校验 + 写盘 + 让内核重读」的动作 —— 塞进弹窗会让用户以为要再点
+ * 一次保存，也会把「取消弹窗」与「取消换文件」两种意图混在一起。
+ * 失败不改变任何状态（后端先校验后写盘，见 `api::subscriptions::replace_file`）。
+ */
+async function replaceLocalFile(item: SubscriptionItem): Promise<void> {
+  let picked: ImportedFile | null
+  try {
+    picked = await pickSubscriptionFile()
+  } catch (error) {
+    toast(t('读取文件失败：{reason}', { reason: errorMessage(error) }), 'err')
+    return
+  }
+  if (!picked) return
+  try {
+    await replaceSubscriptionFile(item, picked.content || '', picked.path || undefined)
+  } catch (error) {
+    toast(t('替换失败：{reason}', { reason: errorMessage(error) }), 'err')
+  }
 }
 
 /* ─── 新增 / 编辑弹窗 ───────────────────────── */
@@ -316,30 +386,99 @@ function SubModal({
   const [decoding, setDecoding] = React.useState(false)
   const [status, setStatus] = React.useState<React.ReactNode>(null)
   const fileInput = React.useRef<HTMLInputElement | null>(null)
+  /**
+   * 导入的本地配置文件（新增时的第二种来源）。
+   *
+   * 只有**新增**能选它：编辑一条已有的链接订阅时改成「本地文件」需要重新选
+   * 文件、重建 provider，与「改个名字 / 链接」不是同一件事 —— 那种情况让用户
+   * 删掉重建。编辑一条本地文件订阅时这里固定显示它的原路径（只读）。
+   */
+  const [localFile, setLocalFile] = React.useState<ImportedFile | null>(null)
+  const isFileMode = editing ? item!.kind === 'file' : localFile !== null
 
   async function save(): Promise<void> {
     if (saving) return
     const nameText = name.trim()
-    const urlText = url.trim()
     if (!nameText) {
       setStatus(<span className='text-destructive'>❌ {t('请填写订阅名称')}</span>)
       return
     }
+    if (editing) {
+      // 本地文件订阅的编辑只改名字 / 启用位：来源与内容都不在这里动
+      //（要换文件就删掉重建，见 localFile 的说明）。链接订阅则要求合法链接。
+      if (isFileMode) {
+        setSaving(true)
+        try {
+          await saveSubscription(item!, { name: nameText, url: item!.url, enabled })
+          onClose()
+        } catch (error) {
+          setStatus(<span className='text-destructive'>❌ {errorMessage(error)}</span>)
+          setSaving(false)
+        }
+        return
+      }
+      const urlText = url.trim()
+      if (!(urlText.startsWith('http://') || urlText.startsWith('https://'))) {
+        setStatus(<span className='text-destructive'>❌ {t('订阅链接必须是 http:// 或 https:// 开头')}</span>)
+        return
+      }
+      setSaving(true)
+      try {
+        await saveSubscription(item!, { name: nameText, url: urlText, enabled })
+        onClose()
+      } catch (error) {
+        setStatus(<span className='text-destructive'>❌ {errorMessage(error)}</span>)
+        setSaving(false)
+      }
+      return
+    }
+    if (localFile) {
+      // 本地配置：内容已经拿到（选文件时由壳读好、后端校验过），这里只提交
+      setSaving(true)
+      try {
+        await addFileSubscription(nameText, localFile.path || '', localFile.content || '')
+        onClose()
+      } catch (error) {
+        setStatus(<span className='text-destructive'>❌ {errorMessage(error)}</span>)
+        setSaving(false)
+      }
+      return
+    }
+    const urlText = url.trim()
     if (!(urlText.startsWith('http://') || urlText.startsWith('https://'))) {
       setStatus(<span className='text-destructive'>❌ {t('订阅链接必须是 http:// 或 https:// 开头')}</span>)
       return
     }
     setSaving(true)
     try {
-      if (editing) {
-        await saveSubscription(item!, { name: nameText, url: urlText, enabled })
-      } else {
-        await addSubscription(nameText, urlText)
-      }
+      await addSubscription(nameText, urlText)
       onClose()
     } catch (error) {
       setStatus(<span className='text-destructive'>❌ {errorMessage(error)}</span>)
       setSaving(false)
+    }
+  }
+
+  /** 选本地配置文件：壳弹系统选文件框 → 后端校验并回执元信息 */
+  async function pickFile(): Promise<void> {
+    if (saving) return
+    setStatus(t('正在读取文件…'))
+    try {
+      const picked = await pickSubscriptionFile()
+      if (!picked) {
+        setStatus(null)
+        return
+      }
+      setLocalFile(picked)
+      if (!name.trim() && picked.name) setName(picked.name)
+      setStatus(
+        <span className='text-success'>
+          ✅ {t('已读取：{n} 条节点声明', { n: picked.declaredNodes ?? 0 })}
+        </span>,
+      )
+    } catch (error) {
+      setLocalFile(null)
+      setStatus(<span className='text-destructive'>❌ {errorMessage(error)}</span>)
     }
   }
 
@@ -384,23 +523,38 @@ function SubModal({
           </div>
 
           <div className='flex flex-col gap-1.5'>
-            <Label htmlFor='sub-url'>{t('订阅链接')}</Label>
-            <Input id='sub-url' autoComplete='off' spellCheck={false}
-              placeholder='https://…' value={url}
-              onChange={event => setUrl(event.currentTarget.value)} />
-            <div className='flex items-center gap-2'>
-              <Button size='sm' variant='outline' disabled={decoding}
-                onClick={() => fileInput.current?.click()}>
-                {decoding ? t('识别中…') : t('从图片识别二维码')}
-              </Button>
-              <span className='text-[11px] text-subtle'>{t('也可以把二维码截图直接粘贴到弹窗里（Ctrl+V）')}</span>
-              <input ref={fileInput} type='file' accept='image/*' className='hidden'
-                onChange={event => {
-                  const file = event.currentTarget.files?.[0]
-                  if (file) void decodeFrom(file)
-                  event.currentTarget.value = ''
-                }} />
-            </div>
+            <Label htmlFor='sub-url'>{isFileMode ? t('配置文件') : t('订阅链接')}</Label>
+            {isFileMode ? (
+              <div className='flex items-center gap-2'>
+                <Input id='sub-url' readOnly spellCheck={false}
+                  value={localFile?.path || item?.sourcePath || ''}
+                  placeholder={t('（网页端导入：不记录原路径）')} />
+                {editing ? null : (
+                  <Button size='sm' variant='outline' disabled={saving}
+                    onClick={() => void pickFile()}>{t('重新选择')}</Button>
+                )}
+              </div>
+            ) : (
+              <Input id='sub-url' autoComplete='off' spellCheck={false}
+                placeholder='https://…' value={url}
+                onChange={event => setUrl(event.currentTarget.value)} />
+            )}
+            {isFileMode ? null : (
+              <div className='flex items-center gap-2'>
+                <Button size='sm' variant='outline' disabled={decoding}
+                  onClick={() => fileInput.current?.click()}>
+                  {decoding ? t('识别中…') : t('从图片识别二维码')}
+                </Button>
+                <Button size='sm' variant='outline' disabled={saving}
+                  onClick={() => void pickFile()}>{t('导入本地配置文件')}</Button>
+                <span className='text-[11px] text-subtle'>{t('也可以把二维码截图直接粘贴到弹窗里（Ctrl+V）')}</span>                <input ref={fileInput} type='file' accept='image/*' className='hidden'
+                  onChange={event => {
+                    const file = event.currentTarget.files?.[0]
+                    if (file) void decodeFrom(file)
+                    event.currentTarget.value = ''
+                  }} />
+              </div>
+            )}
           </div>
 
           <div className='flex flex-row items-center gap-2.5'>
@@ -409,7 +563,9 @@ function SubModal({
           </div>
 
           <p className='text-xs leading-[1.65] text-subtle'>
-            {t('订阅内容由内核定时刷新（每 24 小时）；节点数与同步状态在保存后由轮询刷新，稍等几秒。')}
+            {isFileMode
+              ? t('本地配置文件只认 Clash / mihomo 的 YAML（含 proxies 列表）。它不参与定时刷新：改完原文件后，在列表里点「重新导入」。')
+              : t('订阅内容由内核定时刷新（每 24 小时）；节点数与同步状态在保存后由轮询刷新，稍等几秒。')}
           </p>
 
           <div className='min-h-[18px] text-xs text-subtle'>{status}</div>
@@ -417,7 +573,8 @@ function SubModal({
         <DialogFooter>
           <div className='mr-auto' />
           <Button variant='outline' disabled={saving} onClick={onClose}>{t('取消')}</Button>
-          <Button variant='default' disabled={saving || decoding} onClick={() => void save()}>
+          <Button variant='default' disabled={saving || decoding || (isFileMode && !editing && !localFile)}
+            onClick={() => void save()}>
             {saving ? t('保存中…') : t('保存')}
           </Button>
         </DialogFooter>

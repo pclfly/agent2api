@@ -134,6 +134,7 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 它当「配置里已删掉的键」清掉，下次启动同一批历史被重算第二遍
     // （日期键未变时是幂等覆盖、静默；变过日期键就留下重复的聚合行）。
     "modelUsageUpstreamRemapped",
+    "accountCreditsBackfilled",
     // 远程模型清单的持久化缓存（core::providers::catalog_cache）：整份
     // 「各家上次成功拉到的清单」一个键（十份清单挤一个键的理由见那个模块头）。
     // 属于「其它零散状态」——它不是配置项，配置写入绝不能动它。
@@ -242,7 +243,9 @@ pub fn is_reserved(key: &str) -> bool {
 /// 见 [`apply_v10`]。上游与本地各自把 v10 用作一列（上游 `route`、本地
 /// `credit`），从任一线升上来的库都缺对方那一列，而迁移从 `current + 1`
 /// 开始跑、跳不到那一版 —— 本版本重跑同一份幂等加列，两条线在此收敛。
-pub const SCHEMA_VERSION: i64 = 12;
+///
+/// v13：请求积分来源。必须使用新迁移，已到 v12 的库不会重跑 apply_v10。
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -832,6 +835,13 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         // v12：两线 v10 的收敛 —— 重跑同一份幂等加列，让「上游的库」补上
         // credit、「本地的库」补上 route（见 SCHEMA_VERSION 与 apply_v10）
         12 => apply_v10(conn),
+        13 => {
+            let exists = conn.prepare("SELECT 1 FROM pragma_table_info('requests') WHERE name = 'credit_source'")?.exists([])?;
+            if !exists {
+                conn.execute_batch("ALTER TABLE requests ADD COLUMN credit_source TEXT NOT NULL DEFAULT '';")?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -906,6 +916,20 @@ mod tests {
         migrate(&conn).expect("全新库迁移应通过");
         assert!(has_column(&conn, "route"), "全新库应有 route 列");
         assert!(has_column(&conn, "credit"), "全新库应有 credit 列");
+    }
+
+    #[test]
+    fn v12_gains_credit_source_without_losing_credit() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=12 { apply_version(&conn, version).unwrap(); }
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        assert!(!has_column(&conn, "credit_source"));
+        conn.execute("INSERT INTO requests(id, ts, model, credit) VALUES ('1', 1, 'test', 0.125)", []).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let row:(f64,String)=conn.query_row("SELECT credit, credit_source FROM requests WHERE id=1", [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(row, (0.125, String::new()));
+        apply_version(&conn, 13).unwrap();
     }
 
     /// 迁移幂等：跑第二遍不报错、不改版本号。

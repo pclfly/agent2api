@@ -295,7 +295,12 @@ export function ProxyForm({
                 <SelectValue>
                   {pool?.find(item => item.id === draft.proxyId)
                     ? poolItemLabel(pool.find(item => item.id === draft.proxyId)!)
-                    : (pool === null ? t('正在读取…') : pool.length ? t('请选择代理') : t('还没有保存的代理'))}
+                    : draft.proxyId
+                      // 引用的条目不在可用列表里：已禁用 / 已删除 / Clash 侧删了
+                      // 出口。绝不能回落成「请选择代理」（那会把「配着但用不了」
+                      // 显示成「没配」），但这里拿不到条目名，所以只点明事实
+                      ? t('当前引用的代理已禁用或已删除')
+                      : (pool === null ? t('正在读取…') : pool.length ? t('请选择代理') : t('还没有可用的代理'))}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
@@ -314,8 +319,8 @@ export function ProxyForm({
               : pool === null
                 ? t('正在读取代理列表…')
                 : pool.length
-                  ? t('地址与端口由「网络代理」页管理：那边改一次、测一次，所有引用它的账号一起生效')
-                  : t('「网络代理」页还没有出口 —— 去那里新增，或点「同步 Clash Verge」把 Clash 的出口导进来')}
+                  ? t('地址与端口由「网络代理」页管理：那边改一次、测一次，所有引用它的账号一起生效；已禁用的节点不出现在这里')
+                  : t('「网络代理」页还没有可用出口 —— 去那里新增，或把已禁用的节点打开')}
           </div>
         </div>
       ) : null}

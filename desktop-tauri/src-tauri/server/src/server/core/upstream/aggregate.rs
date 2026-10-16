@@ -157,7 +157,12 @@ async fn aggregate_frame_stream_inner(
             }
             // 错误描述已在构造时折进 io::Error（reqwest 直连在
             // `aggregate_sse_completion`、翻译流在 `ProtocolTranslateStream`）
-            GatewayError::with_status(502, format!("上游流式传输中断: {error}"))
+            // 上游在流中途断掉（没发 TLS close_notify）单独换成一句能指向
+            // 排查方向的说明，与流式路径同一口径（见 `describe_stream_break`）
+            match crate::server::core::egress::describe_stream_break(&text) {
+                Some(message) => GatewayError::with_status(502, message),
+                None => GatewayError::with_status(502, format!("上游流式传输中断: {error}")),
+            }
         })?;
         if !first_chunk_seen {
             first_chunk_seen = true;

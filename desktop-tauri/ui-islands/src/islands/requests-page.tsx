@@ -15,6 +15,8 @@ import {
   type PageSizeChoice,
 } from './table-shell'
 import { t } from '../i18n'
+import { providerOptionsForDisplay, resolveProviderLabel } from './provider-label'
+import { useProviderLabels } from './use-provider-labels'
 
 /**
  * Agent2API · 请求日志页（网关转发明细：筛选 / 分页 / 自动刷新）—— React 岛。
@@ -74,6 +76,7 @@ type RequestEntry = {
   promptTokens?: number; completionTokens?: number; totalTokens?: number; cacheReadTokens?: number
   /** 本次请求消耗的积分（上游 usage.credit；null/缺省 = 上游没报这个字段，不是 0） */
   credit?: number | null
+  creditSource?: string
   attempts?: number; attemptDetails?: unknown[]; sensitiveHits?: unknown[]
   /** 模型测试发起的请求（后端 `is_test`；此前落盘的老行没有这个键） */
   isTest?: boolean
@@ -600,9 +603,9 @@ function countRetries(entry: RequestEntry): number {
   }, 0)
 }
 
-/** 提供商展示名：providers.js 目录 → 原样回显 id（行内那一列还优先用后端给的 providerLabel） */
-function providerLabelOf(id: string): string {
-  return shared().wbProviders?.labelOf?.(id) || id
+/** 展示名：最新目录 → 后端有效名称 → 原始 ID；账号字段不参与解析。 */
+function providerLabelOf(id: string, backendLabel?: string): string {
+  return resolveProviderLabel(id, backendLabel, shared().wbProviders?.labelOf)
 }
 
 /** 行 key 的去重：ts 在同一毫秒可能重复（并发请求），重复的补一个序号后缀，避免 React 报重复 key */
@@ -785,7 +788,7 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
     case 'target': {
       const id = String(entry.provider ?? '').trim()
       const fromBackend = String(entry.providerLabel ?? '').trim()
-      const provider = fromBackend || (id ? providerLabelOf(id) : '')
+      const provider = providerLabelOf(id, fromBackend)
       // 账号为空 = 请求在选定账号之前就失败了（后端契约：无账号时给空串），显式给破折号而不是留空
       return (
         <span key={key} className={className}>
@@ -981,9 +984,10 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
         return <span key={key} className={`req-none ${base} ta-${align}`} title='上游未回报本次消耗的积分'>-</span>
       }
       const text = formatCredit(number)
+      const estimated = entry.creditSource === 'estimate'
       return (
-        <span key={key} className={className} title={`本次请求消耗 ${text} 积分`}>
-          <span className='req-credit-line'>{text}</span>
+        <span key={key} className={className} title={estimated ? t('按 Token 用量预估 {credit} 积分，并非上游实际扣费', { credit: text }) : `本次请求消耗 ${text} 积分`}>
+          <span className='req-credit-line'>{estimated ? '≈' : ''}{text}</span>
         </span>
       )
     }
@@ -1031,6 +1035,7 @@ function headRow(columns: VisibleColumn[]): React.ReactNode {
 /* ─── 面板本体 ─────────────────────────────── */
 
 function RequestsPage() {
+  useProviderLabels()
   const [data, setData] = React.useState<PanelData>(EMPTY_DATA)
   const [filters, setFilters] = React.useState<Filters>(() => readSavedFilters())
   const [range, setRange] = React.useState<string>(() => current.range)
@@ -1316,15 +1321,13 @@ function RequestsPage() {
   if (runningOnly) summaryParts.push(t('只看进行中'))
   else if (filters.status === 'ok') summaryParts.push(t('只看成功'))
   else if (filters.status === 'error') summaryParts.push(t('只看失败'))
-  if (filters.provider) summaryParts.push(providerLabelOf(filters.provider))
+  if (filters.provider) summaryParts.push(providerLabelOf(filters.provider, providerOptions.find(item => item.value === filters.provider)?.label))
   if (filters.model) summaryParts.push(filters.model)
 
   /** 选中值不在候选清单里（筛着某个模型时把日志清空了 / 排在第 201 位）就把它自己补进去 ——
    *  否则用户看到的筛选条件会**静默消失**，而列表还是上一次的结果（旧实现 fillFilterSelect 的同一取舍） */
-  const providerSelectOptions = React.useMemo(() => {
-    if (!filters.provider || providerOptions.some(item => item.value === filters.provider)) return providerOptions
-    return [{ value: filters.provider, label: filters.provider }, ...providerOptions]
-  }, [filters.provider, providerOptions])
+  // Resolve on each render: late directory loads and renames update even with polling off.
+  const providerSelectOptions = providerOptionsForDisplay(providerOptions, filters.provider, shared().wbProviders?.labelOf)
   const modelSelectOptions = React.useMemo(() => {
     if (!filters.model || modelOptions.includes(filters.model)) return modelOptions
     return [filters.model, ...modelOptions]

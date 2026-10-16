@@ -15,9 +15,21 @@
 //! `core::sub_kernel`（它只认识 proxy_pool），本模块不碰。
 //!
 //! ── 字段 ────────────────────────────────────────────────────
-//! `{id, name, url, enabled, createdAt, updatedAt}`。id 形如
-//! `sub_<毫秒>_<8 位随机>`（与代理池条目同一手法），它同时是 mihomo
+//! `{id, name, kind, url, path, sourcePath, enabled, createdAt, updatedAt}`。
+//! id 形如 `sub_<毫秒>_<8 位随机>`（与代理池条目同一手法），它同时是 mihomo
 //! proxy-provider 名字的前缀（`sub_<id>`），所以只允许小写字母数字下划线。
+//!
+//! ── kind：链接订阅 vs 本地配置文件 ─────────────────────────────
+//! `kind: "url"`（缺省，存量条目全是这种）= 内核定时拉取的机场订阅链接；
+//! `kind: "file"` = 用户导入的**本地配置文件**（Clash / mihomo YAML，内含
+//! `proxies` 列表）。两者的差别只有三处，其余链路完全共用：
+//!   · 内核配置里的 provider `type` 是 `http` / `file`（见 `sub_kernel`）；
+//!   · file 条目**不参与定时刷新** —— 内核的 file provider 没有 interval，
+//!     内容只在我们写入时变（导入时写一次，「立即更新」重新导入一次）；
+//!   · file 条目的 YAML 内容由 api 层写进内核目录，本模块只存元数据与
+//!     原始路径（`sourcePath`，仅用于「从原路径重新导入」与报错文案）。
+//! 不把内容存进 kv：那是几十 KB 到几 MB 的文本，与「条目数量级小、整份读写」
+//! 的 kv 契约不合；内核目录本来就是这些文件的落点。
 
 use std::sync::OnceLock;
 
@@ -30,9 +42,14 @@ use crate::server::logging;
 /// `kv` 表里的键名（保留键，见 `db::schema::RESERVED_KV_KEYS`）
 pub const KV_KEY: &str = "subscriptions";
 
-/// 名称 / 链接的长度上限（名称出现在表格里；链接要进 mihomo 配置）
+/// 名称 / 链接 / 本地路径的长度上限（名称出现在表格里；链接要进 mihomo 配置）
 const MAX_NAME_LENGTH: usize = 60;
 const MAX_URL_LENGTH: usize = 2048;
+const MAX_PATH_LENGTH: usize = 1024;
+
+/// 订阅来源：内核定时拉取的链接 / 用户导入的本地配置文件
+pub const KIND_URL: &str = "url";
+pub const KIND_FILE: &str = "file";
 
 /// 进程级库句柄（照 `core::proxy_pool` 的形态：bootstrap 时 install 一次）
 static DB: OnceLock<Option<Db>> = OnceLock::new();
@@ -109,6 +126,19 @@ fn valid_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 条目的来源类型；缺字段的存量条目一律按链接订阅（它们全是那种）。
+pub fn kind_of(item: &Value) -> String {
+    let kind = text_of(item, "kind");
+    if kind == KIND_FILE { KIND_FILE.to_string() } else { KIND_URL.to_string() }
+}
+
+/// 内核 provider 的缓存文件路径（相对于内核目录）。两种来源共用它：
+/// http provider 把它当缓存落点，file provider 直接读它 —— 所以「写进去的
+/// YAML」与「内核读到的节点」永远是同一份文件。
+pub fn provider_cache_path(id: &str) -> String {
+    format!("providers/sub_{id}.yaml")
+}
+
 /// 新条目的 id：`sub_<毫秒>_<8 位随机>`。随机段与 `proxy_pool::new_id` 同一
 /// 手法（RandomState 的随机种子），不引第三方依赖。
 fn new_id() -> String {
@@ -123,6 +153,8 @@ fn new_id() -> String {
 /// 把 API 输入（新增的整份表单）归一成一条订阅条目。
 ///
 /// 新增时 `existing` 传 None；编辑时从旧条目沿用 `id` / `createdAt`。
+/// `kind` 决定校验哪一侧：链接订阅查 url，本地配置文件查原始路径
+/// （YAML 内容由 api 层校验并写盘，本模块不认识内核目录）。
 fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, String> {
     let Some(object) = input.as_object() else {
         return Err("订阅条目必须是对象".to_string());
@@ -131,8 +163,26 @@ fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, Stri
     if name.is_empty() {
         return Err("请填写订阅名称".to_string());
     }
+    // kind 跟随输入；输入没给时沿用旧条目（编辑旧链接订阅时不必重传 kind）
+    let kind_input = clean_string(object.get("kind"), 10);
+    let kind = if kind_input == KIND_FILE {
+        KIND_FILE.to_string()
+    } else if kind_input == KIND_URL {
+        KIND_URL.to_string()
+    } else {
+        existing.map(kind_of).unwrap_or_else(|| KIND_URL.to_string())
+    };
     let url = clean_string(object.get("url"), MAX_URL_LENGTH);
-    valid_url(&url)?;
+    let source_path = clean_string(object.get("sourcePath"), MAX_PATH_LENGTH);
+    if kind == KIND_FILE {
+        // 本地配置的「链接」就是它的原始路径（表格里那一列要显示点什么，
+        // 且「立即更新」需要知道从哪里重新导入）
+        if source_path.is_empty() {
+            return Err("请选择要导入的本地配置文件".to_string());
+        }
+    } else {
+        valid_url(&url)?;
+    }
     let now = logging::now_ms();
     let id = existing
         .map(|item| text_of(item, "id"))
@@ -145,7 +195,14 @@ fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, Stri
     let mut normalized = Map::new();
     normalized.insert("id".to_string(), Value::String(id));
     normalized.insert("name".to_string(), Value::String(name));
-    normalized.insert("url".to_string(), Value::String(url));
+    normalized.insert("kind".to_string(), Value::String(kind.clone()));
+    if kind == KIND_FILE {
+        normalized.insert("url".to_string(), Value::String(String::new()));
+        normalized.insert("sourcePath".to_string(), Value::String(source_path));
+    } else {
+        normalized.insert("url".to_string(), Value::String(url));
+        normalized.insert("sourcePath".to_string(), Value::String(String::new()));
+    }
     normalized.insert(
         "enabled".to_string(),
         Value::Bool(!matches!(object.get("enabled"), Some(Value::Bool(false)))),
@@ -161,7 +218,9 @@ fn describe_item(item: &Value, node_count: usize) -> Value {
     json!({
         "id": text_of(item, "id"),
         "name": text_of(item, "name"),
+        "kind": kind_of(item),
         "url": text_of(item, "url"),
+        "sourcePath": text_of(item, "sourcePath"),
         "enabled": !matches!(item.get("enabled"), Some(Value::Bool(false))),
         "createdAt": item.get("createdAt").cloned().unwrap_or(Value::from(0)),
         "updatedAt": item.get("updatedAt").cloned().unwrap_or(Value::from(0)),
@@ -188,10 +247,20 @@ pub fn create(input: &Value) -> Result<Vec<Value>, String> {
     let item = normalize_item(input, None)?;
     let mut items = read_items();
     // 同一链接只存一份：重复导入是常见误操作（同一订阅改个名再存一遍
-    // 会拉两次内容、占两份 provider）
-    let url = text_of(&item, "url");
-    if items.iter().any(|item| text_of(item, "url") == url) {
-        return Err("该订阅链接已存在".to_string());
+    // 会拉两次内容、占两份 provider）。本地配置文件按**原始路径**去重：
+    // 同一个文件导入两次同样是白占一份 provider。
+    if kind_of(&item) == KIND_FILE {
+        let path = text_of(&item, "sourcePath");
+        if items.iter().any(|item| {
+            kind_of(item) == KIND_FILE && text_of(item, "sourcePath") == path
+        }) {
+            return Err("该本地配置文件已导入过".to_string());
+        }
+    } else {
+        let url = text_of(&item, "url");
+        if items.iter().any(|item| kind_of(item) != KIND_FILE && text_of(item, "url") == url) {
+            return Err("该订阅链接已存在".to_string());
+        }
     }
     items.insert(0, item.clone());
     write_items(&items)?;
@@ -217,13 +286,20 @@ pub fn update(input: &Value) -> Result<Vec<Value>, String> {
     };
     let next = normalize_item(input, Some(&items[index]))?;
     // 改链接时查重（排除自己）
-    let url = text_of(&next, "url");
-    if items
-        .iter()
-        .enumerate()
-        .any(|(position, item)| position != index && text_of(item, "url") == url)
-    {
-        return Err("该订阅链接已存在".to_string());
+    if kind_of(&next) == KIND_FILE {
+        let path = text_of(&next, "sourcePath");
+        if items.iter().enumerate().any(|(position, item)| {
+            position != index && kind_of(item) == KIND_FILE && text_of(item, "sourcePath") == path
+        }) {
+            return Err("该本地配置文件已导入过".to_string());
+        }
+    } else {
+        let url = text_of(&next, "url");
+        if items.iter().enumerate().any(|(position, item)| {
+            position != index && kind_of(item) != KIND_FILE && text_of(item, "url") == url
+        }) {
+            return Err("该订阅链接已存在".to_string());
+        }
     }
     items[index] = next.clone();
     write_items(&items)?;
@@ -288,6 +364,7 @@ pub fn enabled_provider_inputs() -> Vec<ProviderInput> {
             id: text_of(item, "id"),
             name: text_of(item, "name"),
             url: text_of(item, "url"),
+            kind: kind_of(item),
         })
         .collect()
 }
@@ -295,4 +372,73 @@ pub fn enabled_provider_inputs() -> Vec<ProviderInput> {
 /// 是否已安装内核且有启用的订阅（bootstrap 自动拉起的判据）
 pub fn should_autostart() -> bool {
     crate::server::core::sub_kernel::installed() && has_enabled()
+}
+
+/// 一条订阅的完整形态（api 层写本地配置文件、重新导入时定位条目用）。
+pub fn find(id: &str) -> Option<Value> {
+    read_items()
+        .into_iter()
+        .find(|item| text_of(item, "id") == id)
+}
+
+/// 该本地文件路径是否已被**另一条**订阅占用（原地替换换位置前的查重）。
+///
+/// 单独一个只读函数而不是让调用方把列表拆开看：去重口径（只比 file 条目、
+/// 排除自己）与 `create` / `update` 里那两处必须一致，写成一处引用。
+pub fn file_path_taken(path: &str, except_id: &str) -> bool {
+    read_items().iter().any(|item| {
+        kind_of(item) == KIND_FILE
+            && text_of(item, "id") != except_id
+            && text_of(item, "sourcePath") == path
+    })
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 缺字段的存量条目一律按链接订阅 —— 这个兜底决定了升级后老订阅不会
+    /// 突然变成「本地文件」而拿不到 url。
+    #[test]
+    fn missing_kind_defaults_to_a_url_subscription() {
+        assert_eq!(kind_of(&json!({"id": "sub_1"})), KIND_URL);
+        assert_eq!(kind_of(&json!({"id": "sub_1", "kind": "url"})), KIND_URL);
+        assert_eq!(kind_of(&json!({"id": "sub_1", "kind": "file"})), KIND_FILE);
+        // 未知取值按链接处理（不把坏数据当成本地文件）
+        assert_eq!(kind_of(&json!({"id": "sub_1", "kind": "weird"})), KIND_URL);
+    }
+
+    /// 两种来源共用同一个缓存文件路径：导入时写进去的 YAML 就是内核读到的文件。
+    ///
+    /// 实际落盘是 `sub_sub_<毫秒>_<随机>.yaml`（id 本身带 `sub_` 前缀，而 provider
+    /// 名又是 `sub_<id>`）—— 这不是重复，是本仓既有的命名（`data/proxy-kernel/providers/`
+    /// 下的存量文件就是这个形状）：改掉前缀会让内核找不到已有缓存、所有订阅重拉一遍。
+    #[test]
+    fn provider_cache_path_is_shared_by_both_kinds() {
+        assert_eq!(provider_cache_path("local"), "providers/sub_local.yaml");
+        assert_eq!(
+            provider_cache_path("sub_1792052874963_dc1b6bb8"),
+            "providers/sub_sub_1792052874963_dc1b6bb8.yaml"
+        );
+    }
+
+    /// 本地配置文件按**原始路径**校验与去重，链接订阅按 url
+    #[test]
+    fn a_local_file_needs_a_source_path_not_a_url() {
+        let missing = normalize_item(&json!({"name": "本机配置", "kind": "file"}), None).unwrap_err();
+        assert!(missing.contains("本地配置文件"), "{missing}");
+        let ok = normalize_item(
+            &json!({"name": "本机配置", "kind": "file", "sourcePath": "C:/nodes.yaml"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(kind_of(&ok), KIND_FILE);
+        assert_eq!(ok["sourcePath"], json!("C:/nodes.yaml"));
+        // 本地文件条目的 url 恒为空串：没有远端可拉
+        assert_eq!(ok["url"], json!(""));
+        // 链接订阅仍然要求合法链接
+        let bad = normalize_item(&json!({"name": "机场", "url": "ftp://x"}), None).unwrap_err();
+        assert!(bad.contains("http"), "{bad}");
+    }
 }

@@ -340,6 +340,20 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task_state, "authUrl": auth_url,
             "edition": task_edition, "provider": "lobsterai" }));
     }
+    // QwenWork: locally generated PKCE confirmation URL; the worker polls the
+    // official service. No authorization code callback is accepted for this flow.
+    if kind == crate::server::core::providers::ProviderKind::QwenWork {
+        let name = payload.as_ref()
+            .and_then(|p| p.get("name").and_then(Value::as_str))
+            .map(str::to_string).filter(|v| !v.trim().is_empty());
+        let handle = match state.login().start_qwenwork_login(name) {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        return ok_json(json!({"state":task.state,"authUrl":task.auth_url,
+            "edition":"intl","provider":"qwenwork"}));
+    }
     // MiniMax：**设备授权登录**（OAuth 设备码 + PKCE，与 Qoder / Cline 同形）。
     // 同步问上游要 user_code 与授权页地址（一次 POST），把地址交给界面打开；
     // 用户确认后由后台任务轮询换令牌。响应形状与另外几条登录链一致

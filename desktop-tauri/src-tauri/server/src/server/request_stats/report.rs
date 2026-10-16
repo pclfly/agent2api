@@ -143,6 +143,7 @@ pub(super) fn range_totals(
                 acc.successful,
                 acc.tokens,
             );
+            push_account_credit(&mut totals.account_totals, &acc.account_id, acc.credit, acc.credit_requests, acc.credit_estimated);
         }
     }
 
@@ -266,6 +267,9 @@ pub(super) fn push_account_accum(
         None => list.push(AccountAccum {
             account_id: account_id.to_string(),
             account_name: account_name.to_string(),
+            credit: None,
+            credit_requests: 0,
+            credit_estimated: false,
             requests,
             successful,
             tokens,
@@ -273,24 +277,36 @@ pub(super) fn push_account_accum(
     }
 }
 
+/// Add credit only after the account group exists. Coverage counts distinguish partial history.
+pub(super) fn push_account_credit(
+    list: &mut [AccountAccum],
+    account_id: &str,
+    credit: Option<f64>,
+    measured: i64,
+    estimated: bool,
+) {
+    let Some(credit) = credit.filter(|n| n.is_finite()) else {
+        return;
+    };
+    if let Some(item) = list.iter_mut().find(|item| item.account_id == account_id) {
+        item.credit = Some(item.credit.unwrap_or(0.0) + credit);
+        item.credit_requests += measured.max(0);
+        item.credit_estimated |= estimated;
+    }
+}
+
 /// provider id → 展示 label（中文名）。
 ///
-/// 走 `providers::meta` 的注册表换算，**不在这里维护第二份 id→label 映射**：
-/// 注册表是 provider 身份的唯一事实来源，两处映射迟早漂移，而这类漂移不会报错，
-/// 只会让报表里的名字与账号页对不上。
+/// 走 `providers::label_of` 的统一入口：内置注册表 + 运行期自定义提供商目录。
+/// 自定义家不在 ProviderKind 中，只查 kind_from_id 会把 custom-… 错当展示名。
+/// 请求行、筛选清单与报表共用此处，不改落盘 provider ID / account_name。
 ///
 /// 未注册的 id（前端比后端新、或手改文件塞进来的值）**原样返回**：
 /// 显示一个陌生的英文 id 好过显示空白，至少能提示「这是谁」。
 /// 空串同样原样返回（空 label），由展示层决定用什么占位（当前约定是「—」）——
 /// 这一层只回答「id 对应什么名字」，不做展示决策。
 pub(super) fn provider_label(id: &str) -> String {
-    if id.is_empty() {
-        return String::new();
-    }
-    match crate::server::core::providers::kind_from_id(id) {
-        Some(kind) => crate::server::core::providers::meta(kind).label.to_string(),
-        None => id.to_string(),
-    }
+    crate::server::core::providers::label_of(id)
 }
 
 /// 区间级的按 provider 汇总 → `/api/stats/summary` 的 `providers` 数组。
@@ -425,6 +441,9 @@ pub(super) fn build_accounts(totals: &[AccountAccum]) -> Vec<Value> {
             json!({
                 "id": item.account_id,
                 "label": label,
+                "credit": item.credit,
+                "creditRequests": item.credit_requests,
+                "creditEstimated": item.credit_estimated,
                 "requests": item.requests,
                 "success": item.successful,
                 "failures": (item.requests - item.successful).max(0),

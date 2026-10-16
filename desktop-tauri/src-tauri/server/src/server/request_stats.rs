@@ -470,6 +470,17 @@ impl RequestStats {
         });
     }
 
+    /// 仅对终态明细完整的日期回填账号积分；待旧数据迁移完成后再执行。
+    pub fn backfill_account_credits_once(&self) {
+        let result = {
+            let guard = self.guard();
+            self.with_conn_mut(&guard, aggregate::backfill_account_credits)
+        };
+        if let Some(days) = result.filter(|days| !days.is_empty()) {
+            logging::log("[Stats]", &format!("已回填 {} 天的账号积分统计", days.len()));
+        }
+    }
+
     /// 回写一条「进行中」行的**在途**字段（转发期间每次状态真的变化时调一次）。
     ///
     /// ── 为什么需要它 ────────────────────────────────────────────

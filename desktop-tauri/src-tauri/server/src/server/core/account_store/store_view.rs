@@ -324,6 +324,8 @@ impl AccountStore {
             // 公开形态去掉 token 本体、只留 refresh token 尾号与
             // 「有没有 refreshToken / accessToken」（见 `antigravity_accounts.rs`）
             self.to_antigravity_public_account(record)
+        } else if record.provider() == "qwenwork" {
+            self.to_qwenwork_public_account(record)
         } else if record.provider() == super::OFFICEACE_PROVIDER_ID {
             // OfficeAce（华为云果办）：只透出标识与到期时刻，网关 Basic 那一对
             // 与控制面临时凭据都不出这个函数（见 `to_officeace_public_account`）。

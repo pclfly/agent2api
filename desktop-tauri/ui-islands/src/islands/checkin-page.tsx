@@ -49,6 +49,7 @@ const PROVIDER_DESC: Record<string, string> = {
   'autoclaw-intl': t('与国内版同一套任务接口 · 站点不同'),
   qoder: t('活动（campaign）领取 · 每天 10:00 刷新'),
   'qoder-intl': t('带设备风控身份领取「每日 100 Credits」 · 需要 UMID 组件'),
+  qwenwork: t('每日登录自动赠送积分 · 上游没有领取接口，本链只对比余额变化'),
   trae: t('SOLO 的 checkin_credits 领取 · 按自然日 0 点刷新'),
   loomy: t('无独立签到接口 · 每天替账号打一次首次登录积分'),
   kuku: t('「免费领积分」的每日任务 · 逐个领取'),

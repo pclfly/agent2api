@@ -142,6 +142,7 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_MONKEYCODE_INTL,
     SCOPE_COMMANDCODE,
     SCOPE_ANTIGRAVITY,
+    "qwenwork",
 ];
 
 /// 一份清单缓存

@@ -99,6 +99,13 @@ pub fn supports_checkin(account: &Value) -> bool {
     if provider == crate::server::core::providers::qoder::endpoints::Region::Global.provider_id() {
         return true;
     }
+    // QwenWork 也参与本链，但它的**每日登录积分没有上游领取接口**：国际版
+    // `gateway.qwenwork.ai` 的 `/sash/*` 全部 404（2026-10-15/16 实测，
+    // 客户端 bundle 里也没有对应端点）。本链对它做的是「读余额 + 与上次
+    // 跨日读数对比」，见 `providers::qwenwork::daily_gift`。
+    if provider == "qwenwork" {
+        return true;
+    }
     if account.get("edition").and_then(Value::as_str) == Some("intl") {
         return false;
     }
@@ -360,6 +367,19 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "qwenwork" => {
+            // QwenWork 的每日登录积分**没有上游领取接口**（国际版 `/sash/*` 全 404，
+            // 见 `providers::qwenwork::daily_gift` 的模块头）。这里只读一次余额、
+            // 与上次跨日读数对比：变多 = 今天已到账，没变 = 尚未发放（中性，不落
+            // 今日台账，定时链稍后重试）。**不发任何会消耗积分的调用**。
+            let claim = crate::server::core::providers::qwenwork::daily_gift::check_daily_gift(
+                store, &id,
+            )
+            .await
+            .map(|outcome| outcome.to_claim())
+            .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         "officeace" => {
             // OfficeAce：`POST /v1/subscription/bonus/claim`（V11 签名）一次把当天
             // 所有可领的奖励（每日签到 + 一次性新人礼）发下来；一天一个活动只能领
@@ -540,6 +560,10 @@ pub fn claim_pending(claim: &Value) -> bool {
         || message.contains("未下发每日积分活动")
         || message.contains("暂无可领取活动")
         || message.contains("等待重试")
+        // QwenWork 的「今日尚未发放」（`providers::qwenwork::daily_gift`）：
+        // 上游在当天首次真实使用时才入账，所以现在没变不代表今天领不到 ——
+        // 中性路径，定时链稍后重试（文案改词时这条要跟着改）。
+        || message.contains("尚未发放")
 }
 
 /// 执行一次签到并汇总（Node 版 `runCheckin(id)`）。

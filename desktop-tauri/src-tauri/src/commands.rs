@@ -586,6 +586,60 @@ pub async fn export_accounts(app: AppHandle) -> Result<Value, String> {
     }))
 }
 
+/// 导入一份本地配置文件（Clash / mihomo YAML，含 `proxies` 列表）当订阅用。
+///
+/// 壳做两件事：弹系统选文件框、把**路径与内容**一起交给后端。为什么内容也传：
+/// 后端的校验与落盘都在服务端进程里（它可能就是另一个容器），不能假定
+/// 「服务端能读到这个路径」；而 `path` 必须一起给 —— 后端要靠它支持
+/// 「立即更新 = 从原路径重新导入」（见 `api::subscriptions::reimport_local_file`）。
+/// 大小上限与后端的管理面请求体上限（32MB）无关地先挡一道：配置文件里是
+/// 节点清单，正常不过几百 KB。
+#[tauri::command]
+pub async fn import_subscription_file(app: AppHandle) -> Result<Value, String> {
+    let file = app
+        .dialog()
+        .file()
+        .set_title("导入本地配置文件")
+        .add_filter("配置文件", &["yaml", "yml"])
+        .add_filter("全部文件", &["*"])
+        .blocking_pick_file();
+
+    let Some(target) = file else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("文件路径无效: {error}"))?;
+    let meta = std::fs::metadata(&path).map_err(|error| format!("读取文件失败: {error}"))?;
+    if meta.len() > MAX_SUBSCRIPTION_FILE_BYTES {
+        return Err(format!(
+            "文件过大（{} MB）：配置文件里应当只有节点清单",
+            meta.len() / 1024 / 1024
+        ));
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| format!("文件不是可读的文本（YAML）: {error}"))?;
+    let mut data = gateway::call(
+        "POST",
+        "/api/subscriptions/import-file",
+        Some(&json!({
+            "path": path.to_string_lossy(),
+            "content": content,
+        })),
+    )
+    .await?;
+    // 文件原文随回执回给前端暂存：导入分两步（选文件校验 → 随表单落库），
+    // 落库那一步要的就是这份内容（后端不存内容，见 `api::subscriptions` 的
+    // 模块头）。多传一次只是内存里的字符串，不会重复落盘。
+    if let Value::Object(map) = &mut data {
+        map.insert("content".to_string(), Value::String(content));
+    }
+    Ok(data)
+}
+
+/// 本地配置文件的大小上限（8MB；节点清单正常不过几百 KB）
+const MAX_SUBSCRIPTION_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// 从文件导入账号（merge 语义：按身份匹配，命中更新、未命中追加）。
 ///
 /// 兼容两种形态：整体导出文件 `{ version, exportedAt, customProviders, accounts }`

@@ -15,6 +15,7 @@
  */
 
 import { t } from '../i18n'
+import { creditReading, type CreditMeasurement } from './credit-measurement'
 
 /* ─── 数据形状（后端 /api/stats/summary，字段都可缺省） ─── */
 
@@ -23,7 +24,7 @@ export type StatsHour = {
   hour?: string; rate?: number; totalTokens?: number; hitTokens?: number; inputTokens?: number
 }
 /** 排行 / 环形图共用的一条：模型维度用 model 当身份，提供商与账号维度用 id */
-export type StatsGroup = {
+export type StatsGroup = CreditMeasurement & {
   id?: string; label?: string; model?: string
   requests?: number; success?: number; totalTokens?: number; tokens?: number
 }
@@ -251,6 +252,7 @@ export type RankRowView = {
   /** 「名字（id）」：整行的气泡说明与名字列的原生 title 共用同一串 */
   full: string; tip: string
   tokensText: string; percentText: string; barWidth: string
+  creditText: string; creditTip: string
 }
 
 /** `null` = 契约里没有这一维（整块隐藏）；空数组 = 这一维没有数据（给空态文案） */
@@ -264,6 +266,7 @@ export function rankRows(list: StatsGroup[] | undefined): RankRowView[] | null {
       label: String(item?.label ?? '').trim(),
       // 后端字段名是 totalTokens（account 维度同形）；tokens 是兼容旧版本/别处形态的兜底读法
       tokens: Number(item?.totalTokens ?? item?.tokens) || 0,
+      credit: creditReading(item),
     }))
     // 全零的组不参与：它们只可能来自手改过的数据，画出来是一条永远为 0 的行。
     // 判据只看 tokens —— 与排序口径同一条，才不会出现「因为请求数 >0 被保留、
@@ -294,6 +297,13 @@ export function rankRows(list: StatsGroup[] | undefined): RankRowView[] | null {
       // 气泡只讲用量：读数 + 占比，与格里看到的两列同源（不给成功率，见上）
       tip: t('{name}：{tokens} tokens · 占 {pct}%', { name: full, tokens: text, pct: percent.toFixed(1) }),
       tokensText: text,
+      creditText: item.credit.text,
+      creditTip: [
+        t('积分消耗'),
+        item.credit.text === '—' ? t('未采集积分，不代表零消耗') : item.credit.text,
+        item.credit.estimated ? t('包含按 Token 用量计算的预估值，并非上游实际扣费') : '',
+        item.credit.partial ? t('部分采集：{measured}/{total} 次成功请求', { measured: item.credit.measured, total: item.credit.successful }) : '',
+      ].filter(Boolean).join(' · '),
       percentText: `${percent.toFixed(1)}%`,
       // 条宽用百分比：容器宽度变化时条跟着伸缩，不必像 SVG 那样量宽度重绘
       barWidth: `${percent.toFixed(1)}%`,

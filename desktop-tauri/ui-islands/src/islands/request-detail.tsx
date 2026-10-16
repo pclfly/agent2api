@@ -6,6 +6,8 @@ import {
   TableCell, TableHead, TableHeader, TableRow, type SegmentedControlOption,
 } from '@ui'
 import { t } from '../i18n'
+import { resolveProviderLabel } from './provider-label'
+import { useProviderLabels } from './use-provider-labels'
 
 /**
  * 「请求日志」页的**详情弹窗**（请求详情 / 预览对话 / 原始报文 · 三标签）。
@@ -276,11 +278,11 @@ function isRunning(entry: RequestRow | null | undefined): boolean {
   return (Number(entry?.status) || 0) === 0 && !entry?.error
 }
 
-/** 提供商展示名：后端 label → 前端 providers 目录 → 原样回显 id（列表同源） */
+/** 提供商展示名：最新目录 → 后端有效名称 → 原始 ID（列表同源） */
 function providerName(entry: ProviderFields): string {
   const id = String(entry.provider ?? '').trim()
   const label = String(entry.providerLabel ?? '').trim()
-  return label || (id ? shared().wbProviders?.labelOf?.(id) || id : '')
+  return resolveProviderLabel(id, label, shared().wbProviders?.labelOf)
 }
 
 /** 普通对象判断（row / debug / raw 响应的形状守卫；数组不算） */
@@ -699,6 +701,7 @@ type RequestDetailProps = {
 }
 
 function RequestDetail({ id, row, token, onClose }: RequestDetailProps) {
+  useProviderLabels()
   const [active, setActive] = React.useState<TabKey>(DEFAULT_TAB)
   const [raw, setRaw] = React.useState<RawState>(null)
   const [debug, setDebug] = React.useState<DebugState>(null)

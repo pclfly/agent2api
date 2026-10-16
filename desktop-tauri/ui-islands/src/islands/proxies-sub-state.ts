@@ -25,7 +25,12 @@ import { t } from '../i18n'
 export type SubscriptionItem = {
   id: string
   name: string
+  /** `url` 链接订阅（内核定时拉取）| `file` 本地配置文件（不参与定时刷新） */
+  kind: 'url' | 'file'
+  /** 链接订阅的地址；本地配置文件恒为空串 */
   url: string
+  /** 本地配置文件的**原始路径**（导入时记住的，用于「立即更新」重新导入） */
+  sourcePath: string
   enabled: boolean
   createdAt: number
   updatedAt: number
@@ -60,6 +65,25 @@ export type SubscriptionsPayload = {
   removed?: string
 }
 
+/** `importSubscriptionFile` 的回执（校验通过后的文件元信息 + 文件原文） */
+export type ImportedFile = {
+  canceled?: boolean
+  path?: string
+  name?: string
+  /** 文件里声明的节点条数（不是内核拉到的数量） */
+  declaredNodes?: number
+  bytes?: number
+  /**
+   * 文件原文。导入分两步（先选文件校验、再随表单落库），而落库时后端要的
+   * 就是这份内容（服务端可能读不到本机路径，见 `addFileSubscription`）——
+   * 所以壳把它一并回给前端暂存。配置文件是几百 KB 级，多一份内存副本换
+   * 「校验与落库走同一条写路径」是值的。
+   */
+  content?: string
+  /** 壳读文件失败 / 后端校验失败时的原因 */
+  error?: string
+}
+
 /* ─── 桥（只声明本区块用到的成员）──────────────── */
 
 export type SubscriptionBridge = {
@@ -69,6 +93,15 @@ export type SubscriptionBridge = {
   refreshSubscription?: (id: string) => Promise<SubscriptionsPayload | null | undefined>
   removeSubscription?: (id: string) => Promise<SubscriptionsPayload | null | undefined>
   decodeQrImage?: (payload: { imageBase64: string }) => Promise<{ url?: string } | null | undefined>
+  /**
+   * 导入本地配置文件：壳弹选文件框、读原文交给后端校验，回执里带路径 /
+   * 声明节点数 / **文件原文**（导入分两步，落库时后端要的就是这份内容）。
+   * 用户取消选择时回执 `{canceled:true}`。网页端没有「本机路径」，`path` 是空串。
+   */
+  importSubscriptionFile?: () => Promise<ImportedFile | null | undefined>
+  /** 原地替换本地文件订阅的内容（条目 id 不变；`path` 给了就一并换位置） */
+  replaceSubscriptionFile?: (payload: { id: string; content: string; path?: string })
+    => Promise<SubscriptionsPayload | null | undefined>
   getKernelStatus?: () => Promise<KernelStatus | null | undefined>
   downloadKernel?: () => Promise<KernelStatus | null | undefined>
   restartKernel?: () => Promise<KernelStatus | null | undefined>
@@ -201,12 +234,84 @@ export async function addSubscription(name: string, url: string): Promise<Subscr
   return data ?? null
 }
 
+/**
+ * 新增**本地配置文件**订阅。
+ *
+ * `content` 必须一起提交（不是只给路径）：服务端进程可能就是另一个容器，
+ * 不能假定它能读到本机这个路径；而后端的 YAML 校验与写盘都要那份内容。
+ * `sourcePath` 给后端用于「立即更新 = 从原路径重新导入」（网页端是空串，
+ * 那种情况「立即更新」退回「让内核重读现有文件」）。
+ */
+export async function addFileSubscription(
+  name: string,
+  sourcePath: string,
+  content: string,
+): Promise<SubscriptionsPayload | null> {
+  const bridge = wb().workbuddyDesktop
+  const data = await bridge?.addSubscription?.({
+    name: name.trim(),
+    kind: 'file',
+    sourcePath,
+    content,
+    enabled: true,
+  })
+  accept(data)
+  toast(t('已导入「{name}」，内核正在读取节点…', { name: name.trim() }))
+  void pollSectionAfterChange()
+  return data ?? null
+}
+
+/**
+ * 导入本地配置文件的第一步：让壳弹选文件框、由后端校验并回执元信息。
+ * 用户取消选择时返回 null（不是错误，不 toast）。
+ */
+export async function pickSubscriptionFile(): Promise<ImportedFile | null> {
+  const bridge = wb().workbuddyDesktop
+  if (typeof bridge?.importSubscriptionFile !== 'function') {
+    throw new Error(t('当前环境不支持导入本地配置文件'))
+  }
+  const result = await bridge.importSubscriptionFile()
+  if (!result || result.canceled) return null
+  if (result.error) throw new Error(result.error)
+  return result
+}
+
+/**
+ * 原地替换本地文件订阅的内容（条目 id 不变）。
+ *
+ * 为什么不「删掉重建」：id 是 mihomo provider 名与账号引用链的一环，
+ * 换 id 会让所有引用悬空、订阅节点镜像全部重建。`path` 只在换了文件位置时传，
+ * 不传就保留原路径（内容变了、位置没变）。
+ */
+export async function replaceSubscriptionFile(
+  item: SubscriptionItem,
+  content: string,
+  path?: string,
+): Promise<void> {
+  const bridge = wb().workbuddyDesktop
+  if (typeof bridge?.replaceSubscriptionFile !== 'function') {
+    throw new Error(t('当前环境不支持替换本地配置文件'))
+  }
+  const data = await bridge.replaceSubscriptionFile({ id: item.id, content, path })
+  accept(data)
+  toast(t('已替换「{name}」的内容，正在让内核重读…', { name: item.name }))
+  void pollSectionAfterChange()
+}
+
 export async function saveSubscription(
   item: SubscriptionItem,
   payload: { name: string; url: string; enabled: boolean },
 ): Promise<void> {
   const bridge = wb().workbuddyDesktop
-  const data = await bridge?.saveSubscription?.({ id: item.id, ...payload })
+  // kind / sourcePath 必须一起回传：后端 `update` 是整份覆盖语义，而
+  // `normalize_item` 对 `kind:'file'` 要求 `sourcePath` 非空 —— 少传一个键，
+  // 编辑一条本地文件订阅就会报「请选择要导入的本地配置文件」。
+  const data = await bridge?.saveSubscription?.({
+    id: item.id,
+    kind: item.kind,
+    sourcePath: item.sourcePath,
+    ...payload,
+  })
   accept(data)
   toast(t('已保存「{name}」', { name: payload.name.trim() }))
   void pollSectionAfterChange()
@@ -218,7 +323,14 @@ export async function toggleSubscription(item: SubscriptionItem, enabled: boolea
   if (state.pending) return
   patch({ pending: true })
   try {
-    const data = await bridge?.saveSubscription?.({ id: item.id, name: item.name, url: item.url, enabled })
+    const data = await bridge?.saveSubscription?.({
+      id: item.id,
+      name: item.name,
+      kind: item.kind,
+      url: item.url,
+      sourcePath: item.sourcePath,
+      enabled,
+    })
     accept(data)
     toast(enabled ? t('已启用「{name}」', { name: item.name }) : t('已禁用「{name}」', { name: item.name }))
     void pollSectionAfterChange()
@@ -229,7 +341,12 @@ export async function toggleSubscription(item: SubscriptionItem, enabled: boolea
   }
 }
 
-/** 行内「立即更新」：强制拉取订阅内容（后端节点变了会自动重启内核） */
+/**
+ * 行内「立即更新」：强制拉取订阅内容（后端节点变了会自动重启内核）。
+ *
+ * 本地配置文件（`kind === 'file'`）的含义不同：后端会先从**原路径**重新读
+ * 那份文件写进内核目录，再让内核重读 —— 所以文案分开写。
+ */
 export async function refreshSubscription(item: SubscriptionItem): Promise<void> {
   const bridge = wb().workbuddyDesktop
   if (state.refreshing || state.pending) return
@@ -237,7 +354,9 @@ export async function refreshSubscription(item: SubscriptionItem): Promise<void>
   try {
     const data = await bridge?.refreshSubscription?.(item.id)
     accept(data)
-    toast(t('已刷新「{name}」，正在同步节点…', { name: item.name }))
+    toast(item.kind === 'file'
+      ? t('已重新导入「{name}」，正在让内核重读…', { name: item.name })
+      : t('已刷新「{name}」，正在同步节点…', { name: item.name }))
     void pollSectionAfterChange()
   } catch (error) {
     toast(t('刷新失败：{reason}', { reason: errorMessage(error) }), 'err')

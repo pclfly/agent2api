@@ -237,7 +237,8 @@ function RankPanel({ panelId, listId, labelId, title, tip, rows, totalText, with
         <span className='panel-sub' id={labelId}>{totalText}</span>
       </div>
       <div className='panel-body'>
-        <div className='rank-shares' id={listId}>
+        <div className={`rank-shares${withBadge ? ' rank-with-credit' : ''}`} id={listId}>
+          {withBadge && rows.length ? <div className='rank-credit-heading'>{t('积分消耗')}</div> : null}
           {rows.length ? rows.map(row => (
             <div className='rank-row' data-tip={row.tip} key={row.key}>
               <span className='name' title={row.full}>
@@ -247,10 +248,12 @@ function RankPanel({ panelId, listId, labelId, title, tip, rows, totalText, with
               <span className='track'><span className='bar' style={{ width: row.barWidth }} /></span>
               <span className='num' title={`${row.tokensText} tokens`}>{row.tokensText}</span>
               <span className='pct'>{row.percentText}</span>
+              {withBadge ? <span className='credit' title={row.creditTip} aria-label={row.creditTip}>{row.creditText}</span> : null}
             </div>
           )) : placeholder(emptyText)}
         </div>
       </div>
+      {withBadge && rows.length ? <p className='rank-credit-note'>{t('≈ 预估 · * 部分采集 · — 未采集；仅统计成功请求')}</p> : null}
     </section>
   )
 }

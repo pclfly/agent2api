@@ -796,6 +796,28 @@ const OFFICEACE: ProviderConfig = {
   ],
 }
 
+const QWENWORK: ProviderConfig = {
+  provider: 'qwenwork',
+  label: 'QwenWork',
+  webLogin: {
+    button: t('打开 QwenWork 官方授权页'),
+    hint: t('在系统浏览器完成登录与设备确认后，账号会自动加入列表。无需粘贴回调地址；授权有效期为 5 分钟。'),
+    edition: 'intl',
+    modes: [{ value: 'external', label: t('系统浏览器') }],
+  },
+  manualTitle: t('粘贴 QwenWork 凭据'),
+  manualNote: t('支持完整凭据 JSON，或填写 accessToken、userId 和可选 refreshToken。手填账号具备 refreshToken 时可自动续期；缺少实报时积分为预估。签到先查询资格，国际站尚未实测。'),
+  fields: [
+    { key: 'accessToken', label: 'accessToken / JSON', rows: 5, placeholder: '{"token":"…","refreshToken":"…","user":{"id":"…"}}' },
+    { key: 'userId', label: 'userId', optional: true, placeholder: t('完整 JSON 或 JWT 已含用户标识时可留空') },
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: t('没有则无法自动续期') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选') },
+  ],
+  desktopWindowsOnly: true,
+  desktopNote: t('只读导入 QwenWork 当前登录态快照，不回写客户端文件，也不代刷新。登录态失效后请重新导入。'),
+  desktopHint: t('读取 %APPDATA%/QwenWork/auth-v2.dat 与 Local State，仅 Windows'),
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -839,6 +861,7 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // OfficeAce（华为云果办 / OfficeClaw）：浏览器登录（自助 OAuth）或粘贴网关
   //凭据，排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   OFFICEACE,
+  QWENWORK,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

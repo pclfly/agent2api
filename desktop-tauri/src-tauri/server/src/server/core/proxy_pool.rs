@@ -222,6 +222,12 @@ fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, Stri
         "enabled".to_string(),
         Value::Bool(!matches!(object.get("enabled"), Some(Value::Bool(false)))),
     );
+    // 用户禁用位：表单整份提交语义（缺省 = 未禁用）。手动条目的启用开关在
+    // 表单里也走这个字段 —— 与行内开关、镜像条目共用同一个口径，见 is_usable。
+    normalized.insert(
+        "disabled".to_string(),
+        Value::Bool(matches!(object.get("disabled"), Some(Value::Bool(true)))),
+    );
     normalized.insert("protocol".to_string(), Value::String(protocol));
     normalized.insert("host".to_string(), Value::String(host));
     normalized.insert("port".to_string(), Value::from(port));
@@ -305,7 +311,7 @@ pub fn resolve_reference(proxy_id: &str) -> Result<crate::server::core::proxies:
     let Some(item) = find_raw(proxy_id) else {
         return Err(format!("代理「{proxy_id}」不存在或已被删除"));
     };
-    if matches!(item.get("enabled"), Some(Value::Bool(false))) {
+    if !is_usable(&item) {
         return Err(format!(
             "代理「{}」已禁用（在「网络代理」页启用它）",
             display_name(&item, proxy_id)
@@ -369,6 +375,10 @@ fn describe_item(item: &Value) -> Value {
         "name": text_of(item, "name"),
         "source": source,
         "enabled": !matches!(item.get("enabled"), Some(Value::Bool(false))),
+        // 用户禁用位（独立于 enabled，见 is_usable）：前端开关与账号下拉的
+        // 「已禁用」标注都读它；`usable` 是两个字段的合取结果，省得前端自己拼
+        "disabled": is_disabled(item),
+        "usable": is_usable(item),
         // manual 的字段原样带出（编辑弹窗要回显，含密码 —— 与账号代理表单同一口径：
         // 那是本机自己的配置，账号记录里的代理密码同样是明文存的）
         "protocol": text_of(item, "protocol"),
@@ -393,6 +403,19 @@ fn describe_item(item: &Value) -> Value {
 /// 前端就地替换，不必再拉一次。
 pub fn list() -> Vec<Value> {
     read_items().iter().map(describe_item).collect()
+}
+
+/// 只列**可用**条目（供账号侧的代理下拉：已禁用的节点不进选项）。
+///
+/// 与 [`list`] 分开而不是加参数：代理页需要看到全部（禁用的也要能改回去），
+/// 账号侧只该看到能用的 —— 两个调用方的诉求本来就不同，共用一个带 bool 的
+/// 函数只会让两个调用点各自去猜那个 bool 的语义。
+pub fn list_usable() -> Vec<Value> {
+    read_items()
+        .iter()
+        .filter(|item| is_usable(item))
+        .map(describe_item)
+        .collect()
 }
 
 fn find_raw(id: &str) -> Option<Value> {
@@ -422,6 +445,27 @@ pub fn create(input: &Value) -> Result<Vec<Value>, String> {
 /// 该条目是否来自 Clash 同步（只读镜像）。写操作一律先过它。
 fn is_clash_item(item: &Value) -> bool {
     text_of(item, "source") == "clash"
+}
+
+/// 条目是否被**用户**禁用（`disabled` 字段，与 `enabled` 分工见 [`is_usable`]）。
+/// 只认显式 `true`：缺字段（存量条目）一律视为未禁用。
+pub fn is_disabled(item: &Value) -> bool {
+    matches!(item.get("disabled"), Some(Value::Bool(true)))
+}
+
+/// 条目当前是否可用（账号引用它时能不能真的走这个出口）。
+///
+/// 两个字段是**与**关系，因为它们来源不同、生命周期不同：
+///   · `enabled` —— 条目自身的启用位。手动条目由用户填；clash / subscription
+///     镜像**跟随上游**（Clash 里禁用了的监听器、订阅侧失效的节点），每次同步
+///     会被覆盖；
+///   · `disabled` —— **用户对本机这条记录的禁用**，只由用户在「网络代理」页的
+///     开关写，任何同步都不碰它（见 `sync_clash` / `sync_subscription_nodes`）。
+/// 分开两个字段的理由：镜像条目的名称 / 端口 / 启用位都跟随上游，如果用户
+/// 「禁用」也写进 `enabled`，下一次同步就会把它改回来 —— 用户会看到自己刚关掉
+/// 的节点又亮了。
+fn is_usable(item: &Value) -> bool {
+    !matches!(item.get("enabled"), Some(Value::Bool(false))) && !is_disabled(item)
 }
 
 /// 该条目是否为订阅节点镜像（只读镜像，见模块头 subscription 一节）
@@ -495,8 +539,51 @@ pub fn remove(id: &str) -> Result<(Vec<Value>, String), String> {
     Ok((list(), name))
 }
 
-// ─── Clash Verge 同步（全量镜像）─────────────────────────────
+/// 只读镜像（Clash 同步 / 订阅节点）的禁用：**与编辑 / 删除不同，这个操作放行**。
+///
+/// 为什么它与只读语义不冲突：名称 / 端口 / 启用位跟随上游是「别处的配置」
+/// （Clash 的出口集合、订阅的内容），而「本机这条记录要不要用」是用户自己的
+/// 决定 —— 订阅里几十个节点只挑几个用正是这个功能的主要场景，把用户赶去订阅
+/// 侧删节点既不现实（订阅是远端内容）也没有对应入口。写的是独立的 `disabled`
+/// 字段，因此下一次同步不会把它改回来（见 [`is_usable`]）。
+///
+/// 手动条目也走它：行内开关与表单的启用位都落到同一个字段，语义只有一套。
+pub fn set_disabled(id: &str, disabled: bool) -> Result<Vec<Value>, String> {
+    let mut items = read_items();
+    let Some(index) = items
+        .iter()
+        .position(|item| item.get("id").and_then(Value::as_str) == Some(id))
+    else {
+        return Err(format!("代理「{id}」不存在"));
+    };
+    let now = logging::now_ms();
+    let name = display_name(&items[index], id);
+    // 手动条目的 `enabled` 没有上游含义（镜像的才有）——旧版把启用开关写在它
+    // 上面，所以手工条目里可能存着 `enabled:false`。用户重新启用时把它一并
+    // 抹平，否则会出现「开关拨回去了、条目仍不可用」这种读不出来的状态。
+    // 镜像条目不动 `enabled`：那是上游的事实，下一次同步还会写回来。
+    let heal_enabled = !disabled && !is_readonly(&items[index]);
+    let Some(object) = items[index].as_object_mut() else {
+        return Err("代理条目形状异常".to_string());
+    };
+    object.insert("disabled".to_string(), Value::Bool(disabled));
+    if heal_enabled {
+        object.insert("enabled".to_string(), Value::Bool(true));
+    }
+    object.insert("updatedAt".to_string(), Value::from(now));
+    write_items(&items)?;
+    logging::log(
+        "[Proxies]",
+        &if disabled {
+            format!("⏸️ 已禁用代理「{name}」（引用它的账号回退直连）")
+        } else {
+            format!("▶️ 已启用代理「{name}」")
+        },
+    );
+    Ok(list())
+}
 
+// ─── Clash Verge 同步（全量镜像）─────────────────────────────
 /// 同步结果：变更条数 + 失败原因（「Clash 没装」不是错误路径，见 `sync_clash`）
 pub struct ClashSyncReport {
     pub changes: usize,
@@ -587,6 +674,9 @@ pub fn sync_clash() -> ClashSyncReport {
                         "source": "clash",
                         "listenerUid": target.uid,
                         "enabled": target.enabled,
+                        // 新镜像条目默认未禁用；用户之后的禁用由同步保留
+                        // （同步只写 name / enabled / updatedAt）
+                        "disabled": false,
                         "createdAt": now,
                         "updatedAt": now,
                         "lastTest": Value::Null,
@@ -770,6 +860,9 @@ pub fn sync_subscription_nodes(targets: &[SubscriptionNodeTarget]) -> Result<usi
                         "providerId": target.provider_id,
                         "node": target.node,
                         "enabled": true,
+                        // 新节点默认未禁用；用户的禁用由同步保留（同步只写
+                        // name / port / updatedAt）
+                        "disabled": false,
                         "port": target.port,
                         "createdAt": now,
                         "updatedAt": now,
@@ -807,4 +900,145 @@ pub fn sync_subscription_nodes(targets: &[SubscriptionNodeTarget]) -> Result<usi
         write_items(&items)?;
     }
     Ok(changes)
+}
+
+#[cfg(test)]
+mod disable_semantics_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `enabled` 是「条目自身的启用位」（镜像条目跟随上游），`disabled` 是
+    /// 「用户要不要用这条记录」。两者是**与**关系：任一为假，账号引用它就
+    /// 回退直连。
+    #[test]
+    fn usability_is_the_conjunction_of_both_flags() {
+        // 缺字段（存量条目）＝ 未禁用、启用
+        assert!(is_usable(&json!({"id": "px_1"})));
+        assert!(!is_usable(&json!({"id": "px_1", "enabled": false})));
+        assert!(!is_usable(&json!({"id": "px_1", "disabled": true})));
+        assert!(!is_usable(&json!({"id": "px_1", "enabled": false, "disabled": true})));
+        // `disabled: false` 与缺字段等价；非布尔值不当成禁用
+        assert!(is_usable(&json!({"id": "px_1", "disabled": false})));
+        assert!(is_usable(&json!({"id": "px_1", "disabled": "true"})));
+        assert!(is_disabled(&json!({"id": "px_1", "disabled": true})));
+        assert!(!is_disabled(&json!({"id": "px_1"})));
+    }
+
+    /// 公开形态必须把两个字段与合取结果都带出去：前端开关读 `disabled`、
+    /// 下拉标注读 `usable`，少一个就会把「Clash 里禁用了」与「你禁用了它」
+    /// 说成同一件事。
+    #[test]
+    fn described_items_expose_both_flags_and_the_result() {
+        let described = describe_item(&json!({
+            "id": "px_1",
+            "name": "香港节点",
+            "source": "subscription",
+            "providerId": "sub_1",
+            "node": "hk-1",
+            "port": 19107,
+            "enabled": true,
+            "disabled": true,
+        }));
+        assert_eq!(described["enabled"], json!(true));
+        assert_eq!(described["disabled"], json!(true));
+        assert_eq!(described["usable"], json!(false));
+        // 镜像条目的端口直接进 resolved（不经内核状态）
+        assert_eq!(described["resolved"]["host"], json!("127.0.0.1"));
+        assert_eq!(described["resolved"]["port"], json!(19107));
+    }
+}
+
+#[cfg(test)]
+mod pool_write_tests {
+    use super::*;
+    use crate::server::db::test_temp::TempDb;
+    use serde_json::json;
+
+    /// 三个用例共享一条 `install`（OnceLock 只能装一次），所以合成一个用例
+    /// 按顺序跑：写入 → 只列可用 → 用户禁用 → 再次只列可用。
+    ///
+    /// 钉的是**用户禁用位与上游启用位互不干扰**：镜像条目每次同步都会把
+    /// `enabled` 写回上游的值，而 `disabled` 必须原样留着 —— 否则用户刚关掉的
+    /// 节点下一次同步就自己亮了。
+    #[test]
+    fn disabled_survives_a_mirror_sync_and_leaves_the_usable_list() {
+        let (db, _guard) = TempDb::open("proxy-pool-disable");
+        install(Some(db));
+
+        // 一条手动 + 两条订阅镜像
+        create(&json!({"name": "手填出口", "protocol": "http", "host": "10.0.0.1", "port": 8080}))
+            .expect("手动条目应能建");
+        sync_subscription_nodes(&[
+            SubscriptionNodeTarget {
+                provider_id: "sub_a".to_string(),
+                sub_name: "机场 A".to_string(),
+                node: "hk-1".to_string(),
+                port: 19107,
+            },
+            SubscriptionNodeTarget {
+                provider_id: "sub_a".to_string(),
+                sub_name: "机场 A".to_string(),
+                node: "jp-1".to_string(),
+                port: 19108,
+            },
+        ])
+        .expect("订阅镜像应能写入");
+
+        let all = list();
+        assert_eq!(all.len(), 3);
+        assert_eq!(list_usable().len(), 3, "没有禁用时三条都可用");
+
+        let hk = all
+            .iter()
+            .find(|item| item["node"] == json!("hk-1"))
+            .expect("订阅条目应在池里");
+        let hk_id = hk["id"].as_str().expect("条目要有 id").to_string();
+
+        // 用户禁用镜像条目：允许（只读指的是名称 / 端口 / 来源，不含「用不用」）
+        set_disabled(&hk_id, true).expect("镜像条目也要能禁用");
+        let usable = list_usable();
+        assert_eq!(usable.len(), 2, "禁用的节点不进可用列表");
+        assert!(
+            usable.iter().all(|item| item["id"] != json!(hk_id)),
+            "被禁用的那条不该出现在可用列表里"
+        );
+        // 引用它时给出的原因要能指向「去哪里启用」
+        let error = resolve_reference(&hk_id).unwrap_err();
+        assert!(error.contains("已禁用"), "{error}");
+
+        // 一次全量镜像同步（节点集合没变）：`enabled` 会被写回上游值，
+        // 但 `disabled` 必须留着
+        sync_subscription_nodes(&[
+            SubscriptionNodeTarget {
+                provider_id: "sub_a".to_string(),
+                sub_name: "机场 A".to_string(),
+                node: "hk-1".to_string(),
+                port: 19107,
+            },
+            SubscriptionNodeTarget {
+                provider_id: "sub_a".to_string(),
+                sub_name: "机场 A".to_string(),
+                node: "jp-1".to_string(),
+                port: 19108,
+            },
+        ])
+        .expect("再次同步应成功");
+        let after = list();
+        let hk_after = after
+            .iter()
+            .find(|item| item["id"] == json!(hk_id))
+            .expect("同步不该把条目摘掉");
+        assert_eq!(hk_after["disabled"], json!(true), "同步不得清掉用户禁用位");
+        assert_eq!(hk_after["usable"], json!(false));
+        assert_eq!(list_usable().len(), 2, "同步之后仍然只有两条可用");
+
+        // 再启用：回到可用列表（且手动条目的 `enabled` 会被抹平，
+        // 镜像条目的 `enabled` 不动）
+        set_disabled(&hk_id, false).expect("应能重新启用");
+        assert_eq!(list_usable().len(), 3);
+
+        // 条目不存在时给出 404 语义的原因（调用方据此选状态码）
+        let missing = set_disabled("px_not_here", true).unwrap_err();
+        assert!(missing.contains("不存在"), "{missing}");
+    }
 }

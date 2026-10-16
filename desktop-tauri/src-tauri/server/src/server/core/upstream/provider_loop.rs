@@ -1615,6 +1615,9 @@ async fn attempt_queue(
                         ctx.telemetry,
                     ),
                 ),
+                UpstreamResponse::QwenWorkSse => Box::pin(
+                    super::translate::QwenWorkToChatStream::new(response, &wire_model, ctx.telemetry),
+                ),
                 UpstreamResponse::AntigravityGemini => Box::pin(
                     super::translate::AntigravityToChatStream::new(
                         response,

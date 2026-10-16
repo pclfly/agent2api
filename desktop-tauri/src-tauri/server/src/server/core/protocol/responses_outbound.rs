@@ -181,6 +181,34 @@ pub fn responses_request_from_chat(chat: &Value, model: &str) -> Result<Value, C
 /// 顺序不是随意的：回程的 `chat_from_responses` 按「reasoning 项在前、
 /// 本轮 assistant 项在后」消费（`PendingReasoning`），反向也必须产出同一
 /// 形状，多轮历史才能被上游正确读取。
+///
+/// ── reasoning 项**不带 id**（2026-10-14 修）──────────────────
+/// 这里原本给 reasoning 项填 `random_id("rs")`（本地随机编的 `rs_xxx`）。
+/// 但本模块同时把请求写成 `store:false`（见 `responses_request_from_chat`），
+/// 而上游在 `store:false` 下**不持久化任何 item** —— 于是下一轮带着这个
+/// 「上游从没见过的 id」发过去，上游按 id 查不到，整轮 404：
+///
+/// ```text
+///   404 Item with id 'rs_0e2dfe16...' not found. Items are not persisted
+///       when `store` is set to false. Try again with `store` set to true,
+///       or remove this item from your input.
+/// ```
+///
+/// 实测（2026-10-14，`us.mixaicloud.com`，gpt-6-astra，`store:false`）逐类对照：
+///
+/// ```text
+///   reasoning 带 id      → 404 Item with id ... not found
+///   reasoning 无 id      → 200
+///   assistant message 带 id → 200（message 的 id 上游不查，保留无妨）
+///   function_call 带 id  → 400 No tool output found（与 id 无关，两种都 400）
+/// ```
+///
+/// 即**只有 reasoning 项的 id 会被上游按「已持久化条目」查表**。所以这里去掉
+/// 它，让上游按内容（`summary` / `encrypted_content`）处理 —— 加密连续性载体
+/// 的恢复逻辑不受影响（那条链路靠 `encrypted_content` 字段，不靠 id）。
+///
+/// 触发条件（三者同时满足才复现，所以表现为「有时候」）：
+/// 协议是 `responses` + 模型产 reasoning + 多轮对话。
 fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
     let reasoning = {
         let from_field = string_field(message, "reasoning_content");
@@ -199,9 +227,10 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty());
     if !reasoning.is_empty() || encrypted.is_some() {
+        // 刻意不带 "id"：store:false 下上游不持久化，带 id 会被查表拒绝
+        // （见本函数文档的实测对照）
         let mut item = json!({
             "type": "reasoning",
-            "id": random_id("rs"),
             "summary": if reasoning.is_empty() {
                 Vec::<Value>::new()
             } else {
@@ -458,9 +487,13 @@ pub struct ChatFromResponsesStream {
     created: i64,
     started: bool,
     finished: bool,
-    /// 已宣告的工具：item_id / call_id → 槽位（chat 的 tool_calls index +
+    /// 已宣告的工具：工具身份键 → 槽位（chat 的 tool_calls index +
     /// 是否已发过参数增量）
     tools: BTreeMap<String, ToolSlot>,
+    /// 同一个工具在各事件里的**其它身份**（item.id / call_id / item_id）→
+    /// `tools` 里的规范键。见 [`Self::ensure_tool`] 的说明：键不一致会把一次
+    /// 调用拆成两条，其中一条没有工具名。
+    aliases: std::collections::HashMap<String, String>,
     next_tool_index: i64,
     /// 上游最近的 usage（Responses 口径；收尾时折成 chat 形态）
     usage: Option<Value>,
@@ -483,6 +516,7 @@ impl ChatFromResponsesStream {
             started: false,
             finished: false,
             tools: BTreeMap::new(),
+            aliases: std::collections::HashMap::new(),
             next_tool_index: 0,
             usage: None,
         }
@@ -695,14 +729,61 @@ impl ChatFromResponsesStream {
         vec![self.delta_frame(json!({ "role": "assistant", "content": "" }))]
     }
 
+    /// 把事件里出现的身份键解析成 `tools` 里的规范键（沿别名链走，防环，
+    /// 最多 8 跳）。没登记过的键原样返回。
+    fn canonical(&self, key: &str) -> String {
+        let mut current = key.to_string();
+        for _ in 0..8 {
+            let Some(next) = self.aliases.get(&current) else {
+                break;
+            };
+            if next == &current {
+                break;
+            }
+            current = next.clone();
+        }
+        current
+    }
+
     /// 宣告一个工具（若未宣告过）：chat 的 tool_calls 首帧带 id / name / 空参数
+    ///
+    /// ── 为什么要有别名表 ────────────────────────────────────────
+    /// 同一次调用在不同事件里**可用的字段并不相同**：官方形状的
+    /// `response.output_item.added` 在 `item` 里给 `call_id` 与 `id`（`fc_…`），
+    /// 而随后的 `response.function_call_arguments.delta` **只有 `item_id`**，
+    /// 没有 `call_id`。只按单个事件挑键，两类事件会算出两个不同的键，同一次
+    /// 调用被当成两次：多出一条没有工具名的 `tool_calls`，两条参数分片又各自
+    /// 归到不同 index（客户端侧表现为工具名变成 `unknown`、参数被串写）。
+    /// 因此宣告成功时把 `item` 里所有可用身份一并登记为别名，后续事件无论
+    /// 带哪个字段都回到同一槽位。
+    ///
+    /// 拿不到名字的事件不再单独开槽：没有工具名的调用任何客户端都执行不了，
+    /// 发出去只会变成一条指向不存在工具的残片。宁可少一次，也不能让两条槽位
+    /// 互相串参数。
     fn ensure_tool(&mut self, key: &str, item: &Value) -> Vec<bytes::Bytes> {
-        if self.tools.contains_key(key) {
+        let canonical = self.canonical(key);
+        if self.tools.contains_key(&canonical) {
+            self.aliases.insert(key.to_string(), canonical);
+            return Vec::new();
+        }
+        let name = string_field(item, "name");
+        if name.is_empty() {
             return Vec::new();
         }
         let index = self.next_tool_index;
         self.next_tool_index += 1;
-        self.tools.insert(key.to_string(), ToolSlot { index, has_arguments: false });
+        self.tools
+            .insert(canonical.clone(), ToolSlot { index, has_arguments: false });
+        for alias in [
+            key.to_string(),
+            string_field(item, "call_id"),
+            string_field(item, "id"),
+            string_field(item, "item_id"),
+        ] {
+            if !alias.is_empty() && alias != canonical {
+                self.aliases.insert(alias, canonical.clone());
+            }
+        }
         let call_id = {
             let raw = string_field(item, "call_id");
             if raw.is_empty() {
@@ -712,7 +793,6 @@ impl ChatFromResponsesStream {
                 raw
             }
         };
-        let name = string_field(item, "name");
         vec![self.delta_frame(json!({
             "tool_calls": [{
                 "index": index,
@@ -725,7 +805,8 @@ impl ChatFromResponsesStream {
 
     /// 追加一段工具参数（槽位不存在时静默跳过 —— 没宣告过就没有 index 可挂）
     fn push_arguments(&mut self, key: &str, delta: &str) -> Vec<bytes::Bytes> {
-        let Some(slot) = self.tools.get_mut(key) else {
+        let key = self.canonical(key);
+        let Some(slot) = self.tools.get_mut(&key) else {
             return Vec::new();
         };
         slot.has_arguments = true;
@@ -736,7 +817,10 @@ impl ChatFromResponsesStream {
     }
 
     fn has_arguments(&self, key: &str) -> bool {
-        self.tools.get(key).map(|slot| slot.has_arguments).unwrap_or(false)
+        self.tools
+            .get(&self.canonical(key))
+            .map(|slot| slot.has_arguments)
+            .unwrap_or(false)
     }
 
     /// 收尾：finish_reason 帧 + usage 帧 + [DONE]（只做一次）
@@ -829,10 +913,12 @@ impl ChatFromResponsesStream {
     }
 }
 
-/// 事件 / 项里的工具身份键：call_id 优先，退到 id / item_id / output_index。
+/// 事件 / 项里的工具身份键：`call_id` 优先，退到 id / item_id / output_index。
 ///
-/// 同一次调用的各个事件（added / delta / done）必须映射到同一个键，
-/// 上游保证这几个字段在各事件里一致（官方与参考实现都按这个优先链取值）。
+/// 这个优先链只负责在**单个事件内**挑一个起点键。跳事件的一致性由
+/// [`ChatFromResponsesStream::ensure_tool`] 的别名表保证：同一次调用的
+/// `call_id` 与 `item_id` 指向同一槽位，所以「上游在 delta 事件里带不带
+/// `call_id`」（官方形状的 delta 就不带）不再影响结果。
 fn tool_key(event: &Value, item: &Value) -> String {
     for text in [
         string_field(item, "call_id"),
@@ -884,4 +970,236 @@ fn chat_usage_from_responses(usage: &Value) -> Value {
         Value::from(json_number_of(usage, &["total_tokens"]).max(input + output)),
     );
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod tool_identity_tests {
+    use super::*;
+
+    /// 把上游 SSE 事件序列喂进转换器，返回 (工具槽位 index → (name, id, 参数))。
+    fn feed(events: &[Value]) -> Vec<(i64, String, String, String)> {
+        let mut machine = ChatFromResponsesStream::new("m");
+        let mut frames = Vec::new();
+        for event in events {
+            let line = format!("data: {event}\n\n");
+            frames.extend(machine.push(line.as_bytes()));
+        }
+        frames.extend(machine.finish());
+        let text: String = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).to_string())
+            .collect();
+        let mut slots: std::collections::BTreeMap<i64, (String, String, String)> =
+            std::collections::BTreeMap::new();
+        for line in text.split("data: ").skip(1) {
+            let line = line.trim();
+            if line == "[DONE]" || !line.starts_with('{') {
+                continue;
+            }
+            let Ok(chunk) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(calls) = chunk.pointer("/choices/0/delta/tool_calls").and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
+                let entry = slots.entry(index).or_insert((
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ));
+                let function = call.get("function").cloned().unwrap_or(Value::Null);
+                if let Some(name) = function.get("name").and_then(Value::as_str) {
+                    entry.0 = name.to_string();
+                }
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    entry.1 = id.to_string();
+                }
+                if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                    entry.2.push_str(arguments);
+                }
+            }
+        }
+        slots.into_iter().map(|(index, slot)| (index, slot.0, slot.1, slot.2)).collect()
+    }
+
+    fn added() -> Value {
+        json!({"type":"response.output_item.added","output_index":0,
+            "item":{"type":"function_call","id":"fc_item1","call_id":"call_real1",
+                "name":"TaskUpdate","arguments":""}})
+    }
+
+    /// 官方形状：arguments.delta **不带 call_id**，只有 item_id。
+    /// 两种事件必须落在同一槽位，否则一次调用被拆成两条（其中一条没有名字）。
+    #[test]
+    fn official_event_shape_keeps_one_tool_slot() {
+        let events = vec![
+            added(),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,
+                "item_id":"fc_item1","delta":"{\"a\":"}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,
+                "item_id":"fc_item1","delta":"1}"}),
+            json!({"type":"response.output_item.done","output_index":0,
+                "item":{"type":"function_call","id":"fc_item1","call_id":"call_real1",
+                    "name":"TaskUpdate","arguments":"{\"a\":1}"}}),
+        ];
+        let slots = feed(&events);
+        assert_eq!(slots.len(), 1, "一次调用只能有一个槽位: {slots:?}");
+        let (index, name, id, arguments) = &slots[0];
+        assert_eq!(*index, 0);
+        assert_eq!(name, "TaskUpdate");
+        assert_eq!(id, "call_real1", "id 应取上游的 call_id，不能是本地随机的");
+        assert_eq!(arguments, "{\"a\":1}", "参数只应落到同一个槽位");
+    }
+
+    /// 带 call_id 的 delta（本网关自身 Responses 出口的形状）同样不能重复。
+    #[test]
+    fn delta_with_call_id_stays_single_slot() {
+        let events = vec![
+            added(),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,
+                "item_id":"fc_item1","call_id":"call_real1","name":"TaskUpdate","delta":"{\"a\":1}"}),
+        ];
+        let slots = feed(&events);
+        assert_eq!(slots.len(), 1, "{slots:?}");
+        assert_eq!(slots[0].3, "{\"a\":1}");
+    }
+
+    /// 两次不同的调用不能因为字段取舍被并到一起。
+    #[test]
+    fn two_calls_keep_separate_slots() {
+        let events = vec![
+            added(),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,
+                "item_id":"fc_item1","delta":"{\"a\":1}"}),
+            json!({"type":"response.output_item.added","output_index":1,
+                "item":{"type":"function_call","id":"fc_item2","call_id":"call_real2",
+                    "name":"TaskCreate","arguments":""}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":1,
+                "item_id":"fc_item2","delta":"{\"b\":2}"}),
+        ];
+        let slots = feed(&events);
+        assert_eq!(slots.len(), 2, "{slots:?}");
+        assert_eq!(slots[0].1, "TaskUpdate");
+        assert_eq!(slots[0].3, "{\"a\":1}");
+        assert_eq!(slots[1].1, "TaskCreate");
+        assert_eq!(slots[1].3, "{\"b\":2}");
+    }
+
+    /// 全程拿不到名字的残片不产出任何 tool_calls 帧 ——
+    /// 客户端拿到空名调用只会报「Tool not found」。
+    #[test]
+    fn nameless_fragment_produces_no_tool_call() {
+        let events = vec![
+            json!({"type":"response.function_call_arguments.delta","output_index":0,
+                "item_id":"fc_orphan","delta":"{\"a\":1}"}),
+            json!({"type":"response.output_item.done","output_index":0,
+                "item":{"type":"function_call","id":"fc_orphan","arguments":"{\"a\":1}"}}),
+        ];
+        assert!(feed(&events).is_empty(), "空名残片不该产生工具调用: {events:?}");
+    }
+}
+
+/// reasoning 项不带本地 id 的回归护栏（见 `push_assistant_items` 的文档）。
+///
+/// 背景：`store:false` 下上游不持久化 item，带 id 的 reasoning 项会被上游
+/// 按「已存条目」查表，查不到就整轮 404：
+/// `Item with id 'rs_xxx' not found. Items are not persisted when store is set to false.`
+/// 症状是「有时候」——只在 responses 协议 + 推理模型 + 多轮对话三者同时满足时出现。
+#[cfg(test)]
+mod reasoning_id_regression {
+    use super::*;
+    use serde_json::json;
+
+    /// 从转换出的 Responses 请求体里取出 `input` 数组
+    fn input_of(chat: &Value) -> Vec<Value> {
+        let out = responses_request_from_chat(chat, "gpt-6-astra").expect("翻译应成功");
+        out.get("input")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn reasoning_item_carries_no_local_id() {
+        // 多轮历史：第一轮 assistant 带 reasoning_content（触发 reasoning 项）
+        let chat = json!({
+            "model": "gpt-6-astra",
+            "messages": [
+                { "role": "user", "content": "first" },
+                { "role": "assistant", "content": "answer",
+                  "reasoning_content": "let me think about this" },
+                { "role": "user", "content": "second" },
+            ],
+        });
+        let items = input_of(&chat);
+        let reasoning: Vec<&Value> = items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .collect();
+        assert_eq!(reasoning.len(), 1, "应产出恰好一个 reasoning 项: {items:#?}");
+        assert!(
+            reasoning[0].get("id").is_none(),
+            "reasoning 项不得带 id（store:false 下上游会 404）: {:#?}",
+            reasoning[0]
+        );
+        // summary 文本仍要在（去掉的只是 id，不是内容）
+        assert_eq!(
+            reasoning[0].pointer("/summary/0/text").and_then(Value::as_str),
+            Some("let me think about this")
+        );
+    }
+
+    #[test]
+    fn encrypted_content_still_restored_without_id() {
+        // 加密连续性载体（store=false 多轮）必须仍然恢复进 reasoning 项 ——
+        // 去掉 id 不能影响这条链路（Codex / Grok CLI 靠它延续推理）。
+        // 注意：加密体在 chat 体上的暂存键是内部字段 `_wb_encrypted_content`
+        // （由入口翻译写入，见 protocol::FIELD_ENCRYPTED_CONTENT），
+        // 不是上游 Responses 体上的 `encrypted_content`。
+        let chat = json!({
+            "model": "gpt-6-astra",
+            "messages": [
+                { "role": "user", "content": "first" },
+                { "role": "assistant", "content": "",
+                  FIELD_ENCRYPTED_CONTENT: "ENCRYPTED_BLOB_XYZ" },
+                { "role": "user", "content": "second" },
+            ],
+        });
+        let items = input_of(&chat);
+        let reasoning = items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .expect("应产出 reasoning 项");
+        assert!(reasoning.get("id").is_none(), "不得带 id");
+        assert_eq!(
+            reasoning.get("encrypted_content").and_then(Value::as_str),
+            Some("ENCRYPTED_BLOB_XYZ"),
+            "encrypted_content 必须原样保留"
+        );
+        // 只有加密体时 summary 给空数组（与模块头说明一致）
+        assert_eq!(
+            reasoning.get("summary").and_then(Value::as_array).map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn request_still_pins_store_false() {
+        // 护栏的另一半：本网关无状态，store 必须恒为 false。
+        // 若将来有人为了「让 id 生效」把 store 改成 true，这个测试会拦下来 ——
+        // 正确修法是别发 id（本模块已如此），不是让上游存我们的数据。
+        let chat = json!({
+            "model": "gpt-6-astra",
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let out = responses_request_from_chat(&chat, "gpt-6-astra").expect("翻译应成功");
+        assert_eq!(
+            out.get("store").and_then(Value::as_bool),
+            Some(false),
+            "网关无状态：store 必须为 false"
+        );
+    }
 }

@@ -71,7 +71,7 @@ use super::report::normalize_status_filter;
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, credit";
+     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, credit, credit_source";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -135,6 +135,7 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         // None，与「上游没报」在写入侧收敛成同一个值（见 `RequestEntry::credit`）。
         // 读成 Option<f64>：NULL 原样给 None，不替旧行编一个 0
         credit: row.get(25)?,
+        credit_source: row.get(26)?,
     })
 }
 
@@ -624,7 +625,7 @@ pub(super) fn update_running_request(
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
-         is_test = ?22, route = ?23, credit = ?24 \
+         is_test = ?22, route = ?23, credit = ?24, credit_source = ?25 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -653,6 +654,7 @@ pub(super) fn update_running_request(
             entry.is_test as i64,
             encode_optional_json(&entry.route),
             entry.credit,
+            entry.credit_source,
         ],
     )
 }
@@ -670,9 +672,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, credit) \
+         sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, credit, credit_source) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             entry.id,
             entry.ts,
@@ -698,6 +700,7 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.is_test as i64,
             encode_optional_json(&entry.route),
             entry.credit,
+            entry.credit_source,
         ],
     )?;
     Ok(())
@@ -901,6 +904,7 @@ mod tests {
             total_tokens: 414,
             cache_read_tokens: 0,
             credit,
+            credit_source: String::new(),
             provider: "workbuddy-intl".to_string(),
             client_model: String::new(),
             upstream_model: String::new(),
@@ -924,9 +928,19 @@ mod tests {
     fn credit_round_trips_through_insert_and_select() {
         let (db, _guard) = TempDb::open("req-credit-roundtrip");
         db.with_mut(|conn| {
-            insert_request(conn, &entry("w-billed", Some(0.34))).expect("插入计费行");
+            let mut billed = entry("w-billed", Some(0.34));
+            billed.credit_source = "estimate".into();
+            insert_request(conn, &billed).expect("插入计费行");
             insert_request(conn, &entry("w-free", Some(0.0))).expect("插入限免行");
             insert_request(conn, &entry("w-missing", None)).expect("插入无 credit 行");
+            // Production requests finish through UPDATE, not only the INSERT fallback.
+            let mut running = entry("w-running", None);
+            running.status = 0;
+            insert_request(conn, &running).expect("插入进行中行");
+            running.status = 200;
+            running.credit = Some(0.125);
+            running.credit_source = "estimate".into();
+            assert_eq!(update_running_request(conn, &running).unwrap(), 1);
         })
         .expect("库可用");
 
@@ -936,9 +950,12 @@ mod tests {
             })
             .expect("库可用")
             .expect("查询可用");
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         let by_id = |id: &str| rows.iter().find(|row| row.id == id).expect("该行在结果里");
+        assert_eq!(by_id("w-running").credit, Some(0.125));
+        assert_eq!(by_id("w-running").credit_source, "estimate");
         assert_eq!(by_id("w-billed").credit, Some(0.34));
+        assert_eq!(by_id("w-billed").credit_source, "estimate");
         // 显式 0 与「没报」必须分得开 —— 前者是限免档的真实读数，后者是「不知道」
         assert_eq!(by_id("w-free").credit, Some(0.0));
         assert_eq!(by_id("w-missing").credit, None);

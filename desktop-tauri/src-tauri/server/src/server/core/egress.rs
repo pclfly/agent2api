@@ -486,6 +486,35 @@ pub async fn test_proxy(proxy: Option<&ResolvedProxy>) -> ConnectivityResult {
     test_connectivity(proxy, DEFAULT_TEST_TIMEOUT_MS, None).await
 }
 
+/// 上游在流中途把连接断掉（没发 TLS close_notify）时，那串错误链的可读说明。
+///
+/// ── 为什么要单独认它 ──────────────────────────────────────
+/// rustls 对「对端没发 close_notify 就关连接」会给出一长串内部错误：
+///   `error decoding response body → request or response body error →
+///    error reading a body from connection → peer closed connection without
+///    sending TLS close_notify: https://docs.rs/rustls/latest/…`
+/// 用户看到的是一句读不出结论的技术栈，而真正发生的事只有两件：**上游（或它前面的
+/// CDN / 反代）在流式响应中途关掉了连接**，或者**出口节点把长连接掐了**。
+/// 它跟「上游返回 5xx」不是一回事（HTTP 状态早已是 200、客户端已收到部分内容），
+/// 跟「流式响应空闲超时」也不是一回事（那种有数据间隔、这里是被对端主动断开）。
+///
+/// 实测（2026-10-15，本机库里的三发）：OpenCode Zen 与 MixAI 两条自定义上游各
+/// 命中过，断点都在已下发十几到几十帧之后（下游收到 30 帧时被截断），上游没有
+/// 给出 `finish_reason`。因此它不是某一家的协议适配问题，而是长连接在中间某段
+/// 被关掉 —— 出口换成直连或另一个节点后消失。
+///
+/// 认它只影响**文案**，不改转发行为：判定仍由传输层错误决定，断点仍在同一处。
+pub fn describe_stream_break(text: &str) -> Option<String> {
+    if !text.contains("close_notify") {
+        return None;
+    }
+    Some(
+        "上游在流式响应中途关闭了连接（未发送 TLS close_notify）：通常是上游或其 CDN / 反代 \
+         主动断开长连接，也可能是出口代理节点掐断了长连接。已下发的部分内容仍有效，但本次答复不完整"
+            .to_string(),
+    )
+}
+
 /// 错误链的可读描述（对照 Node 版 `proxyErrorDetail`）。
 ///
 /// Node 版从 `error.cause` 一路下钻拼出 `分段 → 分段`，因为 undici 的连接类
@@ -526,5 +555,39 @@ pub fn describe_public(proxy: Option<&ResolvedProxy>) -> Value {
             "host": proxy.host,
             "port": proxy.port_json(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod stream_break_tests {
+    use super::describe_stream_break;
+
+    /// 线上实测的那串 rustls 错误链（2026-10-15，请求日志里的原文）
+    const LIVE_CHAIN: &str = "error decoding response body → request or response body error → \
+        error reading a body from connection → peer closed connection without sending TLS \
+        close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof";
+
+    #[test]
+    fn the_live_rustls_chain_is_recognized_and_reads_as_an_explanation() {
+        let message = describe_stream_break(LIVE_CHAIN).expect("线上那串错误链要认得出来");
+        assert!(message.contains("中途关闭"), "{message}");
+        assert!(message.contains("close_notify"), "{message}");
+        // 认出来之后不该再把 rustls 的实现细节与文档链接原样抛给用户
+        assert!(!message.contains("docs.rs"), "{message}");
+        assert!(!message.contains("error decoding response body"), "{message}");
+    }
+
+    /// 别的传输错误不能被误说成断连 —— 误认会把排查方向整个带偏。
+    #[test]
+    fn other_transport_errors_are_left_alone() {
+        for text in [
+            "error sending request for url (https://upstream.invalid/v1/chat/completions)",
+            "error decoding response body",
+            "operation timed out",
+            "connection refused",
+            "流式响应空闲超时（60 秒内没有新数据）",
+        ] {
+            assert!(describe_stream_break(text).is_none(), "{text}");
+        }
     }
 }

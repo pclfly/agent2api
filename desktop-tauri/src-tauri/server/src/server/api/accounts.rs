@@ -177,6 +177,8 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
         ("POST", "pool/update") => super::proxies::pool_update(&state, &body).await,
         ("POST", "pool/remove") => super::proxies::pool_remove(&state, &body).await,
         ("POST", "pool/test") => super::proxies::pool_test(&state, &body).await,
+        ("POST", "pool/set-disabled") => super::proxies::pool_set_disabled(&state, &body).await,
+        ("GET", "pool/usable") => super::proxies::pool_usable(&state).await,
         ("POST", "pool/sync-clash") => super::proxies::pool_sync_clash(&state).await,
         // 已注册路径上的其它方法：Node 的 tryHandleProxies 落到它自己的 404 信封
         _ => management_error(
@@ -846,6 +848,17 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             };
             store.add_antigravity_account(&credentials, import_name, "manual")
         }
+        // QwenWork：手填或显式只读导入 Windows 客户端凭据快照。
+        Some(crate::server::core::providers::ProviderKind::QwenWork) => {
+            if import_desktop {
+                match crate::server::core::providers::qwenwork::credentials::read_desktop() {
+                    Ok(c) => store.add_qwenwork_account(&c.payload(), import_name, "desktop-import"),
+                    Err(e) => Err(AccountStoreError::new(e.message, e.status_code)),
+                }
+            } else {
+                store.add_qwenwork_account(&payload, import_name, "manual")
+            }
+        }
         // OfficeAce（华为云果办 / OfficeClaw）：粘贴模型网关的 Basic 凭据
         // （`baseUrl` + `modelAppKey`/`modelAppSecret`，可选控制面临时凭据）。
         // **不调上游**（与 CodeArts 同口径）——凭据是导入/登录换来的，添加时
@@ -1099,6 +1112,9 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     // ZCode：同一条理由（它的续期是自家 OAuth 那套，不是 workbuddy 的链）
     if state.store().zcode_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Zcode).await;
+    }
+    if state.store().qwenwork_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::QwenWork).await;
     }
     // OfficeAce：控制面临时凭据（约 2 小时）用 refresh token + DPoP 私钥续期，
     // 必须走它自己的适配器。**这条不能省**：漏了就落到 workbuddy 兜底链路，

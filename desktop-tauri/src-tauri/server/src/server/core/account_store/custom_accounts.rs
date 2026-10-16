@@ -32,10 +32,19 @@
 //! `apiKey` 非空时用它的 SHA-256 前 12 位：**同一把 key 重复添加会合并更新
 //! 同一条记录** —— 与各家「同标识合并」（workbuddy 的 `user-<uid>`、Qoder 的
 //! `qoder-<region>-<hash>`）语义一致，用户粘错重试不会堆出重复账号。
-//! `noAuth` 时用 `provider_id` 派生（同一家只有一条匿名账号，同样合并且跨
-//! 重装稳定）。两者都没有时退化为随机 12 位（`getrandom`）：没有稳定标识可
-//! 派生，但 id 的唯一性不能打折（并发/重装都要安全，理由同 `custom_providers`
-//! 的 id）。派生规则见 [`account_id_for`]。
+//! 空 key（含 `noAuth` 的匿名账号）时用随机 12 位（`getrandom`）—— **同一家
+//! 可以有多条匿名账号**，与「没有稳定标识可派生时，id 的唯一性不能打折」同一
+//! 取向（并发/重装都要安全，理由同 `custom_providers` 的 id）。
+//! 派生规则见 [`account_id_for`]。
+//!
+//! ── 匿名账号为什么不再是「一家一条」 ──────────────────────────
+//! 曾经这里按 `"noauth\0" + provider_id` 派生，即**同一家只允许一条匿名账号**：
+//! 再添一条会算出同一个 id，于是被当成「同一账号」合并 —— 表现为**新加的
+//! 账号把先前那条顶掉**（备注名、代理、限额冷却全被覆盖成新值）。而多开匿名
+//! 账号恰恰是有意义的用法：同家免费档按账号分流（每条挂不同代理、各有各的
+//! 429 冷却窗口）。所以现在改成随机 id，且**确认空闲后才采用**（见
+//! `add_custom_account` 里的重取循环）。存量里那条旧派生 id 只是普通记录，
+//! 不迁移（id 被限额冷却、请求日志、导出文件引用着，改名会打断这些关联）。
 //! 前缀 `custom-acct-` 与 provider id 的 `custom-` **刻意不同形**：
 //! `is_custom_provider_id` 按 provider 前缀判定，账号 id 若同形会被误认成
 //! 提供商 id（两套 id 空间混淆是难查的静默错配）。
@@ -43,6 +52,8 @@
 //! ── 硬约束 ────────────────────────────────────────────────
 //! 本文件全是「读-改-写」文件操作，**没有任何网络请求**（持锁不做网络）。
 //! 绝不 unwrap/expect（release 是 panic=abort）。
+
+use std::sync::MutexGuard;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -65,6 +76,13 @@ const MAX_NAME_CHARS: usize = 100;
 /// apiKey 长度上限（防御：粘贴进一整段文档时不落盘）。
 /// 上游 key 一般 32~256 字符，8192 与 `MAX_TOKEN_LENGTH` 同量级。
 const MAX_API_KEY_LENGTH: usize = 8192;
+
+/// 匿名账号取号的重试上限。
+///
+/// 12 位 hex = 48 位空间，正常情况第一次就空闲；给 8 次是**正确性**兜底而不是
+/// 概率优化 —— 试满说明随机源或既有数据有问题（例如手改出一堆同 id 记录），
+/// 此时报错优于覆写别人的记录（理由见 `allocate_anonymous_id`）。
+const ANONYMOUS_ID_ATTEMPTS: usize = 8;
 
 impl AccountStore {
     // ─── 写：手动添加 ────────────────────────────────────────
@@ -89,10 +107,12 @@ impl AccountStore {
     ///   - `name` 由 `name` 参数决定（调用方已从请求体取好，与各家一致）。
     ///
     /// 幂等口径：`apiKey` 非空时同 key 重复添加 = **更新**既有记录（备注名 /
-    /// baseUrl 覆盖项随之更新，优先级与启用状态沿用）；`noAuth` 时同一家只有
-    /// **一条**匿名账号（id 由 provider 派生，重复添加同样合并）。没有撞上则
-    /// 新建。撞到**其它 provider** 的账号 id（hash 空间巧合）时报 409 而不是
-    /// 覆写。
+    /// baseUrl 覆盖项随之更新，优先级与启用状态沿用）—— 带 key 的账号有稳定
+    /// 标识，粘错重试不该堆出重复记录。**无 key 的匿名账号（`noAuth` 或还没填
+    /// 凭证的）没有稳定标识可派生，因此每次添加都新建一条**，id 现取一个空闲的
+    /// 随机值：同一家可以有多条匿名账号（各挂各的代理、各有各的限额冷却窗口，
+    /// 见模块头「匿名账号为什么不再是『一家一条』」）。撞到**其它 provider** 的
+    /// 账号 id（hash 空间巧合）时报 409 而不是覆写。
     pub fn add_custom_account(
         &self,
         provider_id: &str,
@@ -150,10 +170,21 @@ impl AccountStore {
         };
 
         let _guard = self.guard();
-        let id = account_id_for(provider_id, &api_key, no_auth)
-            .map_err(|error| AccountStoreError::new(error, 500))?;
+        // ── id 怎么来：带 key 的派生，匿名的现取一个空闲随机值 ──────
+        // 带 key：id = key 的散列前缀 → 同一把 key 再加一次落回同一条记录
+        //   （幂等口径见上面 doc）。
+        // 匿名（noAuth / 空 key）：没有稳定标识，**每次都是新账号** —— id 随机
+        //   且必须确认空闲（见 `allocate_anonymous_id`）。这里刻意不去找
+        //   「同家已有的匿名账号」来合并：那正是旧行为，第二条会把第一条顶掉。
+        let id = if api_key.is_empty() {
+            self.allocate_anonymous_id(&_guard)?
+        } else {
+            account_id_for(&api_key)
+        };
         // 撞 id 保护（与 cline 同一考虑）：hash 空间巧合或手改数据都会撞上
-        // 别家的记录，覆写会把那条记录的凭证一起弄丢
+        // 别家的记录，覆写会把那条记录的凭证一起弄丢。
+        // 匿名那一支的 id 是**全局空闲**的（分配函数保证），所以这里只为带 key
+        // 的派生 id 服务。
         let existing = self.record_by_id(&_guard, &id);
         if let Some(existing) = existing.as_ref() {
             if existing.provider() != provider_id {
@@ -293,6 +324,34 @@ impl AccountStore {
             ),
         );
         Ok(self.public_account(&saved))
+    }
+
+    /// 取一个**当前空闲**的匿名账号 id（`custom-acct-` + 12 位随机 hex）。
+    ///
+    /// ── 为什么必须查空闲，而且查的是**全局** ────────────────────
+    /// 账号表的主键就是 id，落地走 `sql::put`（DELETE + INSERT）—— 撞上任何
+    /// 一条既有记录（**不限于本家**）都会把它整条覆写掉，凭证一起没。所以判据
+    /// 不能收窄到「本家有没有」，也不能靠 48 位随机的低碰撞率赌一把：这正是
+    /// 本次修复的教训（旧实现按 provider 派生匿名 id，第二条匿名账号必然与
+    /// 第一条同 id，于是「添加」静默退化成「覆写」）。
+    ///
+    /// 试满 [`ANONYMOUS_ID_ATTEMPTS`] 次仍撞号 → 如实报错（随机源或既有数据
+    /// 有问题），不落一条会覆盖别人的记录（本模块硬约束「绝不 panic」，报错
+    /// 让用户重试是既定处置，与 `zcode_accounts::anonymous_account_id` 同一取向）。
+    fn allocate_anonymous_id(
+        &self,
+        guard: &MutexGuard<'_, ()>,
+    ) -> Result<String, AccountStoreError> {
+        for _ in 0..ANONYMOUS_ID_ATTEMPTS {
+            let id = random_account_id().map_err(|error| AccountStoreError::new(error, 500))?;
+            if self.record_by_id(guard, &id).is_none() {
+                return Ok(id);
+            }
+        }
+        Err(AccountStoreError::new(
+            "无法生成未被占用的账号 id（连续撞号），请重试",
+            500,
+        ))
     }
 
     /// 删除某个自定义提供商名下的**全部账号**，返回删除条数。
@@ -544,26 +603,21 @@ fn credential_of_record(record: &StoredAccount) -> CustomCredential {
     }
 }
 
-/// 账号 id：`custom-acct-` + 12 位 hex。三条派生链，按凭证形态分派：
+/// 带 key 账号的 id：`custom-acct-` + key 的 SHA-256 前 12 位。
 ///
-///   - `apiKey` 非空 → 它的 SHA-256 前 12 位（同 key 合并，见模块头）；
-///   - `noAuth`（无 key）→ `"noauth\0" + provider_id` 的 SHA-256 前 12 位：
-///     同一家上游**只有一条**匿名账号，重复添加同样合并（与同 key 合并同一
-///     动机），且它在这家是稳定的 —— 卸载重装、改备注名都不会换 id；
-///   - 两者都没有（未配置凭证的记录）→ 随机 12 位（`getrandom`）。
+/// **只在 `apiKey` 非空时使用**：同一把 key 的散列恒定，于是「同一把 key 再加
+/// 一次」落回同一条记录（幂等口径见模块头与 `add_custom_account` 的 doc）。
+/// 匿名账号（空 key，含 `noAuth`）不走这里 —— 它们没有可派生的稳定标识，
+/// 由 [`AccountStore::allocate_anonymous_id`] 现取一个空闲随机值。
+fn account_id_for(api_key: &str) -> String {
+    format!("{CUSTOM_ACCOUNT_ID_PREFIX}{}", short_hash(api_key))
+}
+
+/// 随机账号 id：`custom-acct-` + 12 位随机 hex（6 字节 `getrandom`）。
 ///
 /// 随机源失败时如实报错（本函数返回 Err）：本模块硬约束「绝不 panic」，
 /// 宁可让用户重试一次，也不落一条 id 可靠性没保证的记录。
-fn account_id_for(provider_id: &str, api_key: &str, no_auth: bool) -> Result<String, String> {
-    if !api_key.is_empty() {
-        return Ok(format!("{CUSTOM_ACCOUNT_ID_PREFIX}{}", short_hash(api_key)));
-    }
-    if no_auth {
-        // `\0` 分隔：provider_id 里不可能出现它，于是「某把 key 恰好等于
-        // 这个拼接串」的碰撞在哈希之前就被排除
-        let seed = format!("noauth\u{0}{provider_id}");
-        return Ok(format!("{CUSTOM_ACCOUNT_ID_PREFIX}{}", short_hash(&seed)));
-    }
+fn random_account_id() -> Result<String, String> {
     let mut bytes = [0u8; 6];
     getrandom::getrandom(&mut bytes)
         .map_err(|_| "无法生成安全的随机账号 id（系统随机源不可用），请重试".to_string())?;
@@ -575,4 +629,112 @@ fn account_id_for(provider_id: &str, api_key: &str, no_auth: bool) -> Result<Str
 fn short_hash(seed: &str) -> String {
     let digest = Sha256::digest(seed.as_bytes());
     format!("{digest:x}").chars().take(12).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::db::Db;
+    use serde_json::json;
+
+    /// 每个测试一个临时库（与 `codearts_accounts` 的测试同一形制）：
+    /// `Db::open` 自带建表迁移，构造出来的就是真存储层 —— mock 一套反而测不到
+    /// `sql::put` 的主键覆写语义，而本次修复的关键恰恰在「会不会覆写」。
+    fn store() -> AccountStore {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("custom-accounts-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("agent2api.db")).expect("临时库应当能建起来");
+        AccountStore::with_db(Some(db))
+    }
+
+    /// 库里的账号 id 列表（顺序按库的物理行序，断言只看集合与条数）
+    fn ids_of(store: &AccountStore) -> Vec<String> {
+        store
+            .list_accounts()
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map(|accounts| {
+                accounts
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 同一家连加三条匿名（`noAuth`）账号 → **三条独立记录**。
+    ///
+    /// 本次修复的回归钉：旧实现按 `"noauth\0" + provider_id` 派生 id，三条算出
+    /// 同一个 id，于是第二条起「添加」静默退化成「覆写」第一条（备注名、代理、
+    /// 限额冷却全被顶掉）。生产库里的表现正是用户报的「只能加两个账号，加第三
+    /// 个把第一个替换了」—— 上限碰巧是 2 是因为库里另一条是随机 id 的账号。
+    #[test]
+    fn anonymous_accounts_of_one_provider_stay_separate() {
+        let store = store();
+        let provider = "custom-000000000001";
+        let mut added = Vec::new();
+        for index in 1..=3 {
+            let account = store
+                .add_custom_account(
+                    provider,
+                    &json!({ "noAuth": true }),
+                    Some(&format!("匿名 {index}")),
+                )
+                .expect("添加匿名账号应当成功");
+            added.push(
+                account
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        let unique: std::collections::HashSet<&String> = added.iter().collect();
+        assert_eq!(unique.len(), 3, "三条匿名账号必须是三条独立记录：{added:?}");
+        assert_eq!(ids_of(&store).len(), 3, "库里也应当是三条（没有互相覆写）");
+    }
+
+    /// 同一把 key 仍然合并（幂等口径没被这次改动牵动），另一把 key 才是新账号。
+    #[test]
+    fn same_api_key_still_merges_but_another_key_is_a_new_account() {
+        let store = store();
+        let provider = "custom-000000000002";
+        let first = store
+            .add_custom_account(provider, &json!({ "apiKey": "sk-key-one" }), Some("第一条"))
+            .expect("首加应当成功");
+        let again = store
+            .add_custom_account(provider, &json!({ "apiKey": "sk-key-one" }), Some("改个名"))
+            .expect("同 key 再加应当成功");
+        assert_eq!(
+            first.get("id").and_then(Value::as_str),
+            again.get("id").and_then(Value::as_str),
+            "同一把 key 必须落回同一条记录（合并而不是新建）"
+        );
+        assert_eq!(ids_of(&store).len(), 1, "同 key 两次添加只应留下一条记录");
+
+        store
+            .add_custom_account(provider, &json!({ "apiKey": "sk-key-two" }), Some("第二条"))
+            .expect("换一把 key 应当是新建");
+        assert_eq!(ids_of(&store).len(), 2, "另一把 key 必须是另一条记录");
+    }
+
+    /// 匿名账号与带 key 的账号混放时互不干扰（同一家之内）——
+    /// 匿名账号的取号只看「全局空闲」，不去翻本家有没有带 key 的记录。
+    #[test]
+    fn anonymous_and_keyed_accounts_coexist() {
+        let store = store();
+        let provider = "custom-000000000003";
+        store
+            .add_custom_account(provider, &json!({ "apiKey": "sk-key" }), Some("带 key"))
+            .expect("带 key 的添加应当成功");
+        store
+            .add_custom_account(provider, &json!({ "noAuth": true }), Some("匿名 A"))
+            .expect("匿名 A 应当成功");
+        store
+            .add_custom_account(provider, &json!({ "noAuth": true }), Some("匿名 B"))
+            .expect("匿名 B 应当成功");
+        assert_eq!(ids_of(&store).len(), 3, "三条互不覆写");
+    }
 }

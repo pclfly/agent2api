@@ -666,7 +666,12 @@ impl Stream for ForwardStream {
                     {
                         text
                     } else {
-                        format!("上游流式传输中断: {error}")
+                        // 上游在流中途把连接断掉（没发 TLS close_notify）是一类
+                        // 反复出现的形态：rustls 给的那串错误链里全是实现细节，
+                        // 换成一句能指向排查方向的说明（见 describe_stream_break）。
+                        // 认不出就按原样加前缀 —— 不把别的传输错误误说成断连。
+                        crate::server::core::egress::describe_stream_break(&text)
+                            .unwrap_or_else(|| format!("上游流式传输中断: {error}"))
                     };
                     // 只在终端：这条原因由下面的 `note_error` 进请求日志
                     // （客户端此时已收到部分内容，HTTP 状态早就是 200，

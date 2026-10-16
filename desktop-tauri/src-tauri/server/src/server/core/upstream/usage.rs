@@ -48,6 +48,8 @@ pub struct UsageTokens {
     /// `None`，请求日志的「消耗」列据此显示「-」而不是编一个 0 出来 —— 那会
     /// 让「这家不报积分」与「这次没花钱」在界面上分不开。
     pub credit: Option<f64>,
+    /// True only for a provider-side estimate, never an upstream debit.
+    pub credit_estimated: bool,
 }
 
 /// 从 usage 对象里提取 token 数与积分消耗（字段名兼容见模块头部）。
@@ -74,7 +76,9 @@ pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
     // `prompt_cache_hit_tokens` 同块 —— 见 `workbuddy/normalize.rs` 的逆向实测
     // 与参考实现的 `_extract_usage`）。其它家不报这个键 → None。
     let credit = number_field_f64(object.get("credit"));
-    Some(UsageTokens { prompt, completion, total, cache_read, credit })
+    Some(UsageTokens { prompt, completion, total, cache_read, credit,
+        credit_estimated: credit.is_some() && usage.get("credit_source").and_then(Value::as_str) == Some("estimate"),
+    })
 }
 
 /// 取数值字段：`as_i64` 对 `1.0` 这类浮点形态会失败，所以再补一次 f64 转换
@@ -215,6 +219,8 @@ pub struct TelemetrySnapshot {
     /// 与四个 token 计数同点采集（`report_usage`），同一「最后一次为准」口径。
     /// 存 `Option<f64>` 的理由见 [`UsageTokens::credit`]：缺失 ≠ 0。
     pub credit: Option<f64>,
+    /// True only for a provider-side estimate, never an upstream debit.
+    pub credit_estimated: bool,
     /// 上游首帧到达的**绝对时刻**（毫秒 Unix 时间戳；None = 全程没有帧到达，
     /// 例如转发前就失败 / 请求尚未开始下发）。
     ///
@@ -1031,6 +1037,7 @@ impl RequestTelemetry {
         // 与 `note_upstream_model` 的「空串不写」同一纪律 —— 「没有」不能覆盖「有」。
         if tokens.credit.is_some() {
             guard.credit = tokens.credit;
+            guard.credit_estimated = tokens.credit_estimated;
         }
     }
 

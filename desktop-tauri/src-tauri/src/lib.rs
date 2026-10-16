@@ -285,6 +285,7 @@ pub fn run() {
             commands::save_app_settings,
             commands::export_accounts,
             commands::import_accounts,
+            commands::import_subscription_file,
             commands::export_database,
             commands::import_database,
             commands::check_update,

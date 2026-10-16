@@ -273,7 +273,7 @@ fn machine_os() -> String {
 ///
 /// 密钥与 IV **都取同一段 16 字节**（源实现 `aesEncrypt` 的既有做法，
 /// 不是这里的设计选择），所以调用方只需给一个 16 字符的 key。
-fn aes128_cbc_base64(key16: &str, plaintext: &[u8]) -> Result<String, GatewayError> {
+pub(crate) fn aes128_cbc_base64(key16: &str, plaintext: &[u8]) -> Result<String, GatewayError> {
     if key16.len() != 16 {
         return Err(GatewayError::with_status(500, "Qoder 签名密钥长度无效"));
     }
@@ -316,7 +316,7 @@ fn aes128_cbc_base64(key16: &str, plaintext: &[u8]) -> Result<String, GatewayErr
 /// 布局：`00 || 02 || PS || 00 || M`，PS 是**非零随机**字节
 /// （源实现走 Node 的 `RSA_PKCS1_PADDING`，OpenSSL 用随机 PS）。
 /// PS 固定会让 RSA 退化成确定性加密 —— 那是可被指纹化的特征，不要改。
-fn rsa_encrypt_base64(plaintext: &str) -> Result<String, GatewayError> {
+pub(crate) fn rsa_encrypt_base64(plaintext: &str) -> Result<String, GatewayError> {
     let modulus = BigUint::parse_bytes(RSA_MODULUS_HEX.as_bytes(), 16)
         .ok_or_else(|| GatewayError::with_status(500, "Qoder 签名公钥无效"))?;
     let key_len = ((modulus.bits() + 7) / 8) as usize;

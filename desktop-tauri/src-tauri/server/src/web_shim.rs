@@ -195,7 +195,7 @@ pub fn shim_js() -> &'static str {
     return authorizeUrl.toString();
   }
 
-  async function waitForManualCallback(provider, state, authUrl) {
+  async function waitForManualCallback(provider, state, authUrl, flow) {
     var label = provider === 'raccoon' ? '小浣熊'
       : provider === 'trae' ? 'Trae'
       : provider.indexOf('accio') === 0 ? 'Accio'
@@ -203,6 +203,7 @@ pub fn shim_js() -> &'static str {
     var callbackInstruction = '授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
         + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。';
     while (true) {
+      requireCurrentLogin(flow);
       var callbackUrl = await ensureOverlay(
         label + '需要粘贴回调地址',
         '<div style="margin-bottom:10px;">' + callbackInstruction + '</div>'
@@ -214,6 +215,7 @@ pub fn shim_js() -> &'static str {
         + 'border-radius:6px;background:#26272b;color:#e8e8e8;">',
         '提交回调地址'
       );
+      requireCurrentLogin(flow);
       callbackUrl = String(callbackUrl || '').trim();
       if (!callbackUrl) continue;
       try {
@@ -221,6 +223,7 @@ pub fn shim_js() -> &'static str {
           state: state,
           callbackUrl: callbackUrl,
         });
+        requireCurrentLogin(flow);
         if (submitted && submitted.nextUrl) {
           // CodeArts 第一跳只有 secret，需要先打开 portal 的下一跳；下一轮
           // 再粘贴浏览器最终回调地址即可完成换码。
@@ -229,8 +232,9 @@ pub fn shim_js() -> &'static str {
         }
         // Trae 是把 query 注入现有 listener 后异步换证；其它几家也统一
         // 以 /wait 的最终状态为准，避免把“已收到回调”误报成“已登录”。
-        return await pollWait(state);
+        return await pollWait(state, flow);
       } catch (error) {
+        requireCurrentLogin(flow);
         await ensureOverlay(
           '回调提交失败',
           '<div style="margin-bottom:4px;">' + escapeHtml(error && error.message ? error.message : error)
@@ -256,7 +260,7 @@ pub fn shim_js() -> &'static str {
   }
 
   // ── HTTP 调用：信封解包与桌面 gateway::unwrap_envelope 对齐 ──
-  async function httpCall(method, path, body, retried) {
+  async function httpCall(method, path, body, retried, signal) {
     var headers = { 'Accept': 'application/json' };
     if (apiKey) headers['x-api-key'] = apiKey;
     // 面板会话的头部回退（见 PANEL_AUTH 段）：有存令牌就带上；
@@ -273,6 +277,7 @@ pub fn shim_js() -> &'static str {
       if (panelRefresh) headers['x-panel-refresh'] = panelRefresh;
     }
     var init = { method: method, headers: headers };
+    if (signal) init.signal = signal;
     var wantsBody = method === 'POST' || method === 'PUT' || method === 'PATCH'
       || !(body === null || body === undefined);
     if (wantsBody) {
@@ -393,11 +398,50 @@ pub fn shim_js() -> &'static str {
 
   var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
 
-  async function pollWait(state) {
+  var currentLogin = null;
+  function requireCurrentLogin(flow) {
+    if (flow && (flow.canceled || flow.finished || currentLogin !== flow)) {
+      throw new Error('登录已取消');
+    }
+  }
+  // Cleanup must neither open an API-key dialog nor keep the UI busy indefinitely.
+  function cancelRemoteLogin(flow) {
+    if (!flow.state || flow.succeeded) return Promise.resolve(false);
+    if (!flow.cancelRequest) {
+      var controller = new AbortController();
+      var timer;
+      var deadline = new Promise(function (_, reject) {
+        timer = setTimeout(function () {
+          controller.abort();
+          reject(new Error('已停止本地等待，但未确认服务端取消；请勿继续授权，任务将自动过期'));
+        }, 2000);
+      });
+      flow.cancelRequest = Promise.race([
+        httpCall('POST', '/api/session/login/cancel', { state: flow.state }, true, controller.signal),
+        deadline,
+      ]).catch(function () {
+        throw new Error('已停止本地等待，但未确认服务端取消；请勿继续授权，任务将自动过期');
+      }).finally(function () { clearTimeout(timer); });
+    }
+    return flow.cancelRequest;
+  }
+  function cleanupLogin(flow) {
+    return cancelRemoteLogin(flow).catch(function (error) {
+      if (!flow.cancelWarningShown) {
+        flow.cancelWarningShown = true;
+        if (window.wbApp && window.wbApp.toast) window.wbApp.toast(error.message, 'err');
+      }
+    });
+  }
+
+  async function pollWait(state, flow) {
     var deadline = Date.now() + 5 * 60 * 1000;
     while (Date.now() < deadline) {
+      requireCurrentLogin(flow);
       await sleep(3000);
+      requireCurrentLogin(flow);
       var wait = await call('GET', '/api/session/login/wait?state=' + encodeURIComponent(state));
+      requireCurrentLogin(flow);
       if (wait && wait.done) {
         if (wait.error) throw new Error(wait.error);
         return wait.session == null ? {} : wait.session;
@@ -406,40 +450,64 @@ pub fn shim_js() -> &'static str {
     throw new Error('登录等待超时（5 分钟）');
   }
 
-  /** 发起一次登录流程：先开窗口（用户手势还在时占位成功率高），再拿地址导航。 */
+  /** Open the placeholder within the user gesture; keep each flow isolated. */
   async function runLoginFlow(provider, startRequest) {
+    if (currentLogin) throw new Error('请先完成或取消当前登录');
+    var flow = { state: '', canceled: false, finished: false, succeeded: false, popup: null, cancelRequest: null };
+    var cancelWait = new Promise(function (resolve) { flow.resolveCancel = resolve; });
+    currentLogin = flow;
     loginActive = true;
     loginProvider = provider;
     emitLogin();
-    var popup = null;
-    try { popup = window.open('about:blank', 'a2a-login'); } catch (e) { /* 拦截时走兜底 */ }
+    try { flow.popup = window.open('about:blank', 'a2a-login'); } catch (e) { /* Link fallback below. */ }
     try {
-      var started = await startRequest;
-      var authUrl = started && started.authUrl;
-      if (!authUrl) throw new Error('网关未返回授权地址');
-      authUrl = buildRaccoonWebAuthUrl(provider, started.state, authUrl);
-      if (popup && !popup.closed) {
-        popup.location.href = authUrl;
-      } else {
-        var second = null;
-        try { second = window.open(authUrl, '_blank'); } catch (e) { /* 落到链接兜底 */ }
-        if (!second) showLinkFallback(authUrl);
-      }
-      if (needsManualCallback(provider)) {
-        // 同时保留自动轮询：同机部署仍会自动完成，远程 Docker 则由用户
-        // 粘贴地址；先完成的一方结束流程，finally 会关闭残留覆盖层。
-        return await Promise.race([
-          pollWait(started.state),
-          waitForManualCallback(provider, started.state, authUrl),
-        ]);
-      }
-      return await pollWait(started.state);
+      // A late /start response still needs remote cancellation after local cancel.
+      var start = Promise.resolve().then(startRequest).then(async function (started) {
+        flow.state = String(started && started.state || '');
+        if (flow.canceled || flow.finished) {
+          await cleanupLogin(flow);
+          return null;
+        }
+        return started;
+      });
+      var result = await Promise.race([cancelWait, (async function () {
+        var started = await start;
+        requireCurrentLogin(flow);
+        var authUrl = started && started.authUrl;
+        if (!authUrl || !flow.state) throw new Error('网关未返回授权地址或登录状态');
+        authUrl = buildRaccoonWebAuthUrl(provider, flow.state, authUrl);
+        if (flow.popup && !flow.popup.closed) {
+          flow.popup.opener = null;
+          flow.popup.location.href = authUrl;
+        } else {
+          var second = null;
+          try { second = window.open(authUrl, '_blank'); } catch (e) { /* Link fallback below. */ }
+          if (second) { second.opener = null; flow.popup = second; }
+          else showLinkFallback(authUrl);
+        }
+        if (needsManualCallback(provider)) {
+          return await Promise.race([
+            pollWait(flow.state, flow),
+            waitForManualCallback(provider, flow.state, authUrl, flow),
+          ]);
+        }
+        return await pollWait(flow.state, flow);
+      })()]);
+      if (flow.canceled) return { canceled: true };
+      flow.succeeded = true;
+      return result;
     } finally {
-      if (popup && !popup.closed) { try { popup.close(); } catch (e) { /* 无害 */ } }
-      closeWebOverlay();
-      loginActive = false;
-      loginProvider = '';
-      emitLogin();
+      flow.finished = true;
+      if (flow.popup && !flow.popup.closed) { try { flow.popup.close(); } catch (e) { /* Harmless. */ } }
+      if (currentLogin === flow) {
+        closeWebOverlay();
+        currentLogin = null;
+        loginActive = false;
+        loginProvider = '';
+        emitLogin();
+      }
+      // Release the login Promise immediately; cleanup has its own finite deadline.
+      if (!flow.succeeded) void cleanupLogin(flow);
     }
   }
 
@@ -591,10 +659,10 @@ pub fn shim_js() -> &'static str {
     getState: function () { return call('GET', '/api/session'); },
     startLogin: function (edition, mode, provider) {
       var target = provider || 'workbuddy';
-      return runLoginFlow(target, call('POST', '/api/session/login/start', {
+      return runLoginFlow(target, function () { return call('POST', '/api/session/login/start', {
         edition: edition || 'cn',
         provider: target,
-      }));
+      }); });
     },
     submitLoginCallback: function (state, callbackUrl) {
       return call('POST', '/api/session/login/callback', {
@@ -606,26 +674,38 @@ pub fn shim_js() -> &'static str {
       return Promise.resolve({ active: loginActive, provider: loginProvider });
     },
     cancelLogin: async function () {
-      // 桌面壳只记一个活动登录；网页端由本状态机驱动，直接清状态。
-      // 上游任务本身会因无人轮询而在超时后落定，不需要额外请求。
-      var wasActive = loginActive;
+      var flow = currentLogin;
+      if (!flow) return false;
+      flow.canceled = true;
+      flow.resolveCancel({ canceled: true });
+      // Clear only this flow; a late response/finally must never clear its successor.
+      currentLogin = null;
       loginActive = false;
       loginProvider = '';
+      if (flow.popup && !flow.popup.closed) { try { flow.popup.close(); } catch (e) {} }
+      closeWebOverlay();
       emitLogin();
-      return wasActive;
+      await cancelRemoteLogin(flow);
+      return true;
     },
     startAutoclawOauthLogin: function (state, authUrl, mode) {
       if (!state || !authUrl) return Promise.reject(new Error('缺少授权参数（state / authUrl）'));
+      if (currentLogin) {
+        // This state already exists: cancel only the rejected task, not the active flow.
+        void cleanupLogin({ state: String(state) });
+        return Promise.reject(new Error('请先完成或取消当前登录'));
+      }
       // AutoClaw OAuth 控制器与桌面 bridge 共用 `{ok, session}` 契约。
       // 网页端轮询拿到的是原始 session，直接返回会被前端误判为取消。
-      return runLoginFlow('autoclaw-intl', Promise.resolve({ state: state, authUrl: authUrl }))
-        .then(function (session) { return { ok: true, session: session }; });
+      return runLoginFlow('autoclaw-intl', function () { return { state: state, authUrl: authUrl }; })
+        .then(function (session) { return session && session.canceled ? session : { ok: true, session: session }; });
     },
     getAutoclawOauthCaptchaConfig: function (provider) {
       return call('POST', '/api/session/login/oauth/captcha-config',
         provider ? { provider: String(provider) } : {});
     },
     startAutoclawOauth: function (provider, vendor, captchaVerifyParam) {
+      if (currentLogin) return Promise.reject(new Error('请先完成或取消当前登录'));
       return call('POST', '/api/session/login/oauth/start', {
         provider: provider ? String(provider) : undefined,
         vendor: String(vendor || ''),
@@ -795,8 +875,13 @@ pub fn shim_js() -> &'static str {
     // 契约见 api::proxies 的模块头 —— 只加一边时另一形态下的页面会报
     // 「桥接方法缺失」，标题栏那一族有同样的教训）
     getProxyPool: function () { return call('GET', '/api/proxies/pool'); },
+    // 账号侧代理下拉用：只列**可用**条目，且不触发 Clash 同步
+    getUsableProxyPool: function () { return call('GET', '/api/proxies/pool/usable'); },
     createProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool', payload || {}); },
     updateProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool/update', payload || {}); },
+    setProxyPoolItemDisabled: function (id, disabled) {
+      return call('POST', '/api/proxies/pool/set-disabled', { id: String(id || ''), disabled: !!disabled });
+    },
     removeProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/remove', { id: String(id || '') }); },
     testProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/test', { id: String(id || '') }); },
     syncClashToProxyPool: function () { return call('POST', '/api/proxies/pool/sync-clash', {}); },
@@ -812,6 +897,46 @@ pub fn shim_js() -> &'static str {
     getKernelStatus: function () { return call('GET', '/api/subscriptions/kernel'); },
     downloadKernel: function () { return call('POST', '/api/subscriptions/kernel/download', {}); },
     restartKernel: function () { return call('POST', '/api/subscriptions/kernel/restart', {}); },
+    // 本地配置文件导入：网页端没有「拿本机路径」的能力，只能让用户选文件、
+    // 把**内容**传上去（与 `import_accounts` 同一手法）。因此没有 `path`
+    // —— 服务端拿不到浏览器所在机器的路径，「立即更新」在网页端会退回
+    // 「让内核重读现有文件」（见 `api::subscriptions::reimport_local_file`）。
+    importSubscriptionFile: function () {
+      return new Promise(function (resolve, reject) {
+        var input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.yaml,.yml,application/yaml,text/yaml';
+        input.style.display = 'none';
+        input.addEventListener('change', async function () {
+          var file = input.files && input.files[0];
+          input.remove();
+          if (!file) { reject(new Error('未选择文件')); return; }
+          try {
+            var text = await file.text();
+            var data = await call('POST', '/api/subscriptions/import-file', {
+              path: '',
+              content: text,
+              name: String(file.name || '').replace(/\.(ya?ml)$/i, ''),
+            });
+            // 文件原文随回执给前端暂存：落库那一步要的就是它（与桌面壳同口径）
+            if (data && typeof data === 'object') data.content = text;
+            resolve(data);
+          } catch (error) {
+            reject(asError(error));
+          }
+        });
+        document.body.appendChild(input);
+        input.click();
+      });
+    },
+    /** 原地替换本地文件订阅的内容（网页端同样没有本机路径，只传内容） */
+    replaceSubscriptionFile: function (payload) {
+      var body = payload || {};
+      return call('POST', '/api/subscriptions/replace-file', {
+        id: String(body.id || ''),
+        content: body.content || '',
+      });
+    },
 
     // ── 积分 / 签到 ──
     getUsage: function () { return call('GET', '/api/usage'); },

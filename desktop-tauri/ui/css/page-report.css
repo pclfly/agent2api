@@ -584,3 +584,17 @@
 @media (max-width: 900px) {
   .page[data-page="overview"] .panel-head .head-actions { flex-basis: 100%; margin-left: 0; justify-content: flex-start; }
 }
+
+/* Only Top accounts has a credit column; provider ranking remains token-only. */
+.rank-shares.rank-with-credit {
+  grid-template-columns: minmax(60px, 1fr) minmax(28px, 1fr) 62px 44px minmax(76px, max-content);
+  column-gap: 8px;
+}
+.rank-credit-heading { grid-column: 5; text-align: right; color: var(--text-2); font-size: 11px; }
+.rank-row .credit { font: 11.5px var(--font-mono); text-align: right; white-space: nowrap; color: var(--text); }
+.rank-credit-note { margin: 0; padding: 0 18px 12px; color: var(--text-2); font-size: 11px; }
+@container rank (max-width: 450px) {
+  .rank-shares.rank-with-credit { grid-template-columns: minmax(55px, 1fr) 60px 40px minmax(74px, max-content); }
+  .rank-with-credit .track { display: none; }
+  .rank-credit-heading { grid-column: 4; }
+}

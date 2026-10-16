@@ -610,6 +610,8 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     // 同源、同一「最后一次为准」口径，收尾记账时一并落库 —— 请求日志的「消耗」
     // 列读它，回答「这次请求扣了多少积分、是哪个模型扣的」。
     entry.credit = snapshot.credit;
+    entry.credit_source = if snapshot.credit.is_none() { "" }
+        else if snapshot.credit_estimated { "estimate" } else { "reported" }.to_string();
     // Token 限制器的增量记账（先取快照再 record：entry 的字段已被 move）。
     // 请求收尾立刻把本次消耗加进当前窗口，选路的 Token 跳过判定不必等下一轮
     // 10 秒刷新。account_id 为空 = 没走到任何账号（转发前就失败的路径），

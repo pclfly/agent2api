@@ -327,6 +327,10 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/proxies/pool/update", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/remove", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/test", any(api::accounts::proxies_entry))
+        // 用户禁用位：与 update 分开的入口（镜像条目也能改，见 api::proxies 的说明）
+        .route("/api/proxies/pool/set-disabled", any(api::accounts::proxies_entry))
+        // 账号侧代理下拉：只列可用条目（禁用的不进选项）
+        .route("/api/proxies/pool/usable", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/sync-clash", any(api::accounts::proxies_entry))
         // ── 订阅（「网络代理」页的订阅区块：机场订阅 → 内核本地监听器）──
         // 固定路径 + api::subscriptions::entry 按 (方法, 剩余段) 分发（理由同上：
@@ -339,6 +343,10 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/subscriptions/refresh", any(api::subscriptions::entry))
         .route("/api/subscriptions/remove", any(api::subscriptions::entry))
         .route("/api/subscriptions/decode-qr", any(api::subscriptions::entry))
+        // 本地配置文件导入（壳弹选文件框后把内容转发过来，见 api::subscriptions）
+        .route("/api/subscriptions/import-file", any(api::subscriptions::entry))
+        // 本地文件订阅原地替换内容（id 不变，见 api::subscriptions::replace_file）
+        .route("/api/subscriptions/replace-file", any(api::subscriptions::entry))
         .route("/api/subscriptions/kernel", any(api::subscriptions::entry))
         .route("/api/subscriptions/kernel/download", any(api::subscriptions::entry))
         .route("/api/subscriptions/kernel/restart", any(api::subscriptions::entry))

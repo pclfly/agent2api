@@ -191,6 +191,20 @@ pub(super) fn normalize_imported(
         normalize_custom_known_fields(&mut record, item, before)?;
     }
 
+    // QwenWork backups preserve the refresh ownership boundary and invalidate in-flight writes.
+    if provider == "qwenwork" {
+        use crate::server::core::providers::qwenwork::credentials::Credentials;
+        let credentials = Credentials::from_value(&Value::Object(record.clone())).map_err(|e| e.message)?;
+        for (key, value) in credentials.payload().as_object().unwrap() {
+            record.insert(key.clone(), value.clone());
+        }
+        let managed = record.get("refreshManaged").and_then(Value::as_bool)
+            .unwrap_or_else(|| record.get("source").and_then(Value::as_str) != Some("desktop-import"));
+        record.insert("refreshManaged".into(), Value::Bool(managed));
+        record.insert("credentialRevision".into(), Value::String(
+            crate::server::core::providers::qoder::cosy::random_uuid().map_err(|e| e.message)?));
+    }
+
     // provider 已在上面落位：这里不再重复写入
     Ok(record)
 }

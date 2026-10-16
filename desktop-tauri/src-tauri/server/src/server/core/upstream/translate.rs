@@ -345,3 +345,173 @@ impl Stream for AntigravityToChatStream {
         }
     }
 }
+
+/// QwenWork response wrapper. Explicit DONE releases the HTTP body without waiting for EOF.
+pub struct QwenWorkToChatStream {
+    inner: Option<futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>>,
+    machine: crate::server::core::providers::qwenwork::stream::Decoder,
+    pending: VecDeque<Bytes>,
+    capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
+    telemetry: Arc<super::usage::RequestTelemetry>,
+}
+impl QwenWorkToChatStream {
+    pub fn new(
+        response: reqwest::Response,
+        model: &str,
+        telemetry: &Arc<super::usage::RequestTelemetry>,
+    ) -> Self {
+        use futures::StreamExt;
+        let described = response.bytes_stream().map(|item| {
+            item.map_err(|error| {
+                std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
+            })
+        });
+        let guarded = super::stall::idle_guard(
+            Box::pin(described),
+            Duration::from_millis(crate::server::config::timeout_settings().stream_idle_ms()),
+        );
+        Self::from_source(guarded, model, telemetry)
+    }
+    fn from_source(
+        inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
+        model: &str,
+        telemetry: &Arc<super::usage::RequestTelemetry>,
+    ) -> Self {
+        Self {
+            inner: Some(inner),
+            machine: crate::server::core::providers::qwenwork::stream::Decoder::new(model),
+            pending: VecDeque::new(),
+            capture: telemetry.capture(),
+            telemetry: telemetry.clone(),
+        }
+    }
+    fn record_state(&mut self) {
+        if let Some(error) = self.machine.error() {
+            self.telemetry.note_error(error);
+        }
+        if self.machine.is_finished() {
+            self.inner = None;
+        }
+    }
+}
+impl Stream for QwenWorkToChatStream {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use futures::StreamExt;
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            let Some(inner) = self.inner.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match inner.poll_next_unpin(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.inner = None;
+                    let frames = self.machine.finish();
+                    self.pending.extend(frames);
+                    self.record_state();
+                }
+                Poll::Ready(Some(Ok(bytes))) => {
+                    if let Some(capture) = &self.capture {
+                        capture.push(&bytes);
+                    }
+                    let frames = self.machine.push(&bytes);
+                    self.pending.extend(frames);
+                    self.record_state();
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.inner = None;
+                    self.telemetry.note_error(&error.to_string());
+                    return Poll::Ready(Some(Err(error)));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwenwork_tests {
+    use super::*;
+    use futures::StreamExt;
+    #[tokio::test]
+    async fn done_closes_without_waiting_for_eof() {
+        let telemetry = Arc::new(super::super::usage::RequestTelemetry::new());
+        let first=futures::stream::iter([Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))]);
+        let source = Box::pin(first.chain(futures::stream::pending()));
+        let stream = QwenWorkToChatStream::from_source(source, "test", &telemetry);
+        let frames = tokio::time::timeout(Duration::from_millis(100), stream.collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(Result::is_ok));
+        assert!(telemetry.snapshot().error.is_none());
+    }
+    #[tokio::test]
+    async fn nonstream_preserves_tool_arguments_and_usage_tail() {
+        let telemetry = Arc::new(super::super::usage::RequestTelemetry::new());
+        let events = [
+            serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"demo","arguments":"{"}}]}}]}),
+            serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}),
+            serde_json::json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20}}),
+        ];
+        let mut bytes = events
+            .iter()
+            .map(|v| format!("data: {v}\n\n"))
+            .collect::<String>();
+        bytes.push_str("data: [DONE]\n\n");
+        let source = Box::pin(
+            futures::stream::iter([Ok(Bytes::from(bytes))]).chain(futures::stream::pending()),
+        );
+        let stream = QwenWorkToChatStream::from_source(source, "test", &telemetry);
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            super::super::aggregate::aggregate_frame_stream(
+                Box::pin(stream),
+                telemetry.clone(),
+                Default::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result.body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+        assert_eq!(result.body["usage"]["credit_source"], "estimate");
+        assert!(telemetry.snapshot().credit_estimated);
+    }
+    #[tokio::test]
+    async fn truncated_and_empty_streams_mark_failure() {
+        for input in [
+            "",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"unfinished\"}}]}\n\n",
+        ] {
+            let telemetry = Arc::new(super::super::usage::RequestTelemetry::new());
+            let source = Box::pin(futures::stream::iter([Ok(Bytes::from(input.to_string()))]));
+            let stream = QwenWorkToChatStream::from_source(source, "test", &telemetry);
+            let result = super::super::aggregate::aggregate_frame_stream(
+                Box::pin(stream),
+                telemetry.clone(),
+                Default::default(),
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(telemetry.snapshot().error.is_some());
+        }
+    }
+    #[tokio::test]
+    async fn business_failure_marks_telemetry() {
+        let telemetry = Arc::new(super::super::usage::RequestTelemetry::new());
+        let source = Box::pin(futures::stream::iter([Ok(Bytes::from_static(
+            b"data: {\"code\":401,\"message\":\"invalid token\"}\n\n",
+        ))]));
+        let frames = QwenWorkToChatStream::from_source(source, "test", &telemetry)
+            .collect::<Vec<_>>()
+            .await;
+        assert!(!frames.is_empty());
+        assert!(telemetry.snapshot().error.is_some());
+    }
+}

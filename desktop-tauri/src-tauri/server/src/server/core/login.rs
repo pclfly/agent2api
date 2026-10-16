@@ -34,6 +34,7 @@ pub mod codearts;
 mod lobsterai;
 mod minimax;
 mod qoder;
+mod qwenwork;
 mod officeace;
 mod trae;
 mod zcode;

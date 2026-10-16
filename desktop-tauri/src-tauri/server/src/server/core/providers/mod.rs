@@ -154,6 +154,7 @@ pub mod onboarding_memory;
 /// 不进身份体系：它是各家的共用设施，只按 provider id 记状态。
 pub mod readiness;
 pub mod qoder;
+pub mod qwenwork;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
@@ -517,6 +518,8 @@ pub enum ProviderKind {
     /// 不需要 CodeArts 那种会话闸门。凭据两层：网关 Basic（不过期，转发用）
     /// 与控制面临时 AK/SK（2 小时，额度/签到用）。
     OfficeAce,
+    /// QwenWork: COSY-signed JSON requests and enveloped chat SSE.
+    QwenWork,
 }
 
 /// 一个提供商的静态元数据。
@@ -615,6 +618,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // glm-5.3 / deepseek-v4-flash-0731 / kimi-k2.6 …），注册表顺序决定目录
     // 合并时同名模型先归谁家 —— 放在末尾即「同名时优先已有各家」。
     ProviderMeta { id: "officeace", label: "OfficeAce 果办" },
+    ProviderMeta { id: "qwenwork", label: "QwenWork" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -700,6 +704,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "commandcode" => Some(ProviderKind::CommandCode),
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
+        "qwenwork" => Some(ProviderKind::QwenWork),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -743,6 +748,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "commandcode",
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
+        ProviderKind::QwenWork => "qwenwork",
     }
 }
 

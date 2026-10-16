@@ -7,6 +7,8 @@
 //!   POST /api/proxies/pool/update 编辑池条目（body 带 id；Clash 同步来的不可改）
 //!   POST /api/proxies/pool/remove 删除池条目（body 带 id；Clash 同步来的不可删）
 //!   POST /api/proxies/pool/test  测试池条目并把结果记进条目
+//!   POST /api/proxies/pool/set-disabled 设置条目的用户禁用位 {id, disabled}
+//!   GET  /api/proxies/pool/usable 只列可用条目（账号侧下拉用）
 //!   POST /api/proxies/pool/sync-clash 手动同步 Clash Verge 出口
 //!
 //! 前两条是账号侧的出口能力（Node 版原有）；`pool` 那六条是「网络代理」页
@@ -248,6 +250,42 @@ fn synced_payload(state: &ServerState, with_report: bool) -> Value {
 /// GET /api/proxies/pool（顺手同步一次 Clash 出口，见 `synced_payload`）
 pub async fn pool_list(state: &ServerState) -> Response {
     ok_json(synced_payload(state, false))
+}
+
+/// GET /api/proxies/pool/usable —— 只列可用条目（账号侧代理下拉）。
+///
+/// 与 `pool_list` 的两处不同：**不同步 Clash**（账号页不该因为画一个下拉就
+/// 触发一次镜像写入），**过滤掉已禁用的条目**（禁用的节点不该出现在选项里）。
+/// 前端仍会在下拉里保留「当前引用的那条」的补位项 —— 否则用户看到的是一个
+/// 「没有选中任何值」的下拉，而账号实际上正引用着一个已禁用的出口。
+pub async fn pool_usable(_state: &ServerState) -> Response {
+    ok_json(json!({ "items": proxy_pool::list_usable() }))
+}
+
+/// POST /api/proxies/pool/set-disabled（body: `{id, disabled}`）
+///
+/// 与 update 分开的理由：update 是**手动条目的整份表单覆盖**，镜像条目一律
+/// 拒绝；而「用不用这条记录」对镜像条目同样成立（订阅里只挑几个节点用是主要
+/// 场景），所以它必须有一条不经过整份表单的入口。见 `proxy_pool::set_disabled`。
+pub async fn pool_set_disabled(state: &ServerState, body: &Bytes) -> Response {
+    let payload = match parse_body(body) {
+        Ok(value) => value,
+        Err(_) => return management_error(400, "请求内容不是有效 JSON"),
+    };
+    let id = payload.get("id").and_then(Value::as_str).unwrap_or("");
+    if id.trim().is_empty() {
+        return management_error(400, "缺少代理 id");
+    }
+    let disabled = matches!(payload.get("disabled"), Some(Value::Bool(true)));
+    match proxy_pool::set_disabled(id, disabled) {
+        Ok(_) => ok_json(pool_payload(state)),
+        Err(message) => {
+            let exists = proxy_pool::list()
+                .iter()
+                .any(|item| item.get("id").and_then(Value::as_str) == Some(id));
+            management_error(if exists { 400 } else { 404 }, message)
+        }
+    }
 }
 
 /// POST /api/proxies/pool/sync-clash（手动强制同步；响应带本次变更数与失败原因）

@@ -27,9 +27,14 @@ import { t } from '../i18n'
 export type ProxyPoolItem = {
   id: string
   name: string
-  /** manual（手填）| clash（Clash Verge 同步来的只读镜像） */
+  /** manual（手填）| clash（Clash Verge 同步来的只读镜像）| subscription（订阅节点镜像） */
   source: string
+  /** 条目自身的启用位：手动条目由表单决定，镜像条目**跟随上游** */
   enabled: boolean
+  /** 用户禁用位（独立于 enabled，后端 `proxy_pool::is_usable`）：只由这里的开关写 */
+  disabled?: boolean
+  /** `enabled && !disabled` 的合取结果（后端算好的）：false = 账号引用它会回退直连 */
+  usable?: boolean
   protocol: string
   host: string
   port: number | null
@@ -104,6 +109,8 @@ export type ProxyPoolBridge = {
   updateProxyPoolItem?: (payload: Record<string, unknown>) => Promise<ProxyPoolPayload | null | undefined>
   removeProxyPoolItem?: (id: string) => Promise<ProxyPoolPayload | null | undefined>
   testProxyPoolItem?: (id: string) => Promise<ProxyTestResult | null | undefined>
+  /** 设置条目的用户禁用位（手动与镜像条目都放行） */
+  setProxyPoolItemDisabled?: (id: string, disabled: boolean) => Promise<ProxyPoolPayload | null | undefined>
   /** 手动同步 Clash Verge 出口（响应带 `changes` / `syncError`） */
   syncClashToProxyPool?: () => Promise<ProxyPoolPayload | null | undefined>
   /** 测**未保存**的表单内容（弹窗里的「测试出口」，payload 是 `{proxy}`） */
@@ -191,9 +198,19 @@ export function isOrphanSubscriptionItem(item: ProxyPoolItem): boolean {
   return isSubscriptionItem(item) && item.orphan === true
 }
 
-/** 写操作（删除）是否放行：只读镜像不放，孤儿订阅节点放 */
+/**
+ * 写操作（删除）是否放行：只读镜像不放，孤儿订阅节点放。
+ *
+ * 注意**启用/禁用不适用这条**：那是用户对本机记录的决定，镜像条目同样可改
+ * （见 [`toggleDisabled`]）—— 只读指的是名称 / 端口 / 来源跟随上游。
+ */
 export function isWritablePoolItem(item: ProxyPoolItem): boolean {
   return !isReadonlyPoolItem(item) || isOrphanSubscriptionItem(item)
+}
+
+/** 条目当前是否可用（缺 `usable` 的旧壳按 `disabled` 兜底） */
+export function isUsablePoolItem(item: ProxyPoolItem): boolean {
+  return item.usable ?? !item.disabled
 }
 
 /** 只读条目的统一说明（与后端同口径；岛在词典注入之后才求值） */
@@ -388,23 +405,24 @@ export async function testItem(item: ProxyPoolItem): Promise<void> {
 }
 
 /**
- * 行内启停：把整条记录原样回传 + 改 enabled（后端 update 是整份覆盖语义）。
+ * 行内启用 / 禁用：写**用户禁用位**（`setProxyPoolItemDisabled`）。
  *
- * 只服务**手动**条目：Clash 同步来的是只读镜像（视图侧已禁用，这里再挡一次 ——
- * 将来多一个入口时也不会绕过这条规则）。
+ * 为什么不走 `updateProxyPoolItem`：那是手动条目的**整份表单覆盖**，后端对
+ * clash / subscription 镜像一律拒绝；而「用不用这条记录」对镜像条目同样成立
+ * —— 订阅里几十个节点只挑几个用是主要场景。后端把它写进独立的 `disabled`
+ * 字段，因此下一次同步（会把镜像的 `enabled` 写回上游的值）不会把它改回来。
  */
-export async function toggleItem(item: ProxyPoolItem, enabled: boolean): Promise<void> {
+export async function toggleDisabled(item: ProxyPoolItem, enabled: boolean): Promise<void> {
   const bridge = wb().workbuddyDesktop
-  if (typeof bridge?.updateProxyPoolItem !== 'function') return
-  if (isReadonlyPoolItem(item)) {
-    toast(readonlyHint(item), 'err')
+  if (typeof bridge?.setProxyPoolItemDisabled !== 'function') {
+    toast(t('当前环境不支持启停代理（桥接方法缺失）'), 'err')
     return
   }
   const pending = new Set(state.pending)
   pending.add(item.id)
   patch({ pending })
   try {
-    accept(await bridge.updateProxyPoolItem({ ...payloadOfItem(item), enabled }))
+    accept(await bridge.setProxyPoolItemDisabled(item.id, !enabled))
     const name = itemName(item)
     toast(enabled ? t('已启用「{name}」', { name }) : t('已禁用「{name}」', { name }))
   } catch (error) {
@@ -458,6 +476,60 @@ export async function removeItem(item: ProxyPoolItem): Promise<void> {
 }
 
 /* ─── 批量 ───────────────────────────────────── */
+
+/**
+ * 批量启用 / 禁用（串行）。
+ *
+ * 为什么串行：与批量删除同一个理由 —— 每次写都整份重写池（kv 一个键），
+ * 并发写会互相覆盖（丢更新）。
+ *
+ * 与批量删除的两处差别：
+ *   · **不过滤只读镜像** —— 「用不用这条记录」对 Clash / 订阅镜像同样成立
+ *     （订阅里几十个节点只挑几个用是主要场景），写的是独立的 `disabled`
+ *     字段，下一次同步不会把它改回来（见 `toggleDisabled`）；
+ *   · **上游自己禁用**的条目（`enabled === false`）**跳过并计入 skipped** ——
+ *     那种情况不是用户能在这里开启的，把它算成「已启用」是在骗人。
+ *
+ * 不做确认框：这是可逆操作（再点一次就回去），而批量删除要确认是因为它
+ * 不可逆。汇总里报出「启用 N 条 / 禁用 N 条 / 跳过 N 条（上游已禁用）」。
+ */
+export async function batchSetDisabled(disabled: boolean): Promise<void> {
+  const bridge = wb().workbuddyDesktop
+  if (typeof bridge?.setProxyPoolItemDisabled !== 'function') {
+    toast(t('当前环境不支持启停代理（桥接方法缺失）'), 'err')
+    return
+  }
+  if (state.batchBusy || state.testing) return
+  const targets = items().filter(item => state.selected.has(item.id))
+  if (!targets.length) return
+  // 上游已禁用的条目：本次不写（写了也看不出差别，反而会把「上游禁用」
+  // 与「用户启用」两种状态搞混）
+  const writable = targets.filter(item => item.enabled !== false)
+  const skipped = targets.length - writable.length
+  if (!writable.length) {
+    toast(t('选中的 {n} 条都被上游禁用了（在 Clash / 订阅侧改）', { n: skipped }), 'err')
+    return
+  }
+  patch({ batchBusy: true, batchProgress: { done: 0, total: writable.length } })
+  let done = 0
+  let failed = 0
+  let firstError = ''
+  for (const [index, item] of writable.entries()) {
+    patch({ batchProgress: { done: index, total: writable.length } })
+    try {
+      accept(await bridge.setProxyPoolItemDisabled(item.id, disabled))
+      done += 1
+    } catch (error) {
+      failed += 1
+      if (!firstError) firstError = errorMessage(error)
+    }
+  }
+  patch({ batchBusy: false, batchProgress: null })
+  const parts = [disabled ? t('已禁用 {n} 条', { n: done }) : t('已启用 {n} 条', { n: done })]
+  if (skipped) parts.push(t('跳过 {n} 条（上游已禁用）', { n: skipped }))
+  if (failed) parts.push(t('失败 {n} 条（{reason}）', { n: failed, reason: firstError }))
+  toast(failed ? parts.join(t('，')) : `✅ ${parts.join(t('，'))}`, failed ? 'err' : 'ok')
+}
 
 /**
  * 批量测试（串行）：逐条调 `testProxyPoolItem`，每完成一条就把结果并回列表
@@ -597,5 +669,7 @@ function payloadOfItem(item: ProxyPoolItem): Record<string, unknown> {
     username: item.username,
     password: item.password,
     enabled: item.enabled,
+    // 用户禁用位随表单整份回传：漏了它，编辑一次就会把「已禁用」悄悄清掉
+    disabled: item.disabled === true,
   }
 }

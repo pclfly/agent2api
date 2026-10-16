@@ -382,8 +382,14 @@ const BRIDGE_JS: &str = r#"
     //                            `changes`（本次变更数）与 `syncError`
     //                            （Clash 不可用时的原因；那不算失败）
     getProxyPool: () => call('GET', '/api/proxies/pool'),
+    // 账号侧代理下拉用：只列**可用**条目，且不触发 Clash 同步（见
+    // `api::proxies::pool_usable` 的说明）
+    getUsableProxyPool: () => call('GET', '/api/proxies/pool/usable'),
     createProxyPoolItem: payload => call('POST', '/api/proxies/pool', payload || {}),
     updateProxyPoolItem: payload => call('POST', '/api/proxies/pool/update', payload || {}),
+    // 设置条目的用户禁用位（手动与镜像条目都放行，见 `proxy_pool::set_disabled`）
+    setProxyPoolItemDisabled: (id, disabled) =>
+      call('POST', '/api/proxies/pool/set-disabled', { id: String(id || ''), disabled: !!disabled }),
     removeProxyPoolItem: id => call('POST', '/api/proxies/pool/remove', { id: String(id || '') }),
     testProxyPoolItem: id => call('POST', '/api/proxies/pool/test', { id: String(id || '') }),
     syncClashToProxyPool: () => call('POST', '/api/proxies/pool/sync-clash', {}),
@@ -403,6 +409,10 @@ const BRIDGE_JS: &str = r#"
     //                             done/error）；下载完有启用的订阅会自动拉起
     //   · restartKernel           手动启动 / 重启内核（重建配置）
     //   · decodeQrImage           从图片解二维码 `{imageBase64}` → `{url}`
+    //   · importSubscriptionFile  弹系统选文件框，把**路径与内容**一起交给
+    //                             后端校验，回执 `{path, name, declaredNodes,
+    //                             bytes, content}`（不落库 —— 落库走
+    //                             `addSubscription` 带 `kind:'file'`）
     getSubscriptions: () => call('GET', '/api/subscriptions'),
     addSubscription: payload => call('POST', '/api/subscriptions/add', payload || {}),
     saveSubscription: payload => call('POST', '/api/subscriptions/save', payload || {}),
@@ -412,6 +422,11 @@ const BRIDGE_JS: &str = r#"
     getKernelStatus: () => call('GET', '/api/subscriptions/kernel'),
     downloadKernel: () => call('POST', '/api/subscriptions/kernel/download', {}),
     restartKernel: () => call('POST', '/api/subscriptions/kernel/restart', {}),
+    // 本地配置文件导入：弹系统选文件框，把**路径与内容**一起交给后端
+    //（路径只在壳是本机时才有意义，见 `api::subscriptions` 的模块头）
+    importSubscriptionFile: () => invoke('import_subscription_file'),
+    /** 原地替换本地文件订阅的内容（条目 id 不变，见 api::subscriptions::replace_file） */
+    replaceSubscriptionFile: payload => call('POST', '/api/subscriptions/replace-file', payload || {}),
 
     // ── 积分 / 签到 ──
     getUsage: () => call('GET', '/api/usage'),

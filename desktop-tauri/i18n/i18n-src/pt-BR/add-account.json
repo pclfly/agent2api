@@ -364,5 +364,12 @@
   "（有效期 {window}）": "(validade {window})",
   "（订阅池，模型名带 cline-pass/ 前缀，需要账号有对应订阅）。": " (pool de assinatura; nomes de modelo com o prefixo cline-pass/, e a conta precisa da assinatura correspondente).",
   "，下一次最快 {minutes} 分钟后": ", próxima tentativa em pelo menos {minutes} min",
-  "，并从 {n} 把 Key 的可用提供商里移除": ", e removido dos provedores permitidos de {n} keys"
+  "，并从 {n} 把 Key 的可用提供商里移除": ", e removido dos provedores permitidos de {n} keys",
+  "粘贴 QwenWork 凭据": "Colar credenciais do QwenWork",
+  "支持完整凭据 JSON，或填写 accessToken、userId 和可选 refreshToken。手填账号具备 refreshToken 时可自动续期；缺少实报时积分为预估。签到先查询资格，国际站尚未实测。": "Cole o JSON completo das credenciais ou informe accessToken, userId e, opcionalmente, refreshToken. Contas adicionadas manualmente podem ser renovadas automaticamente quando possuem refreshToken. Os créditos são estimados quando não há um valor informado pelo serviço. O check-in consulta primeiro a elegibilidade; o serviço internacional ainda não foi testado em ambiente real.",
+  "完整 JSON 或 JWT 已含用户标识时可留空": "Opcional se o JSON completo ou JWT contiver o ID do usuário",
+  "只读导入 QwenWork 当前登录态快照，不回写客户端文件，也不代刷新。登录态失效后请重新导入。": "Importa um snapshot somente leitura da sessão atual do QwenWork. Não modifica os arquivos do cliente nem renova seus tokens. Importe novamente quando a sessão expirar.",
+  "读取 %APPDATA%/QwenWork/auth-v2.dat 与 Local State，仅 Windows": "Lê %APPDATA%/QwenWork/auth-v2.dat e Local State; somente Windows",
+  "打开 QwenWork 官方授权页": "Abrir a página oficial de autorização do QwenWork",
+  "在系统浏览器完成登录与设备确认后，账号会自动加入列表。无需粘贴回调地址；授权有效期为 5 分钟。": "Entre e confirme o dispositivo no navegador do sistema. A conta será adicionada automaticamente. Não é necessário colar uma URL de retorno; a autorização expira em 5 minutos."
 }

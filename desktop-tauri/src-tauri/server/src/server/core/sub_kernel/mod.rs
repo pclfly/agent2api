@@ -114,8 +114,18 @@ pub struct ProviderInput {
     pub id: String,
     /// 订阅名（代理池节点条目的命名来源）
     pub name: String,
-    /// 订阅链接
+    /// 订阅链接（`kind == "url"` 时是机场订阅地址；`kind == "file"` 时空串
+    /// —— 本地配置没有 URL，内核直接读缓存路径那一份文件）
     pub url: String,
+    /// `url` / `file`（见 `core::subscriptions::kind_of`）：决定 provider 的
+    /// `type`。本地文件**没有 interval**，因此不参与内核的定时刷新 —— 内容
+    /// 只在导入 / 「立即更新」时由我们写一次。
+    pub kind: String,
+}
+
+/// 该 provider 是不是本地配置文件（内核 provider `type: file`）
+pub fn is_file_provider(provider: &ProviderInput) -> bool {
+    provider.kind == crate::server::core::subscriptions::KIND_FILE
 }
 
 /// 内核状态快照（worker 每步操作后更新；status_json 读它）
@@ -359,6 +369,37 @@ fn controller_alive(port: u16) -> bool {
         .and_then(|mut addresses| addresses.next())
         .map(|address| TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok())
         .unwrap_or(false)
+}
+
+/// 内核目录里一个 provider 的缓存文件绝对路径。
+///
+/// http provider 把它当拉取缓存，file provider 直接读它 —— 两条路径同一个
+/// 文件，所以「写进去的 YAML」就是「内核读到的节点」。
+pub fn provider_cache_file(id: &str) -> PathBuf {
+    kernel_dir()
+        .join(crate::server::core::subscriptions::provider_cache_path(id))
+}
+
+/// 写入本地配置文件的 YAML 内容（api 层校验完、写盘用）。
+///
+/// 不在这里重启内核：写文件与「让内核读新内容」是两件事 —— 导入时走
+/// `request_restart`（重建配置 + 拉 provider），「立即更新」走
+/// `request_refresh`（file provider 的强制重读，实测 PUT 后节点即时更新）。
+pub fn write_provider_file(id: &str, content: &str) -> Result<PathBuf, String> {
+    let dir = kernel_dir().join("providers");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("创建内核目录失败: {error}"))?;
+    let path = provider_cache_file(id);
+    std::fs::write(&path, content).map_err(|error| format!("写入配置文件失败: {error}"))?;
+    Ok(path)
+}
+
+/// 删掉一个 provider 的缓存文件（订阅被删 / 换成别的来源时）。
+/// 不存在不算错（链接订阅从来没拉过缓存时就是这种情况）。
+pub fn remove_provider_file(id: &str) {
+    let path = provider_cache_file(id);
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 停机钩子（backend::shutdown 调）：best-effort 杀掉内核子进程。

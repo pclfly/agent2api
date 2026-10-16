@@ -1858,10 +1858,17 @@ impl ResponsesStream {
             let Some(tool) = self.tools.get_mut(&key) else {
                 continue;
             };
+            // 只拿到 index、没拿到名字的残片：**丢弃**。占位名（如
+            // `unknown`）在这里是有害的 —— 客户端会拿这个名字去自己的工具表里
+            // 查，必然报「Tool not found」，而多出来的那条 `function_call`
+            // 对任何客户端都不具备可执行性。宁可少一次调用，也不能发出一个
+            // 指向不存在工具的项。正常流的工具在 `consume_tool` 里拿到名字
+            // 时就宣告过了，走不到这里。
+            if tool.name.is_empty() {
+                continue;
+            }
             let call_id = if tool.call_id.is_empty() { random_id("call") } else { tool.call_id.clone() };
-            // 只拿到 index、没拿到名字的残片：不能宣告（宣告要 name），
-            // 但也不能丢 —— 补一个占位名，否则客户端少一次工具调用
-            let name = if tool.name.is_empty() { "unknown".to_string() } else { tool.name.clone() };
+            let name = tool.name.clone();
             let arguments = if tool.arguments.is_empty() { "{}".to_string() } else { tool.arguments.clone() };
             // 用统一口径构造 item：custom 命中时要输出 custom_tool_call 与
             // 裸文本 input，类型给错客户端就按 JSON 解析，工具照样跑不起来
@@ -2068,7 +2075,12 @@ impl ResponsesCollector {
             }));
         }
         for (_, tool) in self.tools {
-            let name = if tool.name.is_empty() { "unknown".to_string() } else { tool.name };
+            // 空名残片不输出（与流式 `close_tools` 同一口径）：占位名会让客户端
+            // 去查一个不存在的工具并报错
+            if tool.name.is_empty() {
+                continue;
+            }
+            let name = tool.name;
             let call_id = if tool.call_id.is_empty() { random_id("call") } else { tool.call_id };
             let arguments = if tool.arguments.is_empty() { "{}".to_string() } else { tool.arguments };
             // 与另外两个回程出口共用口径：custom 命中时输出 custom_tool_call
@@ -2102,5 +2114,94 @@ impl ResponsesCollector {
 impl Default for ResponsesCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tool_tests {
+    use super::*;
+
+    fn sse(chunks: &[Value]) -> String {
+        let mut out = String::new();
+        for chunk in chunks {
+            out.push_str(&format!("data: {chunk}\n\n"));
+        }
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    fn chat_chunk(delta: Value) -> Value {
+        json!({"id":"c","object":"chat.completion.chunk","created":1,"model":"m",
+            "choices":[{"index":0,"delta":delta,"finish_reason":Value::Null}]})
+    }
+
+    /// 空名工具残片不得变成名叫 `unknown` 的 function_call 项 ——
+    /// 客户端会拿这个名字查自己的工具表，必然报错。
+    #[test]
+    fn streaming_drops_nameless_tool_call() {
+        let mut stream = ResponsesStream::new("m", &json!({}));
+        let text = sse(&[
+            chat_chunk(json!({"role":"assistant","content":""})),
+            chat_chunk(json!({"tool_calls":[{"index":0,"id":"call_x","type":"function",
+                "function":{"name":"","arguments":"{\"a\":1}"}}]})),
+            chat_chunk(json!({"tool_calls":[{"index":0,"function":{"arguments":"}"}}]})),
+            json!({"id":"c","object":"chat.completion.chunk","created":1,"model":"m",
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ]);
+        let mut frames = stream.push(text.as_bytes());
+        frames.extend(stream.finish());
+        let body: String = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).to_string())
+            .collect();
+        assert!(!body.contains("\"unknown\""), "不该输出 unknown 占位工具: {body}");
+        assert!(
+            !body.contains("\"type\":\"function_call\""),
+            "空名调用不应产生 function_call 项: {body}"
+        );
+    }
+
+    /// 有名字的工具仍要正常输出，两次调用不能互相吞掉。
+    #[test]
+    fn streaming_keeps_named_tool_calls() {
+        let mut stream = ResponsesStream::new("m", &json!({}));
+        let text = sse(&[
+            chat_chunk(json!({"role":"assistant","content":""})),
+            chat_chunk(json!({"tool_calls":[{"index":0,"id":"call_a","type":"function",
+                "function":{"name":"read","arguments":"{\"p\":1}"}}]})),
+            chat_chunk(json!({"tool_calls":[{"index":1,"id":"call_b","type":"function",
+                "function":{"name":"ls","arguments":"{\"p\":2}"}}]})),
+            json!({"id":"c","object":"chat.completion.chunk","created":1,"model":"m",
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ]);
+        let mut frames = stream.push(text.as_bytes());
+        frames.extend(stream.finish());
+        let body: String = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).to_string())
+            .collect();
+        assert!(body.contains("\"name\":\"read\""), "{body}");
+        assert!(body.contains("\"name\":\"ls\""), "{body}");
+        assert!(!body.contains("\"unknown\""), "{body}");
+    }
+
+    /// 非流式出口同一口径。
+    #[test]
+    fn non_streaming_drops_nameless_tool_call() {
+        let mut collector = ResponsesCollector::new();
+        collector.push(sse(&[
+            chat_chunk(json!({"role":"assistant","content":"hi"})),
+            chat_chunk(json!({"tool_calls":[{"index":0,"id":"call_x","type":"function",
+                "function":{"name":"","arguments":"{}"}}]})),
+            json!({"id":"c","object":"chat.completion.chunk","created":1,"model":"m",
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ]).as_bytes());
+        collector.finish();
+        let body = collector.into_response("m", &json!({}));
+        let output = body.pointer("/output").and_then(Value::as_array).cloned().unwrap_or_default();
+        assert!(
+            output.iter().all(|item| item.get("name").and_then(Value::as_str) != Some("unknown")),
+            "非流式输出也不该有 unknown 占位: {output:?}"
+        );
     }
 }
