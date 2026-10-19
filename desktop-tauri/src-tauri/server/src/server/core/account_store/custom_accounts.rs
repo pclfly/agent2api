@@ -83,6 +83,20 @@ const MAX_API_KEY_LENGTH: usize = 8192;
 /// 概率优化 —— 试满说明随机源或既有数据有问题（例如手改出一堆同 id 记录），
 /// 此时报错优于覆写别人的记录（理由见 `allocate_anonymous_id`）。
 const ANONYMOUS_ID_ATTEMPTS: usize = 8;
+/// `add_custom_account` 的返回：落盘记录的公开形态 + 这次是新建还是更新。
+///
+/// 幂等口径（见 [`account_id_for`]）会让「同一把 key 的重复添加」合并进既有
+/// 记录。这次提交到底落在哪一边只有存储层
+/// 知道（日志里有 🔄 / ✅ 之分），把它作为返回值交给 API 层带出去，前端才能
+/// 把提示说成「已更新」而不是「已添加」（照搬「已添加」会让人以为列表会多
+/// 出一条，实测反馈过的误导）。
+pub struct CustomAccountUpsert {
+    /// 落盘记录的公开形态（与列表快照同一形状，见 `public_account`）
+    pub account: Value,
+    /// `true` = 新建了一条记录；`false` = 合并更新了既有记录（id 命中同 key
+    /// 的账号）
+    pub created: bool,
+}
 
 impl AccountStore {
     // ─── 写：手动添加 ────────────────────────────────────────
@@ -118,7 +132,7 @@ impl AccountStore {
         provider_id: &str,
         payload: &Value,
         name: Option<&str>,
-    ) -> Result<Value, AccountStoreError> {
+    ) -> Result<CustomAccountUpsert, AccountStoreError> {
         let provider_id = provider_id.trim();
         if !provider_id.starts_with(custom_providers::ID_PREFIX) {
             return Err(AccountStoreError::bad_request(format!(
@@ -201,7 +215,8 @@ impl AccountStore {
         // 备注名兜底链：显式传入 → 记录里原有的 → 「账号 + apiKey 尾号」。
         // 尾号对人有参考价值（哪把 key）；无鉴权账号没有尾号可展示，退化成
         // 「<提供商名>（无需鉴权）」—— 它比一个光秃秃的「自定义账号」更能
-        // 回答「这条是什么」；两者都没有时才是那个通用兜底。
+        // 回答「这条是什么」；两者都没有时才是那个通用兜底。兜底名不做查重：
+        // 同家并存的多条无需鉴权账号默认同名（区分靠用户自己起的备注名）。
         let explicit_name = name
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -277,6 +292,48 @@ impl AccountStore {
                 }
             }
         }
+        // 出网代理（`proxy`，可选）：与内置账号同一形态
+        // `{protocol,host,port,username,password}`，null = 直连。
+        //
+        // ── 为什么必须在这里收 ──────────────────────────────────
+        // 面板「新建自定义提供商」的表单会把代理一并发上来，但它走的是
+        // `create_custom_provider` → 本函数这条链路。早前这里不读 `proxy`，
+        // 于是**表单里填的代理被静默丢弃**，账号实际直连上游 —— 表现就是
+        // 上游 401（请求确实发出去了，只是没经注入代理）。这类「看起来配了、
+        // 实际没生效」最难排查，所以这里显式归一：给了就必须合法，null 表示
+        // 明确改为直连，没带这个键则保留既有值（patch 语义）。
+        if let Some(value) = object.get("proxy") {
+            // normalize_account_proxy 的三态：Ok(None)=明确直连；Ok(Some)=可用出口；
+            // Err=配了但非法（缺主机/端口越界）。非法值必须报错而不是静默直连 ——
+            // 那会把「配错了代理」伪装成「本来就没配」。
+            match crate::server::core::proxies::normalize_account_proxy(value) {
+                Ok(Some(normalized)) => {
+                    fields.insert("proxy".to_string(), normalized);
+                }
+                Ok(None) => {
+                    fields.remove("proxy");
+                }
+                Err(error) => {
+                    return Err(AccountStoreError::bad_request(format!("{error}")));
+                }
+            }
+        }
+        // 链式出网的前置代理（`frontProxy`，可选）：先经它出去，再由 `proxy`
+        // 做第二跳（Clash 选地区 → Vault 注入凭据）。形态与 `proxy` 完全一致，
+        // 三态语义也一致（Some 写入 / null 清空 / 缺键保留）。
+        if let Some(value) = object.get("frontProxy") {
+            match crate::server::core::proxies::normalize_account_proxy(value) {
+                Ok(Some(normalized)) => {
+                    fields.insert("frontProxy".to_string(), normalized);
+                }
+                Ok(None) => {
+                    fields.remove("frontProxy");
+                }
+                Err(error) => {
+                    return Err(AccountStoreError::bad_request(format!("frontProxy: {error}")));
+                }
+            }
+        }
         // 余额查询配置（`balanceQuery`，可选）：预置卡带来的余额方案要的那份
         // 凭证（NewAPI 的访问令牌 / 商汤的控制台账号密码 / 智谱的控制台令牌）。
         // 与 apiKey 同一层是刻意的：它也是「这条账号的凭证」，只是用于查询
@@ -346,7 +403,10 @@ impl AccountStore {
                     .unwrap_or_else(|| provider_id.to_string()),
             ),
         );
-        Ok(self.public_account(&saved))
+        Ok(CustomAccountUpsert {
+            account: self.public_account(&saved),
+            created: existing.is_none(),
+        })
     }
 
     /// 取一个**当前空闲**的匿名账号 id（`custom-acct-` + 12 位随机 hex）。
@@ -860,6 +920,9 @@ pub struct CustomCredential {
     pub base_url_override: Option<String>,
     /// 出网代理（None = 未配置 / 解析失败 → 直连）
     pub proxy: Option<ResolvedProxy>,
+    /// 链式出网的前置代理（可选）：先经它出去，再由 `proxy` 做第二跳。
+    /// 典型形态是「Clash 选地区 → Vault 注入凭据」。None = 单跳（只用 `proxy`）。
+    pub front_proxy: Option<ResolvedProxy>,
 }
 
 /// 一条记录 → 凭证快照（两个入口共用一份取数口径，不会各漂一份）
@@ -874,6 +937,15 @@ fn credential_of_record(record: &StoredAccount) -> CustomCredential {
         // 区别只在日志：这里没有请求上下文可挂 notice，静默直连即可）
         None => None,
     };
+    // 前置代理（`frontProxy`，可选）：与 `proxy` 同一归一/解析口径，
+    // 但**不参与轮询**（它是固定的一跳，不是池里的候选）。
+    let front_proxy = fields
+        .get("frontProxy")
+        .and_then(|value| crate::server::core::proxies::normalize_account_proxy(value).ok().flatten())
+        .and_then(|_| {
+            crate::server::core::proxies::resolve_account_proxy(fields.get("frontProxy"))
+                .and_then(|resolution| resolution.resolved().cloned())
+        });
     CustomCredential {
         account_id: record.id().to_string(),
         account_name: record.name(),
@@ -883,6 +955,7 @@ fn credential_of_record(record: &StoredAccount) -> CustomCredential {
             .unwrap_or("")
             .to_string(),
         no_auth: record.no_auth(),
+        front_proxy,
         base_url_override: fields
             .get("baseUrl")
             .and_then(Value::as_str)
@@ -953,6 +1026,180 @@ mod tests {
             .unwrap_or_default()
     }
 
+    // 完整的规范化形态：断言 config 全量回显，而非只检查某个端口。
+    fn proxy_config(protocol: &str, host: &str, port: u16) -> Value {
+        json!({
+            "source": "custom", "protocol": protocol, "host": host, "port": port,
+            "username": "", "password": "", "label": format!("{protocol}://{host}:{port}"),
+        })
+    }
+
+    fn add_two_hop_account(store: &AccountStore) -> Value {
+        store
+            .add_custom_account(
+                "custom-front-proxy-tests",
+                &json!({
+                    "noAuth": true,
+                    "frontProxy": proxy_config("socks5", "front.example", 1080),
+                    "proxy": proxy_config("http", "exit.example", 8080),
+                }),
+                Some("两跳测试账号"),
+            )
+            .expect("创建两跳账号应当成功").account
+    }
+
+    // 只读本测试的临时库，不访问实际账号；全字段比较同时覆盖 updatedAt 等元数据。
+    fn stored_fields(store: &AccountStore, id: &str) -> Map<String, Value> {
+        let guard = store.guard();
+        store.record_by_id(&guard, id).expect("账号应当存在").fields().clone()
+    }
+
+    #[test]
+    fn create_two_hop_account_exposes_both_proxy_configs() {
+        let store = store();
+        let account = add_two_hop_account(&store);
+        let front = proxy_config("socks5", "front.example", 1080);
+        let exit = proxy_config("http", "exit.example", 8080);
+        let snapshot = store.list_accounts();
+        for public in [&account, &snapshot["accounts"][0]] {
+            assert_eq!(public["frontProxy"]["config"], front);
+            assert_eq!(public["proxy"]["config"], exit);
+            assert_eq!(public["frontProxy"]["source"], "custom");
+            assert_eq!(public["proxy"]["source"], "custom");
+            assert_eq!(public["frontProxy"]["error"], Value::Null);
+            assert_eq!(public["proxy"]["error"], Value::Null);
+        }
+        let stored = stored_fields(&store, account["id"].as_str().unwrap());
+        assert_eq!(stored.get("frontProxy"), Some(&front));
+        assert_eq!(stored.get("proxy"), Some(&exit));
+    }
+
+    #[test]
+    fn update_front_proxy_preserves_second_hop() {
+        let store = store();
+        let account = add_two_hop_account(&store);
+        let id = account["id"].as_str().unwrap();
+        let before = stored_fields(&store, id);
+        let front = proxy_config("http", "new-front.example", 3128);
+        let (updated, changes) = store
+            .update_account(id, &json!({ "frontProxy": front }))
+            .expect("只更新前置跳应当成功");
+        assert!(!changes.is_empty());
+        let snapshot = store.list_accounts();
+        for public in [&updated, &snapshot["accounts"][0]] {
+            assert_eq!(public["frontProxy"]["config"], front);
+            assert_eq!(public["proxy"], account["proxy"], "第二跳展示不能改变");
+        }
+        let after = stored_fields(&store, id);
+        assert_eq!(after.get("frontProxy"), Some(&front));
+        assert_eq!(after.get("proxy"), before.get("proxy"), "第二跳存储不能改变");
+    }
+
+    #[test]
+    fn clear_front_proxy_preserves_second_hop() {
+        let store = store();
+        let account = add_two_hop_account(&store);
+        let id = account["id"].as_str().unwrap();
+        let before = stored_fields(&store, id);
+        let (updated, changes) = store
+            .update_account(id, &json!({ "frontProxy": null }))
+            .expect("null 应当清除前置跳");
+        assert!(!changes.is_empty());
+        let snapshot = store.list_accounts();
+        for public in [&updated, &snapshot["accounts"][0]] {
+            assert_eq!(public.get("frontProxy"), Some(&Value::Null));
+            assert_eq!(public["proxy"], account["proxy"]);
+        }
+        let after = stored_fields(&store, id);
+        assert!(after.get("frontProxy").map(Value::is_null).unwrap_or(true));
+        assert_eq!(after.get("proxy"), before.get("proxy"));
+    }
+
+    #[test]
+    fn legacy_account_without_front_proxy_exposes_null() {
+        let store = store();
+        let exit = proxy_config("http", "exit.example", 8080);
+        let account = store
+            .add_custom_account(
+                "custom-front-proxy-tests",
+                &json!({ "noAuth": true, "proxy": exit }),
+                Some("旧单跳账号"),
+            )
+            .expect("不带前置跳的账号应当仍可创建").account;
+        let id = account["id"].as_str().unwrap();
+        assert!(!stored_fields(&store, id).contains_key("frontProxy"));
+        let (updated, _) = store
+            .update_account(id, &json!({ "name": "旧账号改名" }))
+            .expect("旧账号仍可正常更新");
+        let snapshot = store.list_accounts();
+        for public in [&account, &updated, &snapshot["accounts"][0]] {
+            assert_eq!(public.get("frontProxy"), Some(&Value::Null));
+            assert_eq!(public["proxy"]["config"], exit);
+        }
+        assert!(!stored_fields(&store, id).contains_key("frontProxy"));
+    }
+
+    #[test]
+    fn pool_proxy_echo_preserves_ids_without_pinning_ports() {
+        let store = store();
+        // 不创建池条目，不绑定本机监听端口；不存在的引用允许显示解析失败。
+        let front = json!({ "source": "pool", "proxyId": "missing-front-proxy-test" });
+        let exit = json!({ "source": "pool", "proxyId": "missing-exit-proxy-test" });
+        let account = store
+            .add_custom_account(
+                "custom-front-proxy-tests",
+                &json!({ "noAuth": true, "frontProxy": front, "proxy": exit }),
+                Some("池引用账号"),
+            )
+            .expect("池条目暂不存在也应当能保存引用").account;
+        let snapshot = store.list_accounts();
+        for public in [&account, &snapshot["accounts"][0]] {
+            for (key, expected) in [("frontProxy", &front), ("proxy", &exit)] {
+                let description = &public[key];
+                assert_eq!(description["source"], "pool");
+                assert_eq!(&description["config"], expected);
+                assert!(description["config"].get("host").is_none());
+                assert!(description["config"].get("port").is_none());
+                let error = description.get("error").expect("展示形态应当带 error 字段");
+                assert!(error.is_null() || error.as_str().map(|s| !s.is_empty()).unwrap_or(false));
+            }
+        }
+        let stored = stored_fields(&store, account["id"].as_str().unwrap());
+        assert_eq!(stored.get("frontProxy"), Some(&front));
+        assert_eq!(stored.get("proxy"), Some(&exit));
+        assert_eq!(store.referenced_pool_ids(), std::collections::HashSet::from([
+            "missing-front-proxy-test".to_string(), "missing-exit-proxy-test".to_string(),
+        ]), "both fixed hops must retain their subscription listener");
+    }
+
+    #[test]
+    fn invalid_front_proxy_update_leaves_stored_account_unchanged() {
+        let store = store();
+        let account = add_two_hop_account(&store);
+        let id = account["id"].as_str().unwrap();
+        let before = stored_fields(&store, id);
+        let snapshot_before = store.list_accounts();
+        for invalid in [
+            json!("not-a-proxy"),
+            json!({ "source": "custom", "host": "front.example", "port": 0 }),
+            json!({ "source": "custom", "host": "front.example", "port": 65536 }),
+            json!({ "source": "custom", "port": 1080 }),
+            json!({ "source": "pool", "proxyId": "" }),
+        ] {
+            // name / proxy 在 apply_patch 中先于 frontProxy 处理：后者失败时前者也不能落库。
+            let error = store
+                .update_account(id, &json!({
+                    "name": "不应写入",
+                    "proxy": proxy_config("http", "changed-exit.example", 8888),
+                    "frontProxy": invalid,
+                }))
+                .expect_err("非法前置跳应当拒绝更新");
+            assert_eq!(error.status_code, 400);
+            assert_eq!(stored_fields(&store, id), before, "失败更新不能改变任何存储字段");
+            assert_eq!(store.list_accounts(), snapshot_before);
+        }
+    }
+
     #[test]
     fn balance_query_patch_validates_fields_and_invalidates_identity_cache() {
         let mut query = json!({"username": "before", "password": "secret", "sensenovaJwt": "cached", "sensenovaJwtExpiresAt": 123}).as_object().unwrap().clone();
@@ -987,7 +1234,7 @@ mod tests {
                     &json!({ "noAuth": true }),
                     Some(&format!("匿名 {index}")),
                 )
-                .expect("添加匿名账号应当成功");
+                .expect("添加匿名账号应当成功").account;
             added.push(
                 account
                     .get("id")
@@ -1012,9 +1259,11 @@ mod tests {
         let again = store
             .add_custom_account(provider, &json!({ "apiKey": "sk-key-one" }), Some("改个名"))
             .expect("同 key 再加应当成功");
+        assert!(first.created);
+        assert!(!again.created);
         assert_eq!(
-            first.get("id").and_then(Value::as_str),
-            again.get("id").and_then(Value::as_str),
+            first.account.get("id").and_then(Value::as_str),
+            again.account.get("id").and_then(Value::as_str),
             "同一把 key 必须落回同一条记录（合并而不是新建）"
         );
         assert_eq!(ids_of(&store).len(), 1, "同 key 两次添加只应留下一条记录");

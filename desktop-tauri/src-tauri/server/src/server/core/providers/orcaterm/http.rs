@@ -26,7 +26,7 @@ use crate::server::errors::GatewayError;
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
 
 /// 把传输错误翻译成网关错误（超时 → 504，其余 → 502）。
-fn transport_error(what: &str, error: reqwest::Error) -> GatewayError {
+fn transport_error(what: &str, error: crate::server::core::upstream::request::SendError) -> GatewayError {
     if error.is_timeout() {
         GatewayError::with_status(504, format!("{what}超时，请稍后重试"))
     } else {
@@ -64,8 +64,7 @@ pub async fn post_json_value(
     }
     builder = builder.json(body);
     builder = builder.timeout(std::time::Duration::from_millis(timeout_ms.unwrap_or(REQUEST_TIMEOUT_MS)));
-    let response = builder
-        .send()
+    let response = crate::server::core::upstream::request::send_builder(builder)
         .await
         .map_err(|error| transport_error("OrcaTerm 请求", error))?;
     let status = response.status().as_u16();
@@ -98,9 +97,7 @@ pub async fn sse_post(
     for (name, value) in headers {
         request = request.header(name.as_str(), value);
     }
-    let response = request
-        .json(body)
-        .send()
+    let response = crate::server::core::upstream::request::send_builder(request.json(body))
         .await
         .map_err(|error| transport_error(what, error))?;
     let status = response.status().as_u16();

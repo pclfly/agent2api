@@ -1,0 +1,4 @@
+# Cargo 按执行目录查找配置；从仓库根使用 --manifest-path 时也须复用同一 target。
+[build]
+target-dir = "target"
+incremental = false

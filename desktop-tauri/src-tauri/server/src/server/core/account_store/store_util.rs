@@ -80,6 +80,50 @@ pub(super) fn value_or_nullish(value: Option<&Value>, fallback: Value) -> Value 
     }
 }
 
+/// 保存代理配置时**继承旧凭据**：提交的凭据为空、且地址没变时，用旧值补齐。
+///
+/// ── 解决什么问题 ────────────────────────────────────────────
+/// 账号设置弹窗出于安全不回显密码，保存时通常把 `username`/`password` 提交成
+/// 空串。若直接落盘，一个本来能用的代理会变成「无认证出口」，上游表现是
+/// CONNECT 隧道被对端关闭（`unexpected end of file`）或 407 —— 而用户只
+/// 是点了一下保存。这类「静默降级」几乎无法从错误信息反推。
+///
+/// ── 判据为什么收得这么窄 ────────────────────────────────────
+/// 只在「source/protocol/host/port 全等」且「新值为空、旧值非空」时继承。
+/// 地址或协议一变就是换了出口，凭据必须按新值走（空就是空）—— 否则会把
+/// A 代理的密码带到 B 代理上，那是更坏的错误。
+pub(super) fn inherit_credentials_when_blank(before: &Value, next: Value) -> Value {
+    let (Some(old), Some(new)) = (before.as_object(), next.as_object()) else {
+        return next;
+    };
+    for key in ["source", "protocol", "host", "port"] {
+        if old.get(key) != new.get(key) {
+            return next;
+        }
+    }
+    let blank = |object: &serde_json::Map<String, Value>, key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::is_empty)
+            .unwrap_or(true)
+    };
+    let filled = |object: &serde_json::Map<String, Value>, key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|text| !text.is_empty())
+            .unwrap_or(false)
+    };
+    let mut merged = new.clone();
+    for key in ["username", "password"] {
+        if blank(new, key) && filled(old, key) {
+            merged.insert(key.to_string(), old.get(key).cloned().unwrap_or(Value::Null));
+        }
+    }
+    Value::Object(merged)
+}
+
 /// 设置里的值 → 非空字符串（对应 `existing?.nickname` 这类「可能是任意类型」的取值）。
 /// 返回 None 表示「未设置」，调用方据此走下一级兜底。
 pub(super) fn optional_text(value: Option<&Value>) -> Option<String> {
@@ -188,5 +232,62 @@ pub(super) fn object_or_empty(value: Option<&Value>) -> Map<String, Value> {
     match value {
         Some(Value::Object(map)) => map.clone(),
         _ => Map::new(),
+    }
+}
+
+#[cfg(test)]
+mod inherit_credential_tests {
+    use super::inherit_credentials_when_blank;
+    use serde_json::json;
+
+    fn old() -> serde_json::Value {
+        json!({
+            "source": "custom", "protocol": "http",
+            "host": "vault.example", "port": 14322,
+            "username": "av_agt_abc", "password": "prod-sandbox"
+        })
+    }
+
+    #[test]
+    fn blank_credentials_are_inherited_when_endpoint_unchanged() {
+        let next = json!({
+            "source": "custom", "protocol": "http",
+            "host": "vault.example", "port": 14322,
+            "username": "", "password": ""
+        });
+        let merged = inherit_credentials_when_blank(&old(), next);
+        assert_eq!(merged["username"], "av_agt_abc");
+        assert_eq!(merged["password"], "prod-sandbox");
+    }
+
+    #[test]
+    fn new_credentials_win() {
+        let next = json!({
+            "source": "custom", "protocol": "http",
+            "host": "vault.example", "port": 14322,
+            "username": "new-user", "password": ""
+        });
+        let merged = inherit_credentials_when_blank(&old(), next);
+        assert_eq!(merged["username"], "new-user");
+        // 密码为空 → 沿用旧密码（用户只改了用户名）
+        assert_eq!(merged["password"], "prod-sandbox");
+    }
+
+    #[test]
+    fn changing_host_drops_old_credentials() {
+        let next = json!({
+            "source": "custom", "protocol": "http",
+            "host": "other.example", "port": 14322,
+            "username": "", "password": ""
+        });
+        let merged = inherit_credentials_when_blank(&old(), next);
+        assert_eq!(merged["username"], "");
+        assert_eq!(merged["password"], "");
+    }
+
+    #[test]
+    fn null_next_is_returned_as_is() {
+        let merged = inherit_credentials_when_blank(&old(), serde_json::Value::Null);
+        assert!(merged.is_null());
     }
 }

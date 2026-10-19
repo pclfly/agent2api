@@ -119,9 +119,7 @@ async fn send(plan: &Plan, proxy: Option<&ResolvedProxy>) -> Result<reqwest::Res
     for (name, value) in &plan.headers {
         request = request.header(name.as_str(), value.clone());
     }
-    let response = request
-        .json(&plan.body)
-        .send()
+    let response = crate::server::core::upstream::request::send_builder(request.json(&plan.body))
         .await
         .map_err(|error| GatewayError::with_status(502, format!("Trae 请求发不出去：{}", egress::describe_error_detail(&error))))?;
     Ok(response)

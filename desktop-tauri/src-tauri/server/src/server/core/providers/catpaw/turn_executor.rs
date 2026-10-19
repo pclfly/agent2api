@@ -134,6 +134,7 @@ impl HistoryFingerprints {
 ///     `turn/stop` + 回报 `canceled` —— §9.3「失败/打断路径也要回报 canceled」
 ///     的最后一道网。
 pub(super) struct FinishGuard {
+    route: Option<std::sync::Arc<tokio::sync::Mutex<crate::server::core::proxy_rotate::Attempts>>>,
     pub base_url: String,
     pub credentials: CatPawCredentials,
     pub proxy: Option<ResolvedProxy>,
@@ -160,6 +161,7 @@ pub(super) struct FinishGuard {
 impl FinishGuard {
     pub(super) fn new(ctx: &TurnContext, inflight: bool) -> Self {
         Self {
+            route: crate::server::core::proxy_rotate::context(),
             base_url: ctx.base_url.clone(),
             credentials: ctx.credentials.clone(),
             proxy: ctx.proxy.clone(),
@@ -251,7 +253,9 @@ impl Drop for FinishGuard {
                 short_id(&conversation_id),
             ),
         );
+        let route = self.route.clone();
         handle.spawn(async move {
+            let cleanup = async move {
             stop_turn(&base_url, &credentials, proxy.as_ref(), &conversation_id, &turn_request_id)
                 .await;
             report_terminal(
@@ -263,6 +267,11 @@ impl Drop for FinishGuard {
                 None,
             )
             .await;
+            };
+            match route {
+                Some(route) => crate::server::core::proxy_rotate::ATTEMPTS.scope(route, cleanup).await,
+                None => cleanup.await,
+            }
         });
     }
 }

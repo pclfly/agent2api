@@ -53,7 +53,7 @@
 //! 当前配置项（`apiKeys` / `modelRules` / `logRetentionDays` / `debugMode` /
 //! `sanitizeBlacklistFingerprints` / `promptMode` / `promptFile` /
 //! `scheduledTasks` / `autoCheckin` / `locale` / `lastRequestModel` /
-//! `providerRoute` / `updateProxy` / 三个 `*Dir` / 三个 `*RetentionDays` /
+//! `providerRoute` / `updateProxy` / `updateBeta` / 三个 `*Dir` / 三个 `*RetentionDays` /
 //! 三个 `retry*` / 六条 `scheduledTasks.*` 子键 / 三个 `*Imported` 标记 /
 //! 旧字段 `apiKey`）与固定键**无冲突**，逐项核对过（全仓 `update_raw_field` /
 //! `raw.insert` / `KEY_*` 常量的取值集合 vs 下面的 `RESERVED_KV_KEYS`）。
@@ -80,6 +80,9 @@ use rusqlite::Connection;
 /// 「功能已删、数据留着」的键，登记它们的唯一目的就是让配置写入别去动它。
 pub const RESERVED_KV_KEYS: &[&str] = &[
     // 账号优先级的全局作用域（core::account_store::sql）
+    // 「Agent」页的用户配置：{ clientId: [Profile] } 整份 JSON 一个键
+    // （core::agents）。零散状态，与 desktopSettings 同一类。
+    "agentProfiles",
     "priorityScope",
     // 事件日志的下一个 id 水位（logs_store::sql）
     "logsNextId",
@@ -288,13 +291,36 @@ pub fn is_reserved(key: &str) -> bool {
 /// （`SCHEMA_VERSION <= 13`）读到 v14 库会明确失败，而不是把密文当坏数据跳过、
 /// 再在写回时把「读不出来的行」当成「内存里没有」DELETE 掉（即「回退一次 =
 /// 账号被删」）。对本程序，v14 只是一次空操作。
-/// ── 版本 15：本地 / 官方 v12、v13 撞号后的幂等收敛 ─────────────
-/// 本地 v12 是 route/credit 收敛、v13 是 credit_source；官方 v12 是 client、
-/// v13 是历史正文清理、v14 是加密标记。v15 按实际列补齐四列与索引，已有
-/// 积分与来源不改（NULL 不补成 0）。缺 client 是旧本地线的结构证据，在
-/// 补列的同一事务补做正文清理；官方 v13/v14 已有 client，不重复删除升级后
-/// 采集的调试正文。v14 账号加密启动迁移及高版本库的保护屏障保持不变。
-pub const SCHEMA_VERSION: i64 = 15;
+///
+/// ── 版本 15：requests 补两条索引（`status` 与报表窄列覆盖）─────
+/// 见 [`V15_SCHEMA`]。两条索引都来自同一次实测：明细三万余行、库已经四百多
+/// MB 的库上，两个最热的读路径分别在整表扫描与逐行回表。
+///
+///   · `idx_requests_status`：`SELECT COUNT(*) FROM requests WHERE status = 0`
+///     在**没有任何索引可用**时对整表做 `SCAN`（实测 3 万行 50 ms 量级，
+///     而命中的通常只有个位数行）。这条语句不属于报表 —— 它是前端「进行中」
+///     徽标的全局轮询（每 5 秒一次，与当前停在哪个页面无关，见 `ui/app.js`
+///     的 `syncRunningRequests`）与请求日志列表每次查询的一部分。加索引后
+///     按 status 直接定位，不再扫全表。
+///   · `idx_requests_summary`：`/api/stats/summary` 的近 24 小时明细窗口
+///     （`request_stats::sql::select_summary_rows`）只需要 6 列，而非覆盖索引
+///     必须逐行回表 —— 明细行里躺着 KB 级的 `route` / `attempt_details`，
+///     回表读回来的几乎全是被随后丢掉的字节。这条索引让该查询变成**纯索引
+///     扫描**（列序与那条 SELECT 的列序一致，改动任一侧都要回来对一眼）。
+///
+/// 两条都是 `CREATE INDEX IF NOT EXISTS`（与其余版本的幂等纪律一致）：在存量库
+/// 上建索引要扫一遍表，代价与表大小成正比、只付一次；`requests` 只有几万行时
+/// 在百毫秒量级，不会让启动明显变慢。**不要把这两条往 [`V1_SCHEMA`] 里补**：
+/// 新库按 1→16 依次跑，v15 那一步同样会建出来，而 v1 里多写一份等于同一条索引
+/// 有了两处定义 —— 将来改一处忘一处，正是 `V4_SCHEMA` 那类错位的来源。
+///
+/// ── v16：AI 助手的对话会话（[`V16_SCHEMA`]）──────────────────
+/// 助手从「一次性对话」变成「有历史记录的会话」：左边一列会话、右边一条消息流，
+/// 关掉页面再回来还能接着聊。存**整条消息流的 JSON**（而不是逐条消息一行）的
+/// 理由与 `kv` 表同一取向：读写单元天然是「一整个会话」，逐条存只会让每次保存
+/// 变成 N 次写入 + 一次事务，而没有任何一处需要「按单条消息查」。
+/// v17: converge local credit columns and official indexes/session tables.
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -850,6 +876,60 @@ fn apply_v15(conn: &Connection, cleaned_raw_rows: &mut usize) -> rusqlite::Resul
     }
     Ok(())
 }
+/// 版本 15：requests 补两条索引（schema v15）。
+///
+/// 与 v9 同一形态（既有表加索引，`CREATE INDEX IF NOT EXISTS`，幂等靠版本号）。
+/// 两条索引各自的来历与代价见 [`SCHEMA_VERSION`] 的 v15 段。
+///
+/// `idx_requests_summary` 的列序 = `sql::SUMMARY_COLUMNS` 的列序**加前缀
+/// `ts, is_test`**：`ts` 在最前才能支撑 `WHERE ts >= ? AND ts <= ?` 的范围扫描，
+/// `is_test` 紧随其后是为了在索引内就过滤掉模型测试行（不必回表才知道要丢）。
+/// 其余 5 列（`model` / `upstream_model` / `total_tokens` / `cache_read_tokens`
+/// / `prompt_tokens`）就是报表要读的全部内容 —— 少一列就要回表，多一列白占
+/// 空间与写入开销。
+const V15_SCHEMA: &str = "
+-- ── requests 补 status 索引（schema v15）─────────────────────
+CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
+-- ── requests 补报表窄列覆盖索引（schema v15）─────────────────
+CREATE INDEX IF NOT EXISTS idx_requests_summary ON requests(
+  ts, is_test, model, upstream_model, total_tokens, cache_read_tokens, prompt_tokens
+);
+";
+
+/// 版本 16：AI 助手的对话会话表（schema v16）。
+///
+/// ── 存什么 ──────────────────────────────────────────────────
+/// 一条会话一行。列的口径：
+///   - `id`：会话 id（前端生成，`crypto.randomUUID()` 形态的字符串）。让前端
+///     生成而不是自增：新建会话时前端立刻要用这个 id 挂消息，等一次往返再拿到
+///     它会让「点新建 → 立刻发第一句」出现一个必须等待的中间态；
+///   - `title`：侧边栏显示的名字。取第一条用户消息的前若干字（前端算好传上来），
+///     用户没改过就一直是它 —— 后端不做「自动起标题」那种额外一次上游调用；
+///   - `messages`：**整条消息流的 JSON 原文**（`[{role, content, toolCalls?,
+///     toolCallId?}, …]`，与发给上游的 wire 形态同构）。存原文而不是拆列的理由
+///     见 [`SCHEMA_VERSION`] 的 v16 段；
+///   - `model` / `reasoning`：这条会话最后用的模型与思考等级。存**会话级**而不是
+///     每条消息各带一份：用户换模型是「这条对话从现在起换个模型」，不是逐条
+///     指定；重开一条会话时前端从这两个字段恢复选择器；
+///   - `created_at` / `updated_at`：毫秒时间戳。侧边栏按 `updated_at` 倒序排
+///     （最近聊过的在最上面），`updated_at` 每次保存都刷新。
+///
+/// ── 索引 ────────────────────────────────────────────────────
+/// 只有一条 `updated_at` 倒序索引：侧边栏的全部查询就是「按最近更新排序列出」，
+/// 没有按标题 / 模型检索的需求（会话量级是几十条，前端一次全取即可）。
+const V16_SCHEMA: &str = "
+-- ── assistant_sessions：AI 助手的对话会话（schema v16）───────
+CREATE TABLE IF NOT EXISTS assistant_sessions (
+  id          TEXT PRIMARY KEY,
+  title       TEXT NOT NULL DEFAULT '',
+  messages    TEXT NOT NULL DEFAULT '[]',
+  model       TEXT,
+  reasoning   TEXT,
+  created_at  INTEGER NOT NULL DEFAULT 0,
+  updated_at  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_sessions_updated ON assistant_sessions(updated_at DESC);
+";
 
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
@@ -938,7 +1018,13 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // 失败**不报错**：数据已经删掉了，回收空间是尽力而为的优化 —— 用户
         // 之后仍可在请求日志页的「清理」弹窗里手动压缩（那条路有后台线程与
         // 进度状态，见 `RequestStats::compact`）。
+        //
+        // VACUUM 前后各做一次 checkpoint（与 `RequestStats::compact` 同形，理由
+        // 见那边模块注释）：WAL 模式下 VACUUM 的整库重建会全部落进 `-wal`，
+        // 少了尾部那次截零，空间只是从主库搬到 WAL、总占用不降反升（issue #297）。
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let _ = conn.execute_batch("VACUUM;");
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
     Ok(())
 }
@@ -1006,7 +1092,17 @@ fn apply_version(
         // 读到 v14 库时明确失败（见 `migrate` 的拒绝分支），而不是把密文当坏
         // 数据跳过后又删掉。完整说明见 [`SCHEMA_VERSION`] 的 v14 段。
         14 => Ok(()),
-        15 => apply_v15(conn, cleaned_raw_rows),
+        15 => {
+            apply_v15(conn, cleaned_raw_rows)?;
+            conn.execute_batch(V15_SCHEMA)
+        }
+        16 => conn.execute_batch(V16_SCHEMA),
+        // Converge both released schema histories without changing stored credits.
+        17 => {
+            apply_v15(conn, cleaned_raw_rows)?;
+            conn.execute_batch(V15_SCHEMA)?;
+            conn.execute_batch(V16_SCHEMA)
+        }
         _ => Ok(()),
     }
 }
@@ -1028,7 +1124,10 @@ mod tests {
     /// 建一份「v1 的 requests 表」——两线各自加列之前的共同起点。
     fn base_db() -> Connection {
         let conn = Connection::open_in_memory().expect("内存库可开");
-        conn.execute_batch(V1_SCHEMA).expect("v1 建表");
+        let mut cleaned = 0;
+        for version in 1..=9 {
+            apply_version(&conn, version, &mut cleaned).expect("v1-v9 建表");
+        }
         conn
     }
 
@@ -1219,6 +1318,45 @@ mod tests {
             insert_raw(&conn, "new-debug");
             migrate(&conn).unwrap();
             assert_eq!(raw_count(&conn), if version == 12 { 1 } else { 2 });
+        }
+    }
+
+    /// Exercise actual colliding release versions, not the combined v15 branch.
+    #[test]
+    fn local_v15_and_official_v15_v16_converge_without_losing_data() {
+        for lineage in ["local15", "official15", "official16"] {
+            let conn = released_db(false, 14);
+            if lineage == "local15" {
+                apply_v15(&conn, &mut 0).unwrap();
+                conn.execute_batch("INSERT INTO requests(id, ts, model, credit, credit_source) VALUES ('kept', 1, 'test', 0.125, 'estimate');").unwrap();
+            } else {
+                conn.execute_batch(V15_SCHEMA).unwrap();
+                if lineage == "official16" {
+                    conn.execute_batch(V16_SCHEMA).unwrap();
+                    conn.execute_batch("INSERT INTO assistant_sessions(id, messages) VALUES ('session', 'preserved-message');").unwrap();
+                }
+            }
+            conn.pragma_update(None, "user_version", if lineage == "official16" { 16 } else { 15 }).unwrap();
+            insert_raw(&conn, "keep-debug");
+            conn.execute_batch("INSERT INTO accounts(id, provider, priority, data) VALUES ('account', 'workbuddy', 1, 'enc1:preserve-verbatim');").unwrap();
+            migrate(&conn).unwrap();
+            assert_converged(&conn);
+            assert_eq!(raw_count(&conn), 1, "{lineage}");
+            for name in ["idx_requests_status", "idx_requests_summary", "idx_assistant_sessions_updated"] {
+                assert!(conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1").unwrap().exists([name]).unwrap(), "{lineage}: {name}");
+            }
+            if lineage == "local15" {
+                let credit: (f64, String) = conn.query_row("SELECT credit, credit_source FROM requests WHERE id = 'kept'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+                assert_eq!(credit, (0.125, "estimate".into()));
+            }
+            if lineage == "official16" {
+                let messages: String = conn.query_row("SELECT messages FROM assistant_sessions WHERE id = 'session'", [], |row| row.get(0)).unwrap();
+                assert_eq!(messages, "preserved-message");
+            }
+            let encrypted: String = conn.query_row("SELECT data FROM accounts WHERE id = 'account'", [], |row| row.get(0)).unwrap();
+            assert_eq!(encrypted, "enc1:preserve-verbatim");
+            migrate(&conn).unwrap();
+            assert_eq!(raw_count(&conn), 1);
         }
     }
 

@@ -81,6 +81,8 @@ pub fn build_daily_activity_request(
         proxy,
         // 保活是转发链路的旁支，口径跟转发一致（workbuddy 不覆写能力位 = 直连）
         system_proxy_when_unset: false,
+        accept_any_cert: false,
+        front_proxy: None,
     })
 }
 
@@ -157,5 +159,7 @@ pub fn build_web_conversation_request(
         proxy,
         // 与桌面端保活同一口径：转发链路的旁支，workbuddy 不覆写能力位 = 直连
         system_proxy_when_unset: false,
+        accept_any_cert: false,
+        front_proxy: None,
     })
 }

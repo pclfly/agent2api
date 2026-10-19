@@ -57,8 +57,10 @@ pub mod anthropic;
 pub mod anthropic_outbound;
 pub mod antigravity_outbound;
 pub mod antigravity_schema;
+pub mod antigravity_signature_cache;
 pub mod antigravity_stream;
 pub mod bedrock_outbound;
+pub mod chatglm_stream;
 pub mod commandcode_outbound;
 pub mod freeform;
 pub mod history;
@@ -66,6 +68,7 @@ pub mod native_tool;
 pub mod responses;
 pub mod responses_outbound;
 pub mod tool_plan;
+pub mod vertex_outbound;
 
 use std::borrow::Cow;
 

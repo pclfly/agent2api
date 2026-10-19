@@ -393,7 +393,7 @@ async fn execute(
     if request.stream {
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
         let task_ctx = ctx.clone();
-        tokio::spawn(async move {
+        crate::spawn_task(async move {
             super::turn_executor::drive_stream(task_ctx, response, sender, guard, history).await;
         });
         Ok(ForwardOutcome::Stream {

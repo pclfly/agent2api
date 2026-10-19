@@ -589,6 +589,8 @@ pub fn remove_provider_file(id: &str) {
 /// worker 可能正阻塞在下一条命令上（收不到 Stop 也要杀），所以这里直接
 /// 碰 runtime 里的子进程句柄，不走命令队列。
 pub fn shutdown() {
+    runtime::shutdown_temporary_nodes();
+    crate::server::core::proxy_rotate::shutdown();
     runtime::kill_child();
     logging::log("[Subscription]", "🛑 已停止代理内核");
 }

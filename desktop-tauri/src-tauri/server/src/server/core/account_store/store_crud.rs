@@ -44,8 +44,8 @@ use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
-    js_string, js_truthy, number_or, object_or_empty, optional_text, pick_token, token_tail_of,
-    truncate_chars, value_or, value_or_nullish,
+    inherit_credentials_when_blank, js_string, js_truthy, number_or, object_or_empty, optional_text,
+    pick_token, token_tail_of, truncate_chars, value_or, value_or_nullish,
 };
 use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::endpoints::resolve_edition;
@@ -470,6 +470,7 @@ impl AccountStore {
         // 两者不必（也不该）嵌套（见 `invalidate_catpaw_sessions` 的说明）
         drop(_guard);
         self.invalidate_catpaw_sessions(id, &provider);
+        crate::server::core::proxy_rotate::retire(id);
         Ok(())
     }
 
@@ -737,6 +738,7 @@ impl AccountStore {
             let next = !matches!(value, Value::Bool(false));
             let current = record.enabled();
             if next != current {
+                if !next { crate::server::core::proxy_rotate::retire(record.id()); }
                 record.set_enabled(next);
                 changes.push(if next { "已启用".to_string() } else { "已禁用".to_string() });
             }
@@ -749,37 +751,18 @@ impl AccountStore {
             // Node 用 JSON.stringify 比较：形状相同（含键顺序）才算未变化。
             // serde_json 的序列化键序由插入序决定，与 JS 的对象字面量序一致。
             let before = value_or_nullish(record.get("proxy"), Value::Null);
+            // ── 防「保存时把凭据抹掉」────────────────────────────
+            // 账号设置弹窗只回显 host/port（凭据不回显，这是对的），保存时若
+            // 把整份 proxy 原样提交，username/password 就是空串 —— 直接落盘会
+            // 让一个能用的出口变成「无认证」，上游表现为 CONNECT 隧道被对端
+            // 关闭（`unexpected end of file` / 407），极难归因。
+            //
+            // 判据刻意收窄：**地址没变 + 提交的凭据为空 + 原记录有凭据** 才
+            // 沿用旧凭据。地址变了就是换了一个代理，凭据应当按新值走（空就是空）。
+            let next = inherit_credentials_when_blank(&before, next);
             if next != before {
-                // ── 「轮询」档的唯一准入闸门（写入侧收口）────────────────
-                // 它只对 OpenCode Zen 有意义：那个免费档不用 API Key、**按 IP
-                // 限流**（某个 IP 的额度用完就对这个 IP 一律 429），轮换出口正是
-                // 解法；别的家按 Key / 订阅额度计费，轮换出口只会让上游看到一串
-                // 互不相关的 IP，属于误用。判据放在这里而不是归一里：归一不认识
-                // 记录，而「这条账号是谁家的」只有记录知道（`is_opencode_zen_account`
-                // 同时排除同域不同档的 OpenCode Go）。
-                //
-                // 闸门在**值真的变化**时才判（不是每次提交都判）：设置弹窗每次
-                // 保存都会把 proxy 原样发回来，而导入进来的记录可能本来就带着
-                // 轮询档（导入刻意不过这道闸，见下）—— 那种账号改个备注名不该
-                // 被一条与本次改动无关的规则挡下。批量改代理同样走本函数
-                // （store_batch 逐账号调 apply_patch），混选里那几条非 Zen 账号
-                // 会各自记入 failed，其余照常生效。
-                //
-                // **导入（account_transfer）刻意不过这道闸**：导出文件要能原样
-                // 搬回来，而导入那一刻本机可能还没有那家提供商（判据会假阴性，
-                // 把一条合法记录挡在门外）；那种情况下轮询取用会按「池里没有
-                // 候选」如实报错，用户看得见原因也能修。
-                if crate::server::core::proxies::is_rotate_config(&next)
-                    && !crate::server::core::custom_providers::is_opencode_zen_account(
-                        &record.provider(),
-                        record.get("baseUrl").and_then(Value::as_str),
-                    )
-                {
-                    return Err(AccountStoreError::bad_request(
-                        "轮询出网只对 OpenCode Zen 账号开放：该上游按 IP 限流，\
-                         轮换出口可以绕开单个 IP 的 429；别的提供商请用「已保存的代理」",
-                    ));
-                }
+                // Sticky egress failover is provider-independent; it does not alter quotas.
+                crate::server::core::proxy_rotate::retire(record.id());
                 record.set_proxy(next.clone());
                 let label = if next.is_null() {
                     "代理 → 无代理（直连）".to_string()
@@ -792,6 +775,30 @@ impl AccountStore {
                     format!("代理 → {label}")
                 };
                 changes.push(label);
+            }
+        }
+
+        // 链式出网的前置跳（`frontProxy`）：与 `proxy` 同一归一与三态语义，
+        // 但**不参与轮询闸门**（前置跳是固定的一跳，不是池候选）。null 表示
+        // 取消链式、退回单跳。
+        if let Some(value) = patch.get("frontProxy") {
+            let next = crate::server::core::proxies::normalize_account_proxy(value)
+                .map_err(|error| AccountStoreError::new(error.message, error.status_code))?
+                .unwrap_or(Value::Null);
+            let before = value_or_nullish(record.get("frontProxy"), Value::Null);
+            if next != before {
+                if next.is_null() {
+                    record.set("frontProxy", Value::Null);
+                    changes.push("前置代理 → 无（单跳）".to_string());
+                } else {
+                    record.set("frontProxy", next.clone());
+                    let described = describe_account_proxy(Some(&next));
+                    let label = described
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or("已设置");
+                    changes.push(format!("前置代理 → {label}"));
+                }
             }
         }
 

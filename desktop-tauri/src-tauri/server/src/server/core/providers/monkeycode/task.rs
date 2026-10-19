@@ -205,10 +205,7 @@ pub async fn create_task(
     for (name, value) in &headers {
         builder = builder.header(name.as_str(), value);
     }
-    let response = builder
-        .json(&body)
-        .timeout(Duration::from_millis(CREATE_TIMEOUT_MS))
-        .send()
+    let response = crate::server::core::upstream::request::send_builder(builder.json(&body).timeout(Duration::from_millis(CREATE_TIMEOUT_MS)))
         .await
         .map_err(|error| transport_error("MonkeyCode 建任务请求", error))?;
     let status = response.status().as_u16();
@@ -249,7 +246,7 @@ pub async fn create_task(
 }
 
 /// 传输层错误 → 网关错误（超时 504、其余 502；与各家同款文案）。
-fn transport_error(what: &str, error: reqwest::Error) -> GatewayError {
+fn transport_error(what: &str, error: crate::server::core::upstream::request::SendError) -> GatewayError {
     if error.is_timeout() {
         GatewayError::with_status(504, format!("{what}超时，请稍后重试"))
     } else {

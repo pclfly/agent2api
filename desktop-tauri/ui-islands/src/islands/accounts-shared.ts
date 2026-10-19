@@ -24,7 +24,7 @@ export type ProxyConfig = {
   /** 解析失败的原因：转发时回退直连，界面上整格标红 */
   error?: string
   /**
-   * 轮询档（`source === 'rotate'`，只对 OpenCode Zen 开放）的展示读数：
+   * 轮询档（`source === 'rotate'`）的展示读数：
    * 候选条数与其中可用的条数（后端 `proxy_rotate::summary`）。
    */
   rotate?: { all?: boolean; total?: number; usable?: number } | null
@@ -37,6 +37,8 @@ export type ProxyConfig = {
     all?: boolean
     /** `source === 'rotate' && all !== true`：要轮询的池条目 id */
     proxyIds?: string[]
+    /** 轮询故障策略；旧配置缺失时按 smart 处理 */
+    failureMode?: 'smart' | 'all_errors'
     protocol?: string
     host?: string
     port?: number
@@ -134,6 +136,16 @@ export type AccountRecord = {
   /** ZCode：这一行当前走哪条上游通道（`coding-plan` / `start-plan`，见 accounts-domain 的 ZCODE_PLAN_*） */
   zcodePlan?: string
   hasRefreshToken?: boolean
+  /**
+   * 后端判定「这个账号的登录态已被上游注销，只能重新登录」（issue #215）。
+   *
+   * 连续多次刷新都收到 `12153:refresh token is invalid` 时由刷新链路落标记。
+   * 这类账号的 refresh token 链已经死了，再刷新不会好，凭证维护也会跳过它 ——
+   * 界面必须说出来，否则用户只会看到「刷新一直失败」而不知道该怎么办。
+   */
+  needsRelogin?: boolean
+  /** 与 `needsRelogin` 成对：后端给出的原因文案（为空表示没有标记）。 */
+  needsReloginReason?: string
   hasBalanceToken?: boolean
   /**
    * 自定义账号：记录里有没有非空 `apiKey`（设置弹窗据此决定输入框的提示文案与
@@ -187,8 +199,13 @@ export type AccountRecord = {
   expiresAt?: number
   source?: string
   proxy?: ProxyConfig | null
+  frontProxy?: ProxyConfig | null
   rateLimits?: Record<string, RateLimitInfo>
   [key: string]: unknown
+}
+
+export function accountProxyField(account: AccountRecord | null | undefined): 'proxy' | 'frontProxy' {
+  return account?.frontProxy?.config || account?.frontProxy?.source ? 'frontProxy' : 'proxy'
 }
 
 /** `wbApp.getState()?.accounts` 的形状（providers 摘要 + 账号清单） */
@@ -311,11 +328,14 @@ export type AccountsBridge = {
     durationMs?: unknown
     error?: string
   } | null | undefined>
-  testProxy(payload: { proxy: unknown }): Promise<{
+  testProxy(payload: { proxy: unknown; frontProxy?: unknown; accountId?: string }): Promise<{
     success?: boolean
     status?: unknown
     ip?: string
     durationMs?: unknown
+    targetUrl?: string
+    tlsVerification?: string
+    chained?: boolean
     error?: string
   } | null | undefined>
   switchAccount(id: string): Promise<{ changed?: boolean } | null | undefined>
@@ -485,9 +505,10 @@ export type SharedWindow = {
       id: string; name?: string; protocol?: string; baseUrl?: string
       /** 客户端形态伪装（'' / 'opencode'）：账号设置弹窗的「提供商」段读它做初值 */
       clientEmulation?: string
+      insecureTls?: boolean
     } | null | undefined>
     update?: (patch: {
-      id: string; name: string; protocol: string; baseUrl: string; clientEmulation?: string
+      id: string; name: string; protocol: string; baseUrl: string; clientEmulation?: string; insecureTls?: boolean
     }) => Promise<unknown>
     remove?: (id: string) => Promise<boolean>
   }
@@ -561,4 +582,24 @@ export function formatTime(value: unknown): string {
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * 数值字段 → 展示串：**最多两位小数**，取不到给「—」。
+ *
+ * ── 为什么要有小数上限 ──────────────────────────────────────
+ * 上游有几家给的是 `*Precise` 这类**高精度浮点**（WorkBuddy 国内版的
+ * `CycleCapacityRemainPrecise` 实测回 `3547.430000335`），后端按「缺键不写、
+ * 给什么写什么」如实透传，于是那串尾巴会铺满悬停提示与积分明细。积分读到两位
+ * 小数已经比上游自己面板上给的还细，再多就是噪声。收口只在这里一处
+ * （余额读数 / 余量 / 总量 / 明细行 / 限制器实况都走它），别在十来处各写一遍。
+ *
+ * 整数不受影响（`1500.00` → `1500`，尾随零由 `Number` 归掉）；解析不出数字的值
+ * **原样透出** —— 上游偶尔给「不限」这类文案串，不能把一个有内容的值改写成「—」。
+ */
+export function numberText(value: unknown): string {
+  if (value === null || value === undefined || value === '') return '—'
+  const number = Number(value)
+  if (!Number.isFinite(number)) return String(value)
+  return String(Number(number.toFixed(2)))
 }

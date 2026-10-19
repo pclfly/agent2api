@@ -29,7 +29,7 @@
  */
 
 import {
-  errorMessage, POOL_VALUE_PREFIX, shared, toast,
+  accountProxyField, errorMessage, POOL_VALUE_PREFIX, shared, toast,
   type AccountRecord, type ClashSnapshot, type PanelKind, type PoolItem,
   type TokenReading, type UsageEntry,
 } from './accounts-shared'
@@ -373,6 +373,16 @@ export function connectionsOf(id: string): number {
 /**
  * 拉一次连接数。失败静默：2 秒一次的轮询，后端不可达时 toast 会变成刷屏；
  * 且缓存保留上一轮的值比清空更贴近事实（用户看到的是「刚才还在跑」）。
+ *
+ * ── 数值没变就不写 store（本次改造）──────────────────────────
+ * 这条链路每 2 秒跑一次，而「有请求在跑」是少数时刻：绝大多数轮次里
+ * `connections` 都是同一份空表。原实现照写不误，而 store 的每次 `patch` 都会换一份
+ * 新快照（`useSyncExternalStore` 按引用判「变了没」）—— 于是账号页每 2 秒整体重渲染
+ * 一次，43 个账号 × 十几列的单元格全部重建，屏幕上却一个数字都没变。这里先比一遍，
+ * 相同就直接返回：那 2 秒一次的「重渲染整页」在空闲时彻底消失。
+ *
+ * 比较口径与写入口径必须一致（都是「只放 count > 0 的项」）—— 两个 Map 的构造
+ * 走的是同一段代码，所以「key 集合 + 每个值」全等都等价于「这份读数与上一份相同」。
  */
 export async function syncConnections(): Promise<boolean> {
   try {
@@ -383,12 +393,25 @@ export async function syncConnections(): Promise<boolean> {
       const count = Number(value) || 0
       if (count > 0) connections.set(id, count)
     }
+    if (sameConnections(connections, getStore().connections)) return true
     patch({ connections })
     return true
   } catch {
     // 静默：下一次轮询自然重试（与 app.js 的 refresh / syncLogsBadge 同一取舍）
     return false
   }
+}
+
+/** 两份连接数读数是否完全相同（key 集合与每个值；见 syncConnections 的说明） */
+function sameConnections(
+  next: ReadonlyMap<string, number>,
+  prev: ReadonlyMap<string, number>,
+): boolean {
+  if (next.size !== prev.size) return false
+  for (const [id, count] of next) {
+    if (prev.get(id) !== count) return false
+  }
+  return true
 }
 
 /**
@@ -819,17 +842,11 @@ export async function clearLimits(id: string, model?: string): Promise<void> {
 }
 
 /**
- * 代理列下拉的保存。值只有两种：空串 = 直连（proxy 传 null），否则是 Clash 出口 uid
- * （`{source:'clash', listenerUid}`）——「自定义代理…」不是值而是动作：把下拉恢复成
- * 原选中，再打开账号设置弹窗（完整代理表单在那里）。成功后用后端回报的变更说明播报，
- * 与后端文案保持一份事实。
- */
-/**
- * 代理列选中即保存（`value` 是下拉的值）。下拉的选项只有三类：
- *   ''                     → 直连（proxy = null）
+ * 代理列选中即保存（`value` 是下拉的值）：
+ *   ''                     → 直连（链式账号只移除第一跳）
  *   `pool:<proxyId>`       → 引用「网络代理」页的池条目
- *   两个 `__proxy_*__` 占位值 → 「当前值的显示项」与「打开设置弹窗」，
- *                             都不是一次修改（在前两个分支里拦掉）
+ *   PROXY_ROTATE_ALL       → 全部候选的粘性故障切换
+ *   CURRENT / EDIT         → 当前值显示 / 打开完整设置，不写配置
  *
  * 出口统一走代理池之后，这里**不再**产生 `{source:'clash'}` —— 存量里那种
  * 记录仍照原样转发，用户在这个下拉里选一条池条目或切回直连就会改写它。
@@ -844,10 +861,18 @@ export async function applyProxyPick(id: string, value: string, fallback: string
   if (value === PROXY_CUSTOM_CURRENT) return
   if (value === fallback) return
   try {
+    const account = findAccount(id)
+    if (!account) throw new Error(t('账号不存在，请刷新后重试。'))
+    const field = accountProxyField(account)
+    if (value === PROXY_ROTATE_ALL && field === 'frontProxy') {
+      throw new Error(t('链式代理的第一跳不支持轮询，请在账号设置中配置第二跳'))
+    }
     const proxy = value === ''
       ? null
-      : { source: 'pool', proxyId: value.slice(POOL_VALUE_PREFIX.length) }
-    const result = await shared().workbuddyDesktop?.updateAccount?.(id, { proxy })
+      : value === PROXY_ROTATE_ALL
+        ? { source: 'rotate', all: true, failureMode: 'smart' }
+        : { source: 'pool', proxyId: value.slice(POOL_VALUE_PREFIX.length) }
+    const result = await shared().workbuddyDesktop?.updateAccount?.(id, { [field]: proxy })
     const changes = result?.changes
     // changes[0] 是后端回报的变更说明（后端文案保持一份事实），没有时给前端兜底一句
     const change = Array.isArray(changes) && changes.length ? changes[0] : t('代理已更新')
@@ -863,6 +888,8 @@ export async function applyProxyPick(id: string, value: string, fallback: string
 /** 代理下拉里两个「不是出口 uid」的特殊值：代表当前自定义配置的显示项、打开设置弹窗的动作项 */
 export const PROXY_CUSTOM_CURRENT = '__proxy_custom__'
 export const PROXY_CUSTOM_EDIT = '__proxy_custom_edit__'
+/** 代理列快捷启用全部候选；指定范围仍在完整表单中编辑。 */
+export const PROXY_ROTATE_ALL = '__proxy_rotate_all__'
 
 /**
  * 行上「领套餐」/ 签到中心 ZCode 行：打开**套餐明细**弹窗（zcode-plans-modal.tsx）。

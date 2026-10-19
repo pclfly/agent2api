@@ -54,6 +54,16 @@ impl AccountStore {
                 .unwrap_or(Value::Null);
             allowed.insert("proxy".to_string(), normalized);
         }
+        // 链式出口的前置跳（`frontProxy`）：与 `proxy` 同一归一与三态语义。
+        // 它属于「代理」这一组，所以放进同一个批量动作里 —— 早前这个白名单
+        // 没列它，前端/脚本提交的 frontProxy 会被**静默丢弃**，表现是
+        // 「配置写成功了但出口没变」，极难排查。
+        if let Some(value) = patch_object.get("frontProxy") {
+            let normalized = crate::server::core::proxies::normalize_account_proxy(value)
+                .map_err(|error| AccountStoreError::new(error.message, error.status_code))?
+                .unwrap_or(Value::Null);
+            allowed.insert("frontProxy".to_string(), normalized);
+        }
         if let Some(value) = patch_object.get("maxConcurrent") {
             // 校验先做**一次**（与单账号同一份，见 `normalize_max_concurrent`）：
             // 丢进循环里逐账号报错会把同一个 400 说 N 遍，而这是「参数写错了」，
@@ -272,6 +282,7 @@ impl AccountStore {
         // 落盘完成后作废这些账号的 CatPaw 会话映射（放锁，见本函数说明）
         drop(_guard);
         for (id, provider) in removed_owners {
+            crate::server::core::proxy_rotate::retire(&id);
             self.invalidate_catpaw_sessions(&id, &provider);
         }
         Ok(json!({ "removed": removed, "failed": failed, "list": snapshot }))

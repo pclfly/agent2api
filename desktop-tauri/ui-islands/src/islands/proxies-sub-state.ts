@@ -303,7 +303,9 @@ async function pollSectionAfterChange(): Promise<void> {
  * 新增订阅的输入（两种来源二选一）：
  *   · 链接订阅 → `url`；
  *   · 本地文件 → `kind: 'local'` + `contentBase64`（`fileName` 只做展示）。
- * `contentBase64` 走 base64（与二维码图片同一传输形态），后端解出明文并校验。
+ * `contentBase64` 走 base64（与二维码图片同一传输形态），后端
+ * `api::subscriptions::attach_local_content` 解出明文并校验 —— 字段名必须
+ * 与后端读的键一致，写成别的名字会被当成「没带文件」。
  */
 export type NewSubscriptionInput = {
   name: string

@@ -270,14 +270,6 @@ const PAYLOAD_SIZE_REJECTION_STATUSES: &[u16] = &[413];
 /// 一个是「字节」，一个是「名字」，出处与措辞不同，将来各自的排除面也可能变。
 const DETERMINISTIC_NOT_FOUND_STATUSES: &[u16] = &[404];
 
-/// 轮询出网档（`core::proxy_rotate`）在 429 时**原地换出口**的次数上限。
-///
-/// 为什么是 3：OpenCode Zen 免费档的 429 按 IP 判（这个出口的额度用完），换出口
-/// 就有机会过；但一次请求也不该无限换下去 —— 池里几十个出口全试一遍意味着
-/// 几十次往返，客户端白等。换满 3 个仍 429，按「这台账号此刻确实被上游拒了」
-/// 收尾（走既有的按模型冷却 + 顺延下一个账号），与没有轮询时的行为一致。
-const MAX_ROTATE_EXIT_RETRIES: usize = 3;
-
 /// 这次的失败状态码是否命中「指定错误码直接换号」名单（设置页「通用 → 请求重试」）。
 ///
 /// 命中的失败**跳过本账号**：不进 [`send_with_retry`] 的原地重发，也不做同
@@ -314,7 +306,7 @@ fn transient_retry_advice(status: u16, remaining: usize) -> Option<RetryAdvice> 
 /// 原因取错误自带的简短形态（`UpstreamRequestError::reason`）：连接超时与
 /// 等待响应头超时各自带设置页旋钮名与实际秒数，其余统一「上游连接失败」。
 fn transport_retry_advice(error: &super::request::UpstreamRequestError, remaining: usize) -> Option<RetryAdvice> {
-    if remaining == 0 {
+    if remaining == 0 || error.local {
         return None;
     }
     Some(RetryAdvice {
@@ -464,7 +456,20 @@ pub(super) async fn forward_with_providers(
             if with_mapping { "，含映射" } else { "" },
         ),
     );
-    attempt_queue(service, &ctx, &provider_ids, slot, connections).await
+    let attempts = std::sync::Arc::new(tokio::sync::Mutex::new(crate::server::core::proxy_rotate::Attempts::default()));
+    let future = crate::server::core::proxy_rotate::ATTEMPTS.scope(attempts.clone(),
+        attempt_queue(service, &ctx, &provider_ids, slot, connections));
+    let outcome = if let Some(token) = ctx.telemetry.cancel_token() {
+        tokio::select! { result = future => result, _ = token.cancelled() => Err(cancellation::cancelled_error()) }
+    } else { future.await }?;
+    Ok(match outcome {
+        ForwardOutcome::Stream { status, stream } => {
+            use futures::StreamExt;
+            // Lease follows the response body, not the forwarding stack frame.
+            ForwardOutcome::Stream { status, stream: Box::new(stream.map(move |item| { let _keep = &attempts; item })) }
+        }
+        completion => completion,
+    })
 }
 
 /// 按网关 Key 的**可用提供商**白名单过滤候选链（R9，照抄 OmniProxy 的
@@ -521,6 +526,12 @@ fn filter_by_key_scope(
         ),
     )
     .with_code("model_not_found"))
+}
+
+async fn local_rotation_failure() -> bool {
+    let Some(context) = crate::server::core::proxy_rotate::context() else { return false };
+    let state = context.lock().await;
+    state.active() && (state.local_failure || !state.network_started)
 }
 
 /// 账号循环：每一轮从候选池里按全局优先级选一个账号，用它所属家的适配器发一次。
@@ -630,6 +641,23 @@ async fn attempt_queue(
         // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
         // （429 降级、401 刷新后换号、会话式失败顺延三条路径都经过这里）。
         connections.rebind(target.account_id.clone());
+        if let Some(attempts) = crate::server::core::proxy_rotate::context() {
+            let config = if ctx.proxy_override.is_none() {
+                target.account.as_ref().and_then(|a| a.get("proxy")).and_then(|p| p.get("config"))
+            } else { None };
+            let mut attempts = attempts.lock().await;
+            attempts.configure(target.account_id.as_deref().unwrap_or(""), config);
+            if attempts.active() {
+                let remaining = attempts.remaining();
+                let prepare = tokio::time::timeout(remaining, attempts.select(false));
+                let prepared = if let Some(token) = ctx.telemetry.cancel_token() {
+                    tokio::select! { biased; _ = token.cancelled() => return Err(cancellation::cancelled_error()), result = prepare => result }
+                } else { prepare.await };
+                target.proxy = prepared.map_err(|_| GatewayError::with_status(502, "轮询出口准备超时"))?
+                    .map_err(|reason| GatewayError::with_status(502, reason))?;
+                target.proxy_notice = None;
+            }
+        }
         // ── 自定义提供商的分流（第二阶段；与下面的 is_stateful 同形状）──
         // 位置在 `kind_from_id` 之前：custom id **不进** `ProviderKind`
         // （「不认识就是不认识」的全仓口径，见 `custom_providers` 的模块头），
@@ -642,6 +670,7 @@ async fn attempt_queue(
             match attempt_custom(service, ctx, target, slot, connections, degraded).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
+                    if local_rotation_failure().await { return Err(error); }
                     // 手动终止优先（与无状态路径同一判定与理由）：不把已受理的
                     // 终止当成「这一轮失败」去顺延下一个账号
                     if ctx.telemetry.is_cancelled() {
@@ -764,6 +793,7 @@ async fn attempt_queue(
             {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
+                    if local_rotation_failure().await { return Err(error); }
                     // 手动终止优先（与无状态 / 自定义两条路径同一判定与理由）：
                     // 会话式这一轮已经结束，但用户要的是终止 —— 不把它当成
                     // 普通失败去顺延下一个账号（那会把终止拖成另一轮转发）
@@ -971,8 +1001,10 @@ async fn attempt_queue(
         let started_at = logging::now_ms();
         let mut refreshed = false;
         // 第三个元素是上游响应的协议（适配器在构造请求时给出）：chat 之外
-        // 还要在下面套一层响应翻译，见 `UpstreamResponse` 的说明
-        let (response, wire_model, response_protocol) = loop {
+        // 还要在下面套一层响应翻译，见 `UpstreamResponse` 的说明。第四个元素是
+        // Antigravity 请求信封里的会话键（签名缓存兜底档的写入键，issue #291；
+        // 其余家是空串 —— 提取见循环内唯一那条成功 break）
+        let (response, wire_model, response_protocol, antigravity_session) = loop {
             // 发送体在这一轮发送前取一次（同一家同池同降级状态下复用缓存项）：
             // 借用在本次迭代内有效，`continue`（401 刷新 / 内容拦截补救）时
             // 重新取 —— 于是「换了 body 的那次重试」拿到的一定是新的一份。
@@ -1085,6 +1117,8 @@ async fn attempt_queue(
                 // 能力位由适配器给；账号已配代理或本次显式指定了直连/节点时它不参与
                 system_proxy_when_unset: ctx.proxy_override.is_none()
                     && adapter.system_proxy_when_unset(),
+                accept_any_cert: false,
+        front_proxy: None,
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
@@ -1138,9 +1172,24 @@ async fn attempt_queue(
                     ) {
                         service.route.sticky_bind(&conv_key, account_id, logging::now_ms());
                     }
-                    break (response, wire_model, plan.response);
+                    // Antigravity 的会话键随信封带出（签名缓存兜底档的写入键，
+                    // issue #291）：只有本家的信封有 `request.sessionId`，其余
+                    // 家给空串。`plan.body` 在这里仍归 plan 所有，取指针即可。
+                    let antigravity_session = if plan.response
+                        == crate::server::core::providers::adapter::UpstreamResponse::AntigravityGemini
+                    {
+                        plan.body
+                            .pointer("/request/sessionId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+                    break (response, wire_model, plan.response, antigravity_session);
                 }
                 Err(failure) => {
+                    if local_rotation_failure().await { return Err(failure.error); }
                     // ── 手动终止优先于一切重试动作 ────────────────────────
                     // 用户已经点了「终止请求」：换号 / 退避 / 刷新凭证都没有
                     // 意义。判定放在分类动作之前 —— 否则一次「恰好同时发生」
@@ -1670,9 +1719,19 @@ async fn attempt_queue(
                     super::translate::AntigravityToChatStream::new(
                         response,
                         &wire_model,
+                        &antigravity_session,
                         ctx.telemetry,
                     ),
                 ),
+                // 智谱清言：SSE 帧混着增量与收尾全文快照，翻译机按帧语义差分
+                // （见那台的模块头）
+                UpstreamResponse::ChatglmSnapshot => {
+                    Box::pin(super::translate::ChatglmToChatStream::new(
+                        response,
+                        &wire_model,
+                        ctx.telemetry,
+                    ))
+                }
                 // 外层 `if` 已排除它，这一支只为 match 的穷尽性存在，**不可能
                 // 走到**。真走到说明分派被改坏了：报内部错误而不是 panic
                 // （release 是 `panic=abort`，一处 panic 带走整个网关）。
@@ -1864,14 +1923,8 @@ fn mark_conversation_limited(
 /// 分支用 `custom_forward::cooldown_model` 解析 —— 与发送名同一纯函数、同一
 /// 结果，两次调用不会分叉（见那个函数的说明）。
 ///
-/// ── 轮询出网档（`core::proxy_rotate`）的 429 补救 ─────────────
-/// 这条路径是**唯一**会把「429」再拆一层的地方：轮询档（目前只有 OpenCode Zen
-/// 免费档）下的 429 说的是「这个出口 IP 的免费额度用完了」，不是「这台账号不行」
-/// —— 换一个出口重发往往就过。所以本函数在轮询档上最多原地换
-/// [`MAX_ROTATE_EXIT_RETRIES`] 个出口，换出口的次数与原因记进本轮的尝试明细
-/// （`note_attempt_retry`，与「动作 0 换提示词」同一记账形态：同一个账号、同一条
-/// 明细，不另起一轮）；换满仍 429 才把错误交给调用方，走既有的「按模型冷却 +
-/// 顺延下一个账号」。别的档、别的错误码一律不换出口（理由见函数内注释）。
+/// 出口切换由公共传输层处理：同一已构造请求在 HTTP/传输失败时换出口，
+/// 这里不重新构造请求、不改变会话标识，也不推断服务额度。
 ///
 /// 明细记账的定稿粒度与无状态路径对齐：成功时记**上游真实状态码**（流式在
 /// `ForwardOutcome::Stream.status`、聚合完成恒为 200 —— 非 2xx 在 forward
@@ -1924,21 +1977,7 @@ async fn attempt_custom(
             describe_proxy(target.proxy.as_ref()),
         ),
     );
-    // ── 轮询档的 429 补救：换下一个出口原地重发 ────────────────────
-    // OpenCode Zen 免费档的 429 是**按 IP** 判的（这个出口的免费额度用完，
-    // 见 `core::proxy_rotate` 的模块头）——换一个出口往往就过了，而按「账号
-    // 被限额」处理会白白把这台账号冷却掉。所以这里在轮询档上最多原地换
-    // [`MAX_ROTATE_EXIT_RETRIES`] 个出口；都 429 才把错误交给调用方，走既有的
-    // 「按模型冷却 + 顺延下一个账号」。
-    //
-    // 只对 429（`is_quota_limit`）动手：连接错误 / 5xx / 4xx 与出口无关，
-    // 换出口只是白花一次往返（那类失败由调用方顺延下一个账号兜底）。
-    let mut proxy = target.proxy.clone();
-    let mut rotate_left = if custom_forward::is_rotate_account(target.account.as_ref()) {
-        MAX_ROTATE_EXIT_RETRIES
-    } else {
-        0
-    };
+    let proxy = target.proxy.clone();
     loop {
         match custom_forward::forward(
             &service.store,
@@ -1981,39 +2020,6 @@ async fn attempt_custom(
                 return Ok(outcome);
             }
             Err(error) => {
-                // 换出口重发（同一账号、同一条尝试明细：明细里追加一条内部重试，
-                // 与「动作 0 换提示词重试」同一记账形态，见 `note_attempt_retry`）。
-                if rotate_left > 0 && error.is_quota_limit() {
-                    if let Some(account_id) = target.account_id.as_deref() {
-                        match service.store.next_rotate_proxy(account_id) {
-                            Ok(Some(next)) => {
-                                rotate_left -= 1;
-                                let reason = format!(
-                                    "轮询换出口重试（下一个 {label}）：上游 {status} 表示该出口已用完额度",
-                                    label = describe_proxy(Some(&next)),
-                                    status = error.status_code,
-                                );
-                                logging::verbose("[Upstream]", &format!("🔁 {reason}"));
-                                ctx.telemetry.note_attempt_retry(
-                                    &reason,
-                                    Some(i64::from(error.status_code)),
-                                    0,
-                                );
-                                proxy = Some(next);
-                                continue;
-                            }
-                            // 不是轮询档（理论上不会走到：上面已按它开门）——
-                            // 按原错误收尾，不制造第二条消息
-                            Ok(None) => {}
-                            // 是轮询档但一条候选都取不出来（池空了 / 全被禁用）：
-                            // 原错误更有信息量（上游为什么拒），换出口那件事
-                            // 如实记一句到明细里，便于排障时区分两种成因
-                            Err(reason) => {
-                                ctx.telemetry.note_attempt_retry(&reason, None, 0);
-                            }
-                        }
-                    }
-                }
                 // 只在终端：这条错误会作为 GatewayError 抛回入口（或由调用方的
                 // Err 分支顺延），由 `api::chat` / `api::protocol` 记进请求日志。
                 logging::console_line(
@@ -2360,6 +2366,7 @@ async fn send_or_cancel(
     tokio::select! {
         result = send_chat_request(transport) => result,
         _ = token.cancelled() => Err(super::request::UpstreamRequestError {
+            local: true,
             message: cancellation::MANUAL_TERMINATED.to_string(),
             reason: cancellation::MANUAL_TERMINATED.to_string(),
         }),
@@ -2411,6 +2418,12 @@ async fn sleep_or_cancel(
 ///
 /// 与「还能换几个账号」是两套独立预算：那份归 `attempt_queue` 的 `switches_left`
 /// 管（见 [`take_switch`]），两者互不抵扣。
+async fn rotation_handles_retry() -> bool {
+    match crate::server::core::proxy_rotate::context() {
+        Some(context) => context.lock().await.active(),
+        None => false,
+    }
+}
 async fn send_with_retry(
     adapter: &dyn ProviderAdapter,
     transport: &TransportRequest,
@@ -2441,7 +2454,8 @@ async fn send_with_retry(
                 }
                 // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
                 // 次数用完才收敛成 502，与改造前的兜底一致
-                if let Some(advice) = transport_retry_advice(&error, budget.remaining) {
+                let advice = if rotation_handles_retry().await { None } else { transport_retry_advice(&error, budget.remaining) };
+                if let Some(advice) = advice {
                     budget.remaining -= 1;
                     let used = budget.used();
                     telemetry.note_attempt_retry(&advice.reason, None, advice.delay_ms);
@@ -2499,7 +2513,10 @@ async fn send_with_retry(
         // 上，直接换下一个账号继续试（见 `direct_switch_status` 与动作 3），
         // 换满仍失败才把错误给客户端。两处合起来才是「这个码直接换号」的
         // 完整语义。
-        let advice = if !degraded && matches!(class, UpstreamErrorClass::ContentBlocked { .. }) {
+        // Proxy rotation already applied the bounded transport policy. Do not multiply
+        // its five attempts through the generic provider retry loop. Token refresh is
+        // a separate provider action in attempt_queue, not this resend loop.
+        let advice = if rotation_handles_retry().await || (!degraded && matches!(class, UpstreamErrorClass::ContentBlocked { .. })) {
             None
         } else if direct_switch_status(i64::from(status)) {
             None

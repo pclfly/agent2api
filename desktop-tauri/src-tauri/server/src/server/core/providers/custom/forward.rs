@@ -78,7 +78,9 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::custom_providers;
 use crate::server::core::model_rules;
-use crate::server::core::protocol::{anthropic_outbound, bedrock_outbound, responses_outbound};
+use crate::server::core::protocol::{
+    anthropic_outbound, bedrock_outbound, responses_outbound, vertex_outbound,
+};
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::core::providers::custom::emulation;
 use crate::server::core::upstream::connections::ConnectionGuard;
@@ -131,6 +133,7 @@ pub(crate) async fn forward(
         custom_providers::PROTOCOL_RESPONSES => Some(OutboundKind::Responses),
         custom_providers::PROTOCOL_ANTHROPIC => Some(OutboundKind::Anthropic),
         custom_providers::PROTOCOL_BEDROCK => Some(OutboundKind::Bedrock),
+        custom_providers::PROTOCOL_VERTEX => Some(OutboundKind::Vertex),
         other => {
             return Err(GatewayError::with_status(
                 400,
@@ -187,6 +190,7 @@ pub(crate) async fn forward(
             &quirks,
             body,
             proxy,
+            credential.front_proxy.clone(),
             stream,
             telemetry,
             slot,
@@ -269,6 +273,9 @@ pub(crate) async fn forward(
             if quirks.emulate_opencode { " 伪装=opencode" } else { "" },
         ),
     );
+    // proxy 即将被移进 TransportRequest：先记下「有没有配出口」，
+    // 供 401 的诊断文案使用（见 classify_custom_error 的说明）。
+    let had_proxy = proxy.is_some();
     let transport = TransportRequest {
         url,
         headers,
@@ -276,6 +283,10 @@ pub(crate) async fn forward(
         proxy,
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
+        // vertex 可显式声明放宽 TLS（上游经 MITM 型代理时其证书不被系统信任）
+        accept_any_cert: quirks.insecure_tls && matches!(kind, Some(OutboundKind::Vertex)),
+        // 链式出口：账号若配了前置代理（Clash 选地区），先经它再由 proxy 注入
+        front_proxy: credential.front_proxy.clone(),
     };
     let response = send_chat_request(&transport)
         .await
@@ -297,6 +308,7 @@ pub(crate) async fn forward(
             status,
             &detail.message,
             retry_after.as_deref(),
+            matches!(kind, Some(OutboundKind::Vertex)) && !had_proxy,
         ));
     }
 
@@ -342,6 +354,13 @@ enum OutboundKind {
     /// [`forward_translated`] 里的处理比另外两家多一步「签名」，
     /// 且响应侧的状态机吃的是二进制帧而非 `data:` 行。
     Bedrock,
+    /// Vertex AI Gemini（`POST {base}/<model>:streamGenerateContent?alt=sse`）
+    ///
+    /// 与 Bedrock 同族的两点（模型名进 URL 路径、响应需翻译），但与 responses /
+    /// anthropic 更近的两点：响应是 **SSE 文本行**（不是二进制分帧），鉴权是
+    /// **固定头或留空**（不是签名）。留空的情形是「密钥由出网代理注入」——
+    /// 见 `protocol::vertex_outbound` 的模块头。
+    Vertex,
 }
 
 impl OutboundKind {
@@ -351,6 +370,7 @@ impl OutboundKind {
             Self::Responses => "responses",
             Self::Anthropic => "anthropic",
             Self::Bedrock => "bedrock",
+            Self::Vertex => "vertex",
         }
     }
 }
@@ -374,6 +394,12 @@ struct ProviderQuirks {
     /// 两个桩工具 —— OpenCode Zen 的免费档只有这个形状才放行。**会改写请求体**，
     /// 所以只在记录显式声明时生效。
     emulate_opencode: bool,
+    /// 是否放宽 TLS 校验（提供商记录 `insecureTls: true`）。
+    ///
+    /// 只对 `vertex` 协议生效：上游经 **MITM 型**出网代理（它现签证书才能解密
+    /// 并注入凭证）时，签发者不在系统信任链里，严格校验必然失败。其余协议
+    /// 即使误设该键也不生效 —— 安全降级只在必要的那条路径上开放。
+    insecure_tls: bool,
 }
 
 impl ProviderQuirks {
@@ -411,6 +437,10 @@ impl ProviderQuirks {
                 .is_some_and(|text| {
                     text.eq_ignore_ascii_case(custom_providers::CLIENT_EMULATION_OPENCODE)
                 }),
+            insecure_tls: provider
+                .get("insecureTls")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }
     }
 
@@ -424,6 +454,30 @@ impl ProviderQuirks {
                 None => headers.push((key.clone(), value.clone())),
             }
         }
+    }
+
+    /// vertex 协议实际发往上游的 `x-goog-api-key` 值。
+    ///
+    /// 三种情形：
+    ///   1. 账号填了 Key → 原样发出（直连真实 Vertex 的常规用法）；
+    ///   2. 账号 Key 为空，但提供商 `headers` 里显式写了 `x-goog-api-key`
+    ///      （用户想自己控制注入值，或占位符化交给代理识别）→ 用那个值；
+    ///   3. 都为空 → 返回空串，`vertex_headers` 据此**不发任何凭证头**，
+    ///      交给出网代理（Agent Vault 的 MITM）按 host+path 模板覆写。
+    ///
+    /// 注意情形 3 与「忘填 Key」在语义上是同一形状，但 vertex 协议本该允许
+    /// 无 Key（见 `vertex_outbound::vertex_api_key_required`），所以不判错。
+    fn vertex_api_key(&self, account_key: &str) -> String {
+        let trimmed = account_key.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        for (name, value) in &self.headers {
+            if name.eq_ignore_ascii_case("x-goog-api-key") {
+                return value.trim().to_string();
+            }
+        }
+        String::new()
     }
 
     /// 伪装头与匿名凭证（只在 `clientEmulation: "opencode"` 时动手）。
@@ -503,6 +557,7 @@ async fn forward_translated(
     quirks: &ProviderQuirks,
     body: &Value,
     proxy: Option<ResolvedProxy>,
+    front_proxy: Option<ResolvedProxy>,
     stream: bool,
     telemetry: &Arc<RequestTelemetry>,
     slot: &mut Option<InFlightGuard>,
@@ -676,6 +731,21 @@ async fn forward_translated(
                 .unwrap_or(Value::Object(serde_json::Map::new()));
             (url, headers, reparsed)
         }
+        OutboundKind::Vertex => {
+            // ── Vertex 与另三家的差异 ─────────────────────────────
+            // ① 模型名进 URL 路径（`<model>:streamGenerateContent?alt=sse`）；
+            // ② 鉴权可为空：Key 留空表示「由出网代理注入 x-goog-api-key」，
+            //    此时**一个凭证头都不发**（空 key 会被 Google 判成 API_KEY_INVALID）；
+            // ③ baseUrl 是「模型公共前缀」（到 `/publishers/google/models` 为止），
+            //    不是 API 根 —— 这也是它不能复用 chat 分支拼 `/chat/completions` 的原因。
+            let upstream_key = quirks.vertex_api_key(api_key);
+            let (url, _action) =
+                vertex_outbound::vertex_endpoint(base_url, &wire_model, true);
+            let headers = vertex_outbound::vertex_headers(&upstream_key, &quirks.headers);
+            let payload = vertex_outbound::vertex_request_from_chat(&outbound_chat, &wire_model)
+                .map_err(|message| GatewayError::with_status(400, message))?;
+            (url, headers, payload)
+        }
     };
     let payload = serde_json::to_string(&payload)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
@@ -683,12 +753,23 @@ async fn forward_translated(
     logging::verbose(
         "[CustomProvider]",
         &format!(
-            "POST {url} protocol={} model={} stream={stream} account={account_id} 出口={}",
+            "POST {url} protocol={} model={} stream={stream} account={account_id} 出口={}{}",
             kind.label(),
             if wire_model.is_empty() { "(默认)" } else { &wire_model },
             describe_proxy(proxy.as_ref()),
+            match front_proxy.as_ref() {
+                Some(front) => format!(
+                    " 前置={}:{}（链式：先经前置，再由上面的出口注入）",
+                    front.host,
+                    front.port.unwrap_or(0)
+                ),
+                None => String::new(),
+            },
         ),
     );
+    // proxy 即将被移进 TransportRequest：先记下「有没有配出口」，
+    // 供 401 的诊断文案使用（见 classify_custom_error 的说明）。
+    let had_proxy = proxy.is_some();
     let transport = TransportRequest {
         url,
         headers,
@@ -696,6 +777,9 @@ async fn forward_translated(
         proxy,
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
+        // vertex 可显式声明放宽 TLS（上游经 MITM 型代理时其证书不被系统信任）
+        accept_any_cert: quirks.insecure_tls && matches!(kind, OutboundKind::Vertex),
+        front_proxy: front_proxy.clone(),
     };
     let response = send_chat_request(&transport)
         .await
@@ -722,7 +806,7 @@ async fn forward_translated(
                 &detail.message,
                 retry_after.as_deref(),
             ),
-            _ => classify_custom_error(status, &detail.message, retry_after.as_deref()),
+            _ => classify_custom_error(status, &detail.message, retry_after.as_deref(), matches!(kind, OutboundKind::Vertex) && !had_proxy),
         });
     }
 
@@ -788,6 +872,9 @@ enum TranslateMachine {
     /// Bedrock 的事件流是**二进制分帧**（AWS Event Stream），不是 SSE 文本行 ——
     /// 状态机的接口同形（`push` / `finish`），但内部按长度字段切帧而非按行。
     Bedrock(bedrock_outbound::ChatFromBedrockStream),
+    /// Vertex 的响应是 SSE 文本行（`alt=sse`），按行切帧即可 ——
+    /// 与 responses / anthropic 同族，只是帧内字段路径不同。
+    Vertex(vertex_outbound::ChatFromVertexStream),
 }
 
 impl TranslateMachine {
@@ -796,6 +883,7 @@ impl TranslateMachine {
             Self::Responses(machine) => machine.push(chunk),
             Self::Anthropic(machine) => machine.push(chunk),
             Self::Bedrock(machine) => machine.push(chunk),
+            Self::Vertex(machine) => machine.push(chunk),
         }
     }
 
@@ -804,6 +892,7 @@ impl TranslateMachine {
             Self::Responses(machine) => machine.finish(),
             Self::Anthropic(machine) => machine.finish(),
             Self::Bedrock(machine) => machine.finish(),
+            Self::Vertex(machine) => machine.finish(),
         }
     }
 }
@@ -840,6 +929,9 @@ impl ProtocolTranslateStream {
                 ),
                 OutboundKind::Bedrock => TranslateMachine::Bedrock(
                     bedrock_outbound::ChatFromBedrockStream::new(model),
+                ),
+                OutboundKind::Vertex => TranslateMachine::Vertex(
+                    vertex_outbound::ChatFromVertexStream::new(model),
                 ),
             },
             pending: std::collections::VecDeque::new(),
@@ -983,7 +1075,12 @@ fn rewrite_body(body: &Value, provider_id: &str, requested: &str) -> (Value, Opt
 ///     message（`rotate::mark_account_limited` 会从文案里再解析一次，
 ///     见模块头的说明）；
 ///   - 其余 → 原样透传状态码与上游原文摘要。
-fn classify_custom_error(status: u16, raw: &str, retry_after: Option<&str>) -> GatewayError {
+fn classify_custom_error(
+    status: u16,
+    raw: &str,
+    retry_after: Option<&str>,
+    expect_injection: bool,
+) -> GatewayError {
     let raw = raw.trim();
     let raw = if raw.is_empty() { "上游错误" } else { raw };
     // 仅修正已明确说明的使用范围限制；不把普通权限/额度错误泛化为免费层限制。
@@ -1008,10 +1105,22 @@ fn classify_custom_error(status: u16, raw: &str, retry_after: Option<&str>) -> G
         }
     }
     match status {
-        401 | 403 => GatewayError::with_status(
-            i32::from(status),
-            format!("上游凭证被拒绝（HTTP {status}）: {raw}"),
-        ),
+        401 | 403 => {
+            // 401 的成因有两类，文案要能自证走没走注入代理 —— 否则用户只能
+            // 看到上游的通用「缺少凭据」，猜不到是出口配错（实测最难排的一种：
+            // 账号 proxy 指向 Clash 节点时，请求从节点 IP 直连上游）。
+            let mut message = format!("上游凭证被拒绝（HTTP {status}）: {raw}");
+            // 只对「靠注入代理补凭据」的协议给提示（目前只有 vertex）：
+            // bedrock 用 SigV4 自签、anthropic/responses 发固定头，
+            // 它们 401/403 的成因与「有没有代理」无关，加提示反而误导。
+            if expect_injection {
+                message.push_str(
+                    "
+（诊断：本次请求没有可用的出网代理配置，因此不会有任何凭据注入。                     若目标部署由注入代理替换密钥，请给账号同时配置 proxy（注入代理）                     与 frontProxy（前置节点）。）",
+                );
+            }
+            GatewayError::with_status(i32::from(status), message)
+        }
         429 => {
             let mut message = format!("上游返回 {status}: {raw}");
             // 恢复时间的解析链：Retry-After 头（秒数 / HTTP 日期）→
@@ -1070,7 +1179,7 @@ fn classify_bedrock_error(status: u16, raw: &str, retry_after: Option<&str>) -> 
             ),
         );
     }
-    classify_custom_error(status, raw, retry_after)
+    classify_custom_error(status, raw, retry_after, false)
 }
 
 #[cfg(test)]
@@ -1167,7 +1276,7 @@ mod opencode_error_tests {
             FREE_TIER_RESTRICTION.replace('\'', "’"),
             FREE_TIER_RESTRICTION.replace(' ', "\n  "),
         ] {
-            let error = classify_custom_error(403, &raw, Some("60"));
+            let error = classify_custom_error(403, &raw, Some("60"), false);
             assert_eq!(error.status_code, 403);
             assert!(error.message.contains("OpenCode 免费层使用范围限制"));
             assert!(error.message.contains(&raw));
@@ -1192,7 +1301,7 @@ mod opencode_error_tests {
             "Access denied",
             "",
         ] {
-            let error = classify_custom_error(403, raw, None);
+            let error = classify_custom_error(403, raw, None, false);
             let detail = if raw.is_empty() { "上游错误" } else { raw };
             assert_eq!(error.status_code, 403);
             assert_eq!(error.message, format!("上游凭证被拒绝（HTTP 403）: {detail}"));
@@ -1203,7 +1312,7 @@ mod opencode_error_tests {
     #[test]
     fn opencode_restriction_text_does_not_override_non_403_statuses() {
         for status in [400, 401, 409, 429, 500, 503] {
-            let error = classify_custom_error(status, FREE_TIER_RESTRICTION, None);
+            let error = classify_custom_error(status, FREE_TIER_RESTRICTION, None, false);
             assert_eq!(error.status_code, i32::from(status));
             let expected = if status == 401 {
                 format!("上游凭证被拒绝（HTTP 401）: {FREE_TIER_RESTRICTION}")
@@ -1323,7 +1432,7 @@ mod bedrock_error_tests {
             (429, "Too many requests"),
             (500, "Internal server error"),
         ] {
-            let expected = classify_custom_error(status, raw, None);
+            let expected = classify_custom_error(status, raw, None, false);
             let actual = classify_bedrock_error(status, raw, None);
             assert_eq!(actual.status_code, expected.status_code);
             assert_eq!(actual.message, expected.message);

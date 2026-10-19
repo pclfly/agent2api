@@ -1,6 +1,7 @@
 /**
  * Agent2API · 网络代理页（代理池：列表 / 新增 / 编辑 / 删除 / 启停 / 连通性测试
- * / 同步 Clash Verge / 勾选批量测试与批量删除）。
+ * / 勾选批量测试与批量删除）。Clash 出口同步与订阅导入同在「订阅管理」弹窗里
+ * （见 proxies-sub-view.tsx），页面上不再单列那颗按钮。
  *
  * 对照 OmniProxy 的 ProxiesPage（那张带 CRUD + 测试 + Clash 同步 + 批量的代理表），
  * 存储与解析在 Rust 侧：`core::proxy_pool` 是唯一事实来源（`kv` 的 `proxyPool`
@@ -27,8 +28,9 @@
  *     「订阅管理」弹窗里（见下）。
  *   两种只读来源在「操作」列**只有测试**（外加订阅孤儿的删除）：去哪儿改由只读
  *   开关的悬浮提示说明，不再摆两颗永远点不动的「去 X 改」按钮占地方。
- *   同步有两处触发：进页面时的列表接口（后端自动同步）与面板头的
- *   「同步 Clash Verge」按钮（手动，会报本次变更数）。
+ *   同步有两处触发：进页面时的列表接口（后端自动同步）与「订阅管理」弹窗里的
+ *   「同步 Clash Verge」按钮（手动，会报本次变更数 —— 2026-10 从工具条搬进那个
+ *   弹窗，与订阅摆在一处：两者都是「把外面的出口集合整份镜像进池」）。
  *
  * ── 「启用」列不再只读：本页开关管的是**本端用不用它** ─────────
  * 名称与端口必须跟随来源侧，但「这条本端用不用」是用户自己的事：某条节点常年
@@ -132,7 +134,7 @@ import {
   batchRemove, batchTest, clearSelection, durationText, enableHint,
   formatTime, getSnapshot, isDisabledSubscriptionItem, isMirrorOffItem, isOrphanSubscriptionItem,
   isPicked, isReadonlyPoolItem, isUnprovisionedItem, items, loadPanel, readonlyHint, removeItem,
-  setAllPicked, subscribe, syncClash, testItem, toggleItem, togglePick, wb,
+  setAllPicked, subscribe, testItem, toggleItem, togglePick, wb,
   type ProxyPoolItem,
 } from './proxies-state'
 import {
@@ -156,6 +158,8 @@ function ProxiesPage() {
   const subs = React.useSyncExternalStore(subscribeSubs, getSubSnapshot).data?.items ?? []
   const [modal, setModal] = React.useState<{ item: ProxyPoolItem | null } | null>(null)
   const [settingsOpen, setSettingsOpen] = React.useState(false)
+  /** 窄屏筛选抽屉（见 css/mobile.css 的 .px-filter-group） */
+  const [filterOpen, setFilterOpen] = React.useState(false)
   const [subsOpen, setSubsOpen] = React.useState(false)
   const [kw, setKw] = React.useState('')
   const [srcFilter, setSrcFilter] = React.useState('all')
@@ -473,7 +477,7 @@ function ProxiesPage() {
         <tr>
           <td colSpan={columns.length} className='empty'>
             {ready
-              ? t('还没有代理。点右上角「＋ 新增代理」手填一个，点「同步 Clash Verge」把 Clash 的出口导进来，或在「订阅管理」里导入订阅节点。')
+              ? t('还没有代理。点右上角「＋ 新增代理」手填一个，或在「订阅管理」里导入订阅节点、同步 Clash Verge 的出口。')
               : t('加载中…')}
           </td>
         </tr>
@@ -515,6 +519,22 @@ function ProxiesPage() {
   return (
     <>
       <section className='panel'>
+        {/* 窄屏筛选抽屉的遮罩与标题栏（桌面 display:none，不占位）。
+            四个筛选控件由 CSS 搬进 .px-filter-group，这里只放壳。 */}
+        <div className={cn('px-filter-scrim', filterOpen && 'open')} onClick={() => setFilterOpen(false)} />
+        <div className={cn('px-filter-head', filterOpen && 'open')}>
+          <span className='px-filter-title'>{t('筛选')}</span>
+          <Button variant='ghost' size='sm' className='px-filter-clear'
+            disabled={!kw && vendorFilter === 'all' && srcFilter === 'all' && stFilter === 'all'}
+            onClick={() => {
+              setKw('')
+              pickVendor('all')
+              pickSource('all')
+              setStFilter('all')
+            }}>{t('清空')}</Button>
+          <Button variant='ghost' size='sm' className='px-filter-close'
+            onClick={() => setFilterOpen(false)} aria-label={t('关闭')}>✕</Button>
+        </div>
         <div className='panel-head'>
           <h2>{t('代理池')}</h2>
           <span className='panel-sub'>
@@ -525,6 +545,14 @@ function ProxiesPage() {
               不必等用户看到页脚的 Clash 说明才反应过来 */}
           <span className='text-[11px] text-subtle'>{t('订阅与 Clash 的出口自动镜像进来')}</span>
         <div className='head-actions'>
+          {/* 窄屏「筛选」入口：桌面隐藏（CSS 控制）。角标是生效的筛选条数 */}
+          <button type='button' className='px-filter-open' onClick={() => setFilterOpen(true)}
+            aria-label={t('打开筛选')}>
+            {t('筛选')}
+            {(kw ? 1 : 0) + (vendorFilter !== 'all' ? 1 : 0) + (srcFilter !== 'all' ? 1 : 0) + (stFilter !== 'all' ? 1 : 0) > 0
+              ? <span className='px-filter-badge'>{(kw ? 1 : 0) + (vendorFilter !== 'all' ? 1 : 0) + (srcFilter !== 'all' ? 1 : 0) + (stFilter !== 'all' ? 1 : 0)}</span>
+              : null}
+          </button>
           {/* 设置放在最左：低频配置项（端口范围 / 测试网址），不必挤在主操作旁边。
               弹窗是打开时才读设置（loadSettings 在弹窗内部），这里只负责开门 */}
           <Button variant='outline' disabled={snapshot.batchBusy}
@@ -532,18 +560,12 @@ function ProxiesPage() {
             {t('设置')}
           </Button>
           {/* 订阅管理：订阅表的唯一入口（页面上不再有第二个面板）。
-              带订阅条数 —— 0 条时只写按钮名，免得出现「订阅管理（0）」这种读数 */}
+              带订阅条数 —— 0 条时只写按钮名，免得出现「订阅管理（0）」这种读数。
+              「同步 Clash Verge」也在这个弹窗里（与订阅同属「把外面的出口集合
+              整份镜像进池」，摆在一处），页面上因此不再单列那颗按钮 */}
           <Button variant='outline' disabled={snapshot.batchBusy}
             onClick={() => setSubsOpen(true)}>
             {subs.length ? t('订阅管理（{n}）', { n: subs.length }) : t('订阅管理')}
-          </Button>
-          {/* 同步放在刷新左边：它做的事比「刷新」多一层（把 Clash 的出口集合
-              镜像进池），而进页面时的那次自动同步是静默的 —— 用户想在
-              「我刚在 Clash 里加了出口」之后立刻见效时点它。
-              批量在跑时两个都停：它们会把正在被批量流程改写的列表整份换掉 */}
-          <Button variant='outline' disabled={snapshot.syncing || snapshot.batchBusy}
-            onClick={() => void syncClash()}>
-            {snapshot.syncing ? t('同步中…') : t('同步 Clash Verge')}
           </Button>
           <Button variant='outline' disabled={snapshot.loading || snapshot.batchBusy}
             onClick={() => { void loadPanel(); void loadSection() }}>
@@ -589,8 +611,11 @@ function ProxiesPage() {
           </div>
         </div>
       ) : (
-        /* 内边距与 .batch-bar 的 10px 16px 对齐：两条同高，互为替换时表格不下移 */
-        <div className='flex flex-wrap items-center gap-2.5 border-b border-border px-4 py-[10px]'>
+        /* 内边距与 .batch-bar 的 10px 16px 对齐：两条同高，互为替换时表格不下移。
+           窄屏这四个控件收进右侧抽屉（见 css/mobile.css 的 .px-filter-group），
+           工具条只留一个「筛选」按钮 —— 否则面板头 + 筛选区在 812px 屏上占掉
+           近一半高度，表格只剩 200px 可看。 */
+        <div className={cn('flex flex-wrap items-center gap-2.5 border-b border-border px-4 py-[10px]', 'px-filter-group', filterOpen && 'open')}>
           <InputGroup className='w-[clamp(150px,22vw,220px)]'>
             <InputGroupInput type='search' value={kw} aria-label={t('搜索节点')}
               placeholder={t('搜索名称 / 地址 / 端口')}
@@ -665,8 +690,8 @@ function ProxiesPage() {
         leading={(
           /* 脚注只留**状态**（Clash 没同步上 / 列表读失败）：那两句用法说明
              （出口怎么被账号引用、只读镜像去哪儿改）已经收进各自的入口 ——
-             账号弹窗的「出网代理」、面板头的「订阅管理」与「同步 Clash Verge」，
-             页脚常驻一大段解释只会把读数挤掉 */
+             账号弹窗的「出网代理」、面板头的「订阅管理」（含里面的
+             「同步 Clash Verge」），页脚常驻一大段解释只会把读数挤掉 */
           <>
             {/* Clash 状态常驻在页脚：同步是静默的（进页面自动跑一次），没有这句话时
                 「为什么一条 Clash 条目都没有」只能靠点按钮 + 看 toast 才知道 */}

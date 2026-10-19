@@ -156,6 +156,18 @@ const BRIDGE_JS: &str = r#"
     // 同时跑时界面上一眼能分清。
     title: '__AGENT2API_TITLE__',
 
+    // ── 直连网关的凭证（AI 助手页专用）────────────────────────
+    // 助手页为了流式对话直接 fetch 网关基址、不经桥（见 ui-islands 的
+    // assistant-state.ts）。桌面形态下页面来自 Tauri 自定义协议、网关在
+    // 127.0.0.1:{port}：跨源 + 不带 cookie，那条请求里一个凭证都没有；
+    // 面板认证开启后（设置页开过局域网访问就会注册管理员）会被 401
+    // `panel_login_required` 挡下，界面只能显示「请先登录管理面板」——
+    // 而桌面上并没有登录页。桥的其它方法不受影响，是因为壳统一给它们补了
+    // 第一把 Key（见 gateway::request_builder）；这里把**同一把**交给页面。
+    // 返回 `{ 头名: 值 }`：网页端 shim 的同名方法回面板令牌 / 用户输入的
+    // Key（见 web_shim.rs），助手页对两端一视同仁，只负责合并进请求头。
+    directCredentials: () => invoke('direct_credentials'),
+
     // ── 会话 ──
     getState: () => call('GET', '/api/session'),
     startLogin: (edition, mode, provider, socialRestore) =>
@@ -359,12 +371,34 @@ const BRIDGE_JS: &str = r#"
     testProxy: payload => {
       const body = {};
       if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-        if (typeof payload.id === 'string' && payload.id) body.id = payload.id;
-        // proxy 允许显式 null（测直连），因此按字段存在性判断
+        if (typeof payload.accountId === 'string' && payload.accountId) {
+          body.accountId = payload.accountId;
+          for (const key of ['proxy', 'frontProxy']) {
+            if (Object.prototype.hasOwnProperty.call(payload, key)) body[key] = payload[key];
+          }
+        } else if (typeof payload.id === 'string' && payload.id) body.id = payload.id;
         else if (Object.prototype.hasOwnProperty.call(payload, 'proxy')) body.proxy = payload.proxy;
       }
       return call('POST', '/api/proxies/test', body);
     },
+    // ── Agent（本机 AI 客户端的配置接管）──
+    // 与 `server/src/web_shim.rs` 的同名方法成对存在（教训同上）。契约见
+    // `api::agents` 的模块头：
+    //   · getAgents           全部客户端 + 用户配置 + 安装状态 + 派生读数
+    //   · saveAgentProfiles   保存一个客户端的配置列表（不写客户端文件）
+    //   · applyAgentProfile   写进客户端文件（单配置整段覆写 / 多配置只改
+    //                         enabled），写前自动备份；响应带 `applied`
+    //   · previewAgentProfile 写入预览（不落盘），响应带 `changed` 行号
+    //   · restoreAgentClient  按最近一次备份还原
+    //   · importAgentClient   从客户端现有文件里读回一套配置
+    //   写操作都返回整份 `{clients}`（就地替换，页面不必再拉一次）。
+    getAgents: () => call('GET', '/api/agents'),
+    saveAgentProfiles: payload => call('POST', '/api/agents/profiles', payload || {}),
+    applyAgentProfile: payload => call('POST', '/api/agents/apply', payload || {}),
+    previewAgentProfile: payload => call('POST', '/api/agents/preview', payload || {}),
+    restoreAgentClient: payload => call('POST', '/api/agents/restore', payload || {}),
+    importAgentClient: payload => call('POST', '/api/agents/import', payload || {}),
+
     // ── 代理池（「网络代理」页）──
     // 与 `server/src/web_shim.rs` 的同名方法成对存在（那个文件是 headless
     // 面板的桥）：只加一边时，另一形态下的页面会报「桥接方法缺失」——
@@ -587,6 +621,11 @@ const BRIDGE_JS: &str = r#"
     // WorkBuddy 国际版日活保活的模型链（读 / 存；与 web_shim.rs 的同名方法成对）
     getCheckinKeepalive: () => call('GET', '/api/checkin-keepalive'),
     saveCheckinKeepalive: models => call('POST', '/api/checkin-keepalive', { models }),
+    // 猫猫旅行定时排程（国内版）：读 / 存开关与时刻 / 立即巡检全部
+    // （与 web_shim.rs 的同名方法成对；调度体在 core::growth_scheduler）
+    getTravelSchedule: () => call('GET', '/api/travel-schedule'),
+    saveTravelSchedule: patch => call('POST', '/api/travel-schedule', patch),
+    runTravelScheduleNow: () => call('POST', '/api/travel-schedule/run', {}),
     // WorkBuddy 国际版日活任务的手动粒度入口（mode: full | claim | keepalive）
     runCheckinActivity: (id, mode) => call('POST', '/api/checkin-activity', { id, mode }),
     // 签到中心的聚合快照（每日签到分组 / 自动签到设置 / 签到历史 / 一次性项入口），
@@ -639,6 +678,11 @@ const BRIDGE_JS: &str = r#"
     // 写传 {token: '…' | null}（null = 清除）。加密落库在后端做
     getUpdateToken: () => call('GET', '/api/update/token'),
     setUpdateToken: payload => call('POST', '/api/update/token', payload),
+    // 「加入 beta 版」：读只报 {enabled}，写传 {enabled: true|false}。
+    // 打开后更新检查把 GitHub 的预发布版一并纳入候选（后端下一次检查就换通道）；
+    // 写响应带 saved（false = 本次运行已生效、重启会回到原通道）
+    getUpdateBeta: () => call('GET', '/api/update/beta'),
+    setUpdateBeta: payload => call('POST', '/api/update/beta', payload),
     downloadUpdate: payload => invoke('download_update', {
       url: String((payload && payload.url) || ''),
       name: (payload && payload.name) ? String(payload.name) : null,
@@ -654,6 +698,13 @@ const BRIDGE_JS: &str = r#"
     getSanitize: () => call('GET', '/api/sanitize'),
     saveSanitize: enabled =>
       call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true }),
+
+    // ── 开发者角色兼容开关 ──
+    // 与 getSanitize / saveSanitize 同形：GET 读、PUT 写，响应体就是新状态。
+    // 与 web_shim.rs 的同名方法逐字同形（漏一侧的症状见下面 getCors 那段）。
+    getDeveloperRoleCompat: () => call('GET', '/api/developer-role-compat'),
+    saveDeveloperRoleCompat: enabled =>
+      call('PUT', '/api/developer-role-compat', { developerRoleCompat: enabled === true }),
 
     // ── Cline 伪装头 ──
     // 与 getSanitize / saveSanitize 同形：GET 读（overrides + effective），
@@ -711,7 +762,7 @@ const BRIDGE_JS: &str = r#"
     exportLogs: () => invoke('export_logs'),
 
     // ── 请求统计报表 / 数据保留 ──
-    // range 只认 today / 7 / 30 / month / all / custom，非法值由后端返回 400
+    // range 只认 today / yesterday / 7 / 30 / month / all / custom，非法值由后端返回 400
     // （不在这里静默改口径：界面选了什么就该拿到什么，报错比默默换区间好排查）。
     // dates（`{start, end}`，`YYYY-MM-DD`）**只在 range=custom 时**给：
     // 后端对 custom 会强制要求这两个参数，其余档位带上反而是噪音

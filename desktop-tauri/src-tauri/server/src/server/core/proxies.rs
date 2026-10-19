@@ -143,10 +143,16 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
             Some(Value::Bool(flag)) => *flag,
             Some(_) => return Err(ProxyConfigError::new("轮询的 all 必须是布尔值")),
         };
+        let failure_mode = match object.get("failureMode").and_then(Value::as_str) {
+            None if !object.contains_key("failureMode") => "smart",
+            Some("smart") => "smart",
+            Some("all_errors") => "all_errors",
+            _ => return Err(ProxyConfigError::new("轮询的 failureMode 必须是 smart 或 all_errors")),
+        };
         if all {
             // 「全部」恒不带 proxyIds：留着它会让「以后池里新增的条目要不要进轮询」
             // 变成一个没人回答的问题（两处状态取谁为准）。归一即收口成唯一形态
-            return Ok(Some(json!({ "source": ROTATE_SOURCE, "all": true })));
+            return Ok(Some(json!({ "source": ROTATE_SOURCE, "all": true, "failureMode": failure_mode })));
         }
         let mut ids: Vec<String> = Vec::new();
         if let Some(items) = object.get("proxyIds") {
@@ -173,6 +179,7 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
             "source": ROTATE_SOURCE,
             "all": false,
             "proxyIds": ids,
+            "failureMode": failure_mode,
         })));
     }
 

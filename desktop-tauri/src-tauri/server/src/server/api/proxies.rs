@@ -33,7 +33,7 @@ use axum::body::Bytes;
 use axum::response::Response;
 use serde_json::{json, Value};
 
-use crate::server::core::egress;
+use crate::server::core::{custom_providers, egress};
 use crate::server::core::proxies::{normalize_account_proxy, ResolvedProxy};
 use crate::server::core::proxy_pool;
 use crate::server::core::proxy_settings;
@@ -95,12 +95,14 @@ pub async fn list_proxies(state: &ServerState) -> Response {
 
 /// 出网连通性测试（对照 account-routes.mjs 的 tryHandleProxies test 分支）。
 ///
-/// 两种用法：
+/// 三种用法：
+///   `{ accountId, proxy?, frontProxy? }` 测自定义账号实际上游与完整代理链；
+///     有键用草稿（null 清除），缺键读存量；TLS 只读取提供商设置。
 ///   `{ id }`     测该账号的出网代理（账号不存在 → 404；代理解析失败 → 400）
 ///   `{ proxy }`  测临时配置（含 `proxy: null` = 测直连）
 ///
-/// 判据是「能否连上 WorkBuddy 上游」，而不是能否访问第三方站点（理由见
-/// `core::egress::test_connectivity` 的注释）；出口 IP 是附加信息。
+/// 旧模式判据是「能否连上配置的测试上游」（默认 WorkBuddy），出口 IP 是附加信息；
+/// 新模式只 GET 账号目标 origin，不查 IP，结果另带 targetUrl/tlsVerification/chained。
 /// 响应固定 200 + `{success, status?, ip?, durationMs, error?, proxy}` ——
 /// **测试失败也是 200**（`success:false` + error 文案），前端据此显示红色提示。
 pub async fn test_proxy(state: &ServerState, body: &Bytes) -> Response {
@@ -108,6 +110,10 @@ pub async fn test_proxy(state: &ServerState, body: &Bytes) -> Response {
         Ok(value) => value,
         Err(_) => return management_error(400, "请求内容不是有效 JSON"),
     };
+    // 键存在就进入新模式；非法 accountId 不能落回旧模式测直连。
+    if payload.get("accountId").is_some() {
+        return test_account_proxy(state, &payload).await;
+    }
     let mut proxy: Option<crate::server::core::proxies::ResolvedProxy> = None;
     if let Some(id) = payload
         .get("id")
@@ -167,6 +173,144 @@ pub async fn test_proxy(state: &ServerState, body: &Bytes) -> Response {
     ok_json(data)
 }
 
+/// 新模式只测试该自定义账号的实际上游根地址，不发送模型请求或账号凭证。
+async fn test_account_proxy(state: &ServerState, payload: &Value) -> Response {
+    let Some(id) = payload.get("accountId").and_then(Value::as_str).filter(|id| !id.trim().is_empty()) else {
+        return management_error(400, "accountId 必须是非空字符串");
+    };
+    // 不用 custom_credential_by_id：其代理解析失败会丢失错误并返回 None。
+    // 公开形态保留原始 config，且未启用/未填 Key 的账号也可以做连通性测试。
+    let snapshot = state.store().list_accounts();
+    let Some(account) = snapshot.get("accounts").and_then(Value::as_array)
+        .and_then(|accounts| accounts.iter().find(|account| account.get("id").and_then(Value::as_str) == Some(id))) else {
+        return management_error(404, "账号不存在");
+    };
+    let Some(provider_id) = state.store().custom_account_provider(id) else {
+        return management_error(400, "accountId 必须指向自定义提供商账号");
+    };
+    let Some(provider) = custom_providers::get(&provider_id) else {
+        return management_error(404, "该账号的自定义提供商不存在");
+    };
+    let (target_url, accept_any_cert) = match account_test_target(account, &provider) {
+        Ok(target) => target,
+        Err(error) => return management_error(400, error),
+    };
+    let resolve = |key| -> Result<Option<ResolvedProxy>, String> {
+        let config = account_test_proxy_config(payload, account, key)?;
+        let Some(config) = config else { return Ok(None) };
+        use crate::server::core::proxies::{resolve_account_proxy, ProxyResolution};
+        match resolve_account_proxy(Some(&config)) {
+            Some(ProxyResolution::Resolved(proxy)) => Ok(Some(proxy)),
+            Some(ProxyResolution::Failed(error)) => Err(format!("{key}: {error}")),
+            None => Err(format!("{key}: 已配置代理但未解析出出口，测试已停止")),
+        }
+    };
+    let proxy = match resolve("proxy") {
+        Ok(proxy) => proxy,
+        Err(error) => return management_error(400, error),
+    };
+    let front = match resolve("frontProxy") {
+        Ok(proxy) => proxy,
+        Err(error) => return management_error(400, error),
+    };
+    if let Err(error) = egress::validate_account_route(proxy.as_ref(), front.as_ref()) {
+        return management_error(400, error);
+    }
+    ok_json(egress::test_account_route(proxy.as_ref(), front.as_ref(), &target_url, accept_any_cert).await)
+}
+
+/// 纯函数：草稿按「是否有键」覆盖存量；null 清除，缺键才读公开形态的 config。
+/// 非 null 的公开代理必须携带非空 config，绝不把「未知/解析失败」当成直连。
+fn account_test_proxy_config(payload: &Value, account: &Value, key: &str) -> Result<Option<Value>, String> {
+    let input = if let Some(draft) = payload.get(key) {
+        draft
+    } else {
+        match account.get(key) {
+            None | Some(Value::Null) => return Ok(None),
+            Some(public) => {
+                let config = public.get("config").filter(|config| !config.is_null())
+                    .ok_or_else(|| format!("{key}: 存量代理缺少原始 config，测试已停止"))?;
+                config
+            }
+        }
+    };
+    if input.is_null() {
+        return Ok(None);
+    }
+    // normalize 的旧语义接受空字符串作直连；新模式只有显式 null 能清除代理。
+    if !input.is_object() {
+        return Err(format!("{key}: 代理配置必须是对象或 null"));
+    }
+    normalize_account_proxy(input).map_err(|error| format!("{key}: {error}"))
+}
+
+/// 纯函数：与 forward 的 baseUrl 覆盖优先级和 Vertex TLS 开关一致。
+/// 只保留 origin + '/'，丢掉 URL userinfo/path/query/fragment，避免携带凭证。
+fn account_test_target(account: &Value, provider: &Value) -> Result<(String, bool), String> {
+    let base = match account.get("baseUrl") {
+        None | Some(Value::Null) => provider.get("baseUrl"),
+        Some(Value::String(value)) if value.is_empty() => provider.get("baseUrl"),
+        Some(value) => Some(value),
+    }.and_then(Value::as_str).ok_or_else(|| "该账号或提供商没有有效的 baseUrl".to_string())?;
+    let url = url::Url::parse(base.trim()).map_err(|_| "baseUrl 不是合法的 HTTP/HTTPS URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || url.port() == Some(0) {
+        return Err("baseUrl 必须是有效的 HTTP/HTTPS URL".to_string());
+    }
+    let insecure = provider.get("protocol").and_then(Value::as_str) == Some(custom_providers::PROTOCOL_VERTEX)
+        && provider.get("insecureTls").and_then(Value::as_bool) == Some(true);
+    Ok((format!("{}/", url.origin().ascii_serialization()), insecure))
+}
+
+#[cfg(test)]
+mod account_route_config_tests {
+    use super::*;
+
+    fn config(port: u16) -> Value {
+        json!({"source": "custom", "protocol": "http", "host": "127.0.0.1", "port": port})
+    }
+
+    #[test]
+    fn draft_presence_overrides_saved_config_independently() {
+        let account = json!({"proxy": {"config": config(8001)}, "frontProxy": {"config": config(8002)}});
+        for key in ["proxy", "frontProxy"] {
+            assert_eq!(account_test_proxy_config(&json!({}), &account, key).unwrap().unwrap()["port"], account[key]["config"]["port"]);
+            assert!(account_test_proxy_config(&json!({key: null}), &account, key).unwrap().is_none());
+            assert_eq!(account_test_proxy_config(&json!({key: config(8003)}), &account, key).unwrap().unwrap()["port"], 8003);
+        }
+        assert!(account_test_proxy_config(&json!({"proxy": null}), &account, "frontProxy").unwrap().is_some());
+        assert!(account_test_proxy_config(&json!({}), &json!({}), "proxy").unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_saved_and_draft_values_fail_closed() {
+        for key in ["proxy", "frontProxy"] {
+            for public in [json!({}), json!({"error": "missing pool"}), json!({"config": null}), json!({"config": ""}), json!({"config": {"source": "unknown"}})] {
+                assert!(account_test_proxy_config(&json!({}), &json!({key: public}), key).is_err());
+                // 草稿能修复损坏的存量，不能先被存量 error 拦住。
+                assert!(account_test_proxy_config(&json!({key: config(8080)}), &json!({key: public}), key).is_ok());
+            }
+            for draft in [json!(""), json!(false), json!([]), json!({}), json!({"source": "custom", "host": "127.0.0.1", "port": 0})] {
+                assert!(account_test_proxy_config(&json!({key: draft}), &json!({}), key).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn target_is_origin_only_and_tls_is_provider_vertex_bool_only() {
+        for (protocol, flag, expected) in [("vertex", json!(true), true), ("vertex", json!("true"), false), ("vertex", json!(false), false), ("anthropic", json!(true), false), ("VERTEX", json!(true), false)] {
+            let provider = json!({"protocol": protocol, "insecureTls": flag, "baseUrl": "https://provider.invalid/v1?key=secret"});
+            assert_eq!(account_test_target(&json!({}), &provider).unwrap(), ("https://provider.invalid/".to_string(), expected));
+            let account = json!({"baseUrl": "http://user:secret@[::1]:8080/v1?token=secret#fragment", "insecureTls": true});
+            assert_eq!(account_test_target(&account, &provider).unwrap(), ("http://[::1]:8080/".to_string(), expected));
+        }
+        let provider = json!({"baseUrl": "https://provider.invalid/v1"});
+        for base in [json!(true), json!("invalid"), json!("file:///tmp/test"), json!("https://host.invalid:0/")] {
+            assert!(account_test_target(&json!({"baseUrl": base}), &provider).is_err());
+        }
+        assert!(!account_test_target(&json!({"insecureTls": true}), &provider).unwrap().1);
+    }
+}
+
 // ─── 代理池（「网络代理」页）─────────────────────────────────
 
 /// 引用统计：`proxyId → [{id, name}]`（引用它的账号）。
@@ -188,20 +332,17 @@ fn pool_references(state: &ServerState) -> std::collections::HashMap<String, Vec
         return references;
     };
     for account in accounts {
-        let Some(config) = account.get("proxy").and_then(|proxy| proxy.get("config")) else {
-            continue;
-        };
-        let ids: Vec<String> = if crate::server::core::proxies::is_rotate_config(config) {
-            crate::server::core::proxy_rotate::candidate_ids(config)
-        } else if config.get("source").and_then(Value::as_str) == Some("pool") {
-            config
-                .get("proxyId")
-                .and_then(Value::as_str)
-                .map(|id| vec![id.to_string()])
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let mut ids = std::collections::HashSet::new();
+        for key in ["proxy", "frontProxy"] {
+            let Some(config) = account.get(key).and_then(|proxy| proxy.get("config")) else { continue; };
+            if crate::server::core::proxies::is_rotate_config(config) {
+                ids.extend(crate::server::core::proxy_rotate::candidate_ids(config));
+            } else if config.get("source").and_then(Value::as_str) == Some("pool") {
+                if let Some(id) = config.get("proxyId").and_then(Value::as_str) {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
         let entry = json!({
             "id": account.get("id").cloned().unwrap_or(Value::Null),
             // 统一展示名优先（与列表接口同一取舍，见上面的说明）
@@ -409,11 +550,12 @@ pub async fn pool_remove(state: &ServerState, body: &Bytes) -> Response {
 /// 订阅节点的地址是本机内核起的监听端口，`enabled` 若只写一个标记，端口会继续
 /// 开着 —— 而用户禁用一条节点往往正是为了**不要那个端口**。所以两个方向都要
 /// 让内核跟上，判据都是「真实的缺口」而不是「用户点了什么」：
-///   · 禁用 → 缺口是「已禁用 ∧ 端口还开着」，请求内核重建配置（新配置里没有
-///     这条监听器，进程重启即端口关闭），端口由重启后的节点同步写回 null；
-///   · 启用 → 缺口是「启用 ∧ 被账号引用 ∧ 没有端口」，走补建链路
-///     （`provision_missing_listeners`，与账号保存收尾同一条路）。
-/// 没缺口就不投重启命令，于是重复点击 / 反复开关都不会排出一串多余的重建。
+///   · 禁用 → 缺口是「端口还开着但已不该开」（禁用 / 失去引用），请求内核
+///     重建配置（新配置里没有这条监听器，进程重启即端口关闭），端口由重启后
+///     的节点同步写回 null；
+///   · 启用 → 缺口是「启用 ∧ 被账号引用 ∧ 没有端口」，走补建链路。
+/// 两个方向都走同一个对账入口（`reconcile_listeners`，与账号保存收尾同一条
+/// 路），没缺口就不投重启命令 —— 重复点击 / 反复开关都不会排出一串多余的重建。
 ///
 /// 响应里的 `listener` 说明这次要不要盯一会儿端口（manual / clash 恒 `none`）：
 ///   `none`    没有本机端口要动；
@@ -473,32 +615,27 @@ fn listener_flow(state: &ServerState, id: &str, change: &proxy_pool::EnabledChan
         if !proxy_pool::needs_listener(id, &borrowed) {
             return "none";
         }
-        return if provision_missing_listeners(state) { "opening" } else { "none" };
+        // 对账（补建方向）。返回 false 只有两种情况：这条其实没缺口（上面
+        // 已挡）/ 手动关闭闩置位（对账记了日志，「启动内核」时按 wanted
+        // 一并补上）—— 都不该报 opening 让前端白轮询
+        if reconcile_listeners(state) {
+            "opening"
+        } else {
+            "none"
+        }
+    } else {
+        // 禁用：对账（回收方向）—— 缺口判据是 reconcile 的 stale 检测
+        // （不在 wanted 里却还挂着端口：刚禁用的这条、先前遗留的、
+        // 失去引用的都算），内核没装则无端口可收
+        if !sub_kernel::installed() {
+            return "none";
+        }
+        if reconcile_listeners(state) {
+            "closing"
+        } else {
+            "none"
+        }
     }
-    // 禁用：还有端口开着才需要重建（判据是**全部**禁用中且有端口的条目，
-    // 不只是刚点的这条 —— 这样「内核没来得及重建就又被关掉」的遗留也能收掉）
-    let stale = proxy_pool::disabled_subscription_ids_with_ports();
-    if stale.is_empty() || !sub_kernel::installed() {
-        return "none";
-    }
-    // 手动关闭闩：内核已停着，端口本来就全下线了 —— 禁用标志已落库，下次
-    // 「启动内核」重建配置时自然不带这些端口，不必为关端口把内核拉起来
-    if sub_kernel::is_manually_halted() {
-        logging::log(
-            "[Proxies]",
-            "内核已手动关闭 —— 禁用已记录，「启动内核」后端口不再开",
-        );
-        return "none";
-    }
-    sub_kernel::request_restart(crate::server::core::subscriptions::enabled_provider_inputs());
-    logging::log(
-        "[Proxies]",
-        &format!(
-            "🔄 已请求内核重建（关闭 {} 个被禁用节点的监听端口）",
-            stale.len()
-        ),
-    );
-    "closing"
 }
 
 /// POST /api/proxies/pool/test（测一条池条目，结果记进条目）
@@ -630,63 +767,67 @@ pub async fn settings_save(body: &Bytes) -> Response {
 
 // ─── 节点监听器补建（lazy listeners 的触发点）───────────────
 
-/// 给「需要监听器但还没有端口」的订阅节点补建监听器（lazy listeners 的触发点）。
+/// 监听器对账：把「该开的监听器」与「池里条目的端口状态」收敛一致
+/// （lazy listeners 的**双向**触发点）。
 ///
-/// 「需要」= **账号引用**（`proxy_pool::listener_node_keys`，禁用中的不算），
-/// 与内核侧 `allocate_listeners` 用同一个口径 —— 口径不一致会出现「这里说没缺口、
-/// 内核却不建」这类谁也解释不清的状态。lazy 的语义是「内核只为需要的节点开
-/// 监听器」；引用动作发生在账号保存时，启用一条还没有端口的节点也走这里
-/// （`pool_enable` 的 opening 分支）。测试**不在其中** —— 测试走统一测试口，
-/// 不需要端口（见 `pool_test` 与 `sub_kernel::runtime::select_test_node`）。
-/// 本函数是一个**幂等的重启请求**，只在确实有缺口（需要 ∧ 无端口）时才投
-/// 命令，重复调用无害。
+/// 该开的集合 `wanted` = **账号引用 ∩ 启用中的订阅节点**
+/// （`proxy_pool::listener_node_keys`，与内核侧 `allocate_listeners` 同口径
+/// —— 口径不一致会出现「这里说没缺口、内核却不建」这类谁也解释不清的状态）。
+/// 两个方向的缺口各检测各的：
+///   · **待补建**：在 wanted 里、条目端口还是 null（新增引用 / 刚启用）；
+///   · **待回收**：不在 wanted 里、条目端口还挂着值（失去引用 / 被禁用 /
+///     订阅侧关掉）—— 内核重建时不再给它开监听器，端口随重建一起关。
+/// 任一方向非空就投一次重启（重建按 wanted 全量重算，一次同时干两件事）；
+/// 没缺口不投，重复调用无害 —— 这是调用方敢在每次账号写操作后都调它的前提。
+/// 测试**不在其中** —— 测试走统一测试口，不需要端口（见 `pool_test` 与
+/// `sub_kernel::runtime::select_test_node`）。
 ///
 /// 调用方：
-///   · 账号保存链路（`api::accounts` 的写操作收尾）—— 引用变化后自动补；
-///   · `pool_enable`（启用一条被引用却还没有端口的订阅节点）。
+///   · 账号写操作收尾（`api::accounts` 的 add / update / 批量 / 删除）——
+///     引用变化后补缺与回收；
+///   · `pool_enable`（启用 / 禁用一条订阅节点后的联动）。
 ///
-/// 返回是否投了重启命令：true 时节点端口要等内核重建完成才有值，前端轮询
+/// 手动关闭闩置位时只记日志不投命令：用户刚按过「关闭内核」，保存引用不能
+/// 把它悄悄带起来 —— 「启动内核」重建时同样按 wanted 全量分配，缺口自然收敛。
+///
+/// 返回是否投了重启命令：true 时节点端口要等内核重建完成才有终值，前端轮询
 /// 列表即可。同步版（投命令是 mpsc send，无需 await）—— 账号写操作收尾在
 /// 持锁路径的边缘调用它，不想为它包一层 spawn。
-pub fn provision_missing_listeners(state: &ServerState) -> bool {
+pub fn reconcile_listeners(state: &ServerState) -> bool {
     let pool_ids = state.store().referenced_pool_ids();
     let borrowed: std::collections::HashSet<&str> =
         pool_ids.iter().map(String::as_str).collect();
     let wanted = proxy_pool::listener_node_keys(&borrowed);
-    let missing = if wanted.is_empty() {
-        Vec::new()
-    } else {
-        proxy_pool::subscription_entries_with_ports()
-            .into_iter()
-            .filter(|(provider_id, node, port)| {
-                port.is_none() && wanted.contains(&format!("{provider_id}::{node}"))
-            })
-            .collect::<Vec<_>>()
-    };
-    if missing.is_empty() {
+    let mut missing = 0usize;
+    let mut stale = 0usize;
+    for (provider_id, node, port) in proxy_pool::subscription_entries_with_ports() {
+        // key 形态与 `listener_node_keys` 的构造处一致（`{providerId}::{node}`）
+        match (wanted.contains(&format!("{provider_id}::{node}")), port) {
+            (true, None) => missing += 1,
+            (false, Some(_)) => stale += 1,
+            _ => {}
+        }
+    }
+    if missing == 0 && stale == 0 {
         return false;
     }
-    // 手动关闭闩：用户刚点过「关闭内核」，保存引用不悄悄把内核带起来 ——
-    // 缺口记在这条日志里，「启动内核」重建配置时会把这些监听器一并建出来
+    // 手动关闭闩：用户刚点过「关闭内核」，这里不悄悄把它带起来 —— 缺口
+    // 记在这条日志里，「启动内核」重建配置时按最新引用一并收敛
     if sub_kernel::is_manually_halted() {
         logging::log(
             "[Proxies]",
             &format!(
-                "内核已手动关闭 —— {} 个被引用节点的监听器暂不补建，「启动内核」后自动补上",
-                missing.len()
+                "内核已手动关闭 —— 监听器对账暂缓（{missing} 个待补建 / {stale} 个待回收），「启动内核」时按最新引用重算"
             ),
         );
         return false;
     }
-    // 有缺口才重启内核（重建配置把缺的监听器建出来）。内核未安装时投命令
-    // 也无害（restart 早退在「未安装」上，见 `sub_kernel` worker 的说明）。
+    // 有缺口才重启内核（重建配置把缺的建出来、多的收掉）。内核未安装时投
+    // 命令也无害（restart 早退在「未安装」上，见 `sub_kernel` worker 的说明）。
     sub_kernel::request_restart(crate::server::core::subscriptions::enabled_provider_inputs());
     logging::log(
         "[Proxies]",
-        &format!(
-            "🔄 检测到 {} 个被引用的订阅节点还没有监听器，已请求内核补建",
-            missing.len()
-        ),
+        &format!("🔄 监听器对账：{missing} 个待补建 / {stale} 个待回收，已请求内核重建"),
     );
     true
 }

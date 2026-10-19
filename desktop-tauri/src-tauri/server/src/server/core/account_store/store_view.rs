@@ -87,6 +87,23 @@ impl AccountStore {
                     .unwrap_or(false),
             ),
         );
+        // 「需要重新登录」标记（issue #215）：上游注销了会话、refresh token 一并
+        // 作废时由刷新链路落。界面据此把「刷新失败」显示成「需要重新登录」——
+        // 两者对用户的下一步动作完全不同（前者再点一次，后者必须去登录）。
+        // 键恒在（false 表示正常），前端不必判「键缺失」。
+        public.insert(
+            "needsRelogin".to_string(),
+            Value::Bool(
+                fields
+                    .get("needsRelogin")
+                    .map(js_truthy)
+                    .unwrap_or(false),
+            ),
+        );
+        public.insert(
+            "needsReloginReason".to_string(),
+            value_or(fields.get("needsReloginReason"), Value::String(String::new())),
+        );
         public.insert(
             "prefixPath".to_string(),
             value_or_nullish(
@@ -191,36 +208,25 @@ impl AccountStore {
     /// listeners 只剩「测试钉住」在撑，统一测试口上线、pinned 退役后暴露
     /// （所有被引用的节点都拿不到监听端口，地址列全红）。
     ///
-    /// ── 轮询档（rotate）怎么算 ──────────────────────────────────
-    /// 它引用的条目**随时可能被取用**，所以整个候选集合都算「在用」：
-    /// `all: true` 时把池里全部启用条目的 id 都返回（轮询的语义就是「池里每个
-    /// 启用的出口都可能轮到」，漏掉的那部分会在取用时因「未分配端口」被跳过，
-    /// 等于轮询范围被悄悄缩小）；指定档返回它列出的 id（不存在的条目查不出
-    /// 节点，天然跳过）。这一条判据实现复用 `proxy_rotate::candidate_ids` ——
-    /// 「哪些条目可能被用到」在取用与预建监听器两处必须是同一个答案。
+    /// 轮询候选不算持久引用；未分配节点仅在转发失败后按需开独立临时端口。
     pub fn referenced_pool_ids(&self) -> std::collections::HashSet<String> {
         let _guard = self.guard();
         let state = self.load(&_guard);
         let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for record in &state.accounts {
             let proxy = record.proxy();
-            // 原始形态优先；带 `config` 包装的（老版本落库的展示形态）取里层
-            let config = proxy
-                .get("config")
-                .filter(|value| value.is_object())
-                .unwrap_or(&proxy);
-            if config.get("source").and_then(Value::as_str) == Some("pool") {
-                if let Some(id) = config
-                    .get("proxyId")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                {
-                    ids.insert(id.to_string());
+            // Both fixed hops need persistent listeners; rotating exits still use leases.
+            for proxy in [Some(&proxy), record.get("frontProxy")] .into_iter().flatten() {
+                // Accept legacy public wrappers as well as normalized stored values.
+                let config = proxy.get("config").filter(|value| value.is_object()).unwrap_or(proxy);
+                if config.get("source").and_then(Value::as_str) == Some("pool") {
+                    if let Some(id) = config.get("proxyId").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                        ids.insert(id.to_string());
+                    }
                 }
             }
-            if crate::server::core::proxies::is_rotate_config(config) {
-                ids.extend(crate::server::core::proxy_rotate::candidate_ids(config));
-            }
+            // Rotate candidates are not persistent listener references. Their unopened
+            // subscription nodes are provisioned one at a time by independent leases.
         }
         ids
     }
@@ -406,6 +412,11 @@ impl AccountStore {
         };
         match shaped {
             Value::Object(mut fields) => {
+                // 前置跳与出口代理共用展示形态：缺省为 null，池引用保留 config 中的 id。
+                fields.insert(
+                    "frontProxy".to_string(),
+                    describe_account_proxy(record.get("frontProxy")),
+                );
                 fields.insert(
                     "hasCredentials".to_string(),
                     Value::Bool(record.has_credentials()),

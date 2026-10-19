@@ -118,21 +118,31 @@ const DIRECT_KEY: &str = "__direct__";
 /// 固定的（reqwest 没有逐请求改它们的入口），配置一改必须建新 Client ——
 /// 把值放进键里，「改设置 → 下一次取用自动命中新键 → 新客户端」就是自然结果，
 /// 旧值对应的条目由 LRU 淘汰（在途请求仍持着旧 Client 的 Arc 跑完）。
-fn cache_key(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> String {
+/// 缓存键：`协议://主机:端口`（不含凭证）+ 超时 + TLS 模式。
+///
+/// `accept_any_cert` 进键是必需的：宽松与严格两个客户端各占一条缓存条目
+/// （否则先到的那个会顶掉另一个，同出口的两类协议互相干扰）。
+fn cache_key_with_tls(
+    proxy: Option<&ResolvedProxy>,
+    timeouts: &TimeoutSettings,
+    accept_any_cert: bool,
+) -> String {
     let egress = match proxy {
         None => DIRECT_KEY.to_string(),
-        Some(proxy) => format!(
-            "{}://{}:{}",
-            proxy.protocol,
-            proxy.host,
-            proxy.port.map(|port| port.to_string()).unwrap_or_else(|| "?".to_string())
-        ),
+        Some(proxy) => {
+            use sha2::{Digest, Sha256};
+            let identity = serde_json::to_vec(&(&proxy.source, &proxy.username, &proxy.password)).unwrap_or_default();
+            let auth = Sha256::digest(identity);
+            format!("{}://{}:{}|{:x}", proxy.protocol, proxy.host,
+                proxy.port.map(|port| port.to_string()).unwrap_or_else(|| "?".to_string()), auth)
+        },
     };
     // 两项传输层超时进键：见上面的说明
     format!(
-        "{egress}|c{}|r{}",
+        "{egress}|c{}|r{}|tls{}",
         timeouts.connect_ms(),
-        timeouts.read_timeout_backstop_ms()
+        timeouts.read_timeout_backstop_ms(),
+        if accept_any_cert { "any" } else { "verify" }
     )
 }
 
@@ -220,23 +230,28 @@ fn base_builder(timeouts: &TimeoutSettings) -> reqwest::ClientBuilder {
 /// 反过来，构造**直连** Client 时必须显式 `.no_proxy()`：reqwest 默认会去读
 /// 环境变量里的代理设置，不关掉的话用户机器上设了 `HTTPS_PROXY` 就会
 /// 「配置为直连却走了代理」。
-fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Result<reqwest::Client, String> {
-    build_client_with(proxy, timeouts, false)
-}
-
-/// [`build_client`] 的本体：`no_redirect` 为真时**不自动跟随 3xx**。
+/// 显式出口的 Client 构造本体。
 ///
-/// 为什么需要这个开关：多步登录链路（商汤日日新的 OAuth2 + PKCE，见
-/// `providers::custom::sensenova_auth`）要自己读每一步的 `Location` 与
-/// `Set-Cookie`，自动跟转会把这些中间响应吞掉。reqwest 0.12 的跳转策略只能
-/// 在建 Client 时定（`RequestBuilder` 上没有逐请求的 `redirect()`），
-/// 所以它做成一个构造开关而不是请求参数。
+/// 两个开关：
+///   - `no_redirect`：**不自动跟随 3xx**。多步登录链路（商汤日日新的 OAuth2 +
+///     PKCE，见 `providers::custom::sensenova_auth`）要自己读每一步的 `Location`
+///     与 `Set-Cookie`，自动跟转会把这些中间响应吞掉。reqwest 0.12 的跳转策略
+///     只能在建 Client 时定（`RequestBuilder` 上没有逐请求的 `redirect()`），
+///     所以它做成一个构造开关而不是请求参数。
+///   - `accept_any_cert`：**不校验证书链**。唯一用途是上游经 MITM 型出网代理
+///     （它现签证书才能解密并注入凭证）。调用面见 `client_for_with_tls`。
 fn build_client_with(
     proxy: Option<&ResolvedProxy>,
     timeouts: &TimeoutSettings,
     no_redirect: bool,
+    accept_any_cert: bool,
 ) -> Result<reqwest::Client, String> {
     let mut builder = base_builder(timeouts);
+    if accept_any_cert {
+        // 唯一的安全降级点：只由 vertex 协议的 `insecureTls` 走到这里，
+        // 见 `client_for_with_tls` 的说明。
+        builder = builder.danger_accept_invalid_certs(true);
+    }
     if no_redirect {
         builder = builder.redirect(reqwest::redirect::Policy::none());
     }
@@ -254,9 +269,6 @@ fn build_client_with(
             // Proxy::all 返回 Result：release 是 panic=abort，绝不能用 unwrap
             let parsed = reqwest::Proxy::all(&url)
                 .map_err(|error| format!("代理地址无效（{}）: {error}", describe_proxy(proxy)))?;
-            // reqwest 从 URI 里解析用户名/密码作为 basic auth（build_proxy_url 已编码），
-            // http/socks5 两种协议都支持；这里不再单独调 basic_auth，
-            // 免得两个来源的凭证打架
             builder = builder.proxy(parsed);
         }
     }
@@ -300,7 +312,7 @@ fn build_system_proxy_client(timeouts: &TimeoutSettings) -> Result<reqwest::Clie
 /// 但错误会如实回到用户面前 —— 硬约束是绝不 panic（release 是 panic=abort）。
 pub fn client_without_redirects(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
     let timeouts = crate::server::config::timeout_settings();
-    match build_client_with(proxy, &timeouts, true) {
+    match build_client_with(proxy, &timeouts, true, false) {
         Ok(client) => Arc::new(client),
         Err(error) => {
             logging::log(
@@ -346,9 +358,30 @@ pub fn client_for_system_proxy() -> Arc<reqwest::Client> {
 /// 并发构造同一个出口时两次都建 Client（各自持自己的连接池），
 /// 后者覆盖前者 —— 最坏结果是多建了一个池，不影响正确性。
 pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
+    client_for_with_tls(proxy, false)
+}
+
+/// [`client_for`] 的 TLS 变体：`accept_any_cert` 为真时**不校验证书链**。
+///
+/// ── 什么时候需要 ────────────────────────────────────────────
+/// 出网代理如果是 **MITM 型**（它要解密流量才能注入凭证，如 Agent Vault 的
+/// 14322），它会用自己现签的证书冒充上游，客户端看到的签发者不在系统信任链里，
+/// 校验必然失败（`invalid peer certificate: UnknownIssuer`）。这类部署的正确
+/// 做法是分发它的根证书；拿不到根证书时，只能由**记录显式声明**放宽校验。
+///
+/// ── 为什么必须显式声明 ──────────────────────────────────────
+/// 这是针对该出口的全局安全降级（同名出口上的所有上游都不再验证身份），
+/// 不能按 baseUrl 或代理类型去猜。当前唯一调用方是 `vertex` 协议的转发，
+/// 条件是提供商记录里 `insecureTls: true`。
+///
+/// 缓存键带 `tls:` 段：同一出口的宽松/严格两个客户端分开缓存，互不顶掉。
+pub fn client_for_with_tls(
+    proxy: Option<&ResolvedProxy>,
+    accept_any_cert: bool,
+) -> Arc<reqwest::Client> {
     // 超时设置逐次取用（配置一改，下一次就命中新键并建新 Client，见 cache_key）
     let timeouts = crate::server::config::timeout_settings();
-    let key = cache_key(proxy, &timeouts);
+    let key = cache_key_with_tls(proxy, &timeouts, accept_any_cert);
     // ① 先查缓存（快速路径）
     {
         let mut guard = lock_clients();
@@ -361,7 +394,8 @@ pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
         }
     }
     // ② 未命中才构造（锁外，可能阻塞）
-    let client = Arc::new(build_client(proxy, &timeouts).unwrap_or_else(|error| {
+    let client = Arc::new(
+        build_client_with(proxy, &timeouts, false, accept_any_cert).unwrap_or_else(|error| {
         // 这条**保留在运行日志**（不像同类的「账号代理不可用」那样进请求日志）：
         // 它每个出口缓存条目最多触发一次 —— 构造失败的兜底 Client 也会被缓存
         // （见下面 ③），后续请求直接命中缓存、不再走到这里，所以条数**不随
@@ -444,6 +478,166 @@ impl ConnectivityResult {
         }
         Value::Object(map)
     }
+}
+
+/// 新账号测试的配置闸门。两跳实现只会发明文 HTTP CONNECT，不能把 SOCKS
+/// 或 HTTPS 代理当 HTTP 使用；单跳仍沿用已有 HTTP / SOCKS5 能力。
+pub fn validate_account_route(proxy: Option<&ResolvedProxy>, front: Option<&ResolvedProxy>) -> Result<(), String> {
+    if front.is_some() && proxy.is_none() {
+        return Err("frontProxy 需要同时配置 proxy（第二跳代理）".to_string());
+    }
+    for (name, proxy) in [("proxy", proxy), ("frontProxy", front)] {
+        let Some(proxy) = proxy else { continue };
+        if !matches!(proxy.protocol.as_str(), "http" | "socks5") {
+            return Err(format!("{name}: 代理协议只支持 http 或 socks5"));
+        }
+        if front.is_some() && proxy.protocol != "http" {
+            return Err(format!("{name}: 两跳代理链只支持 HTTP CONNECT，两跳协议均须为 http"));
+        }
+        if proxy.port.is_none() || proxy.port == Some(0) || proxy.host.is_empty()
+            || proxy.host.chars().any(|ch| ch.is_whitespace() || ch.is_control() || "/\\@?#".contains(ch))
+            || url::Url::parse(&build_proxy_url(proxy)).ok().and_then(|url| url.host_str().map(str::to_string)).is_none()
+        {
+            return Err(format!("{name}: 代理主机或端口无效，测试已停止"));
+        }
+    }
+    Ok(())
+}
+
+/// 独立测试客户端：复用 client_for_with_tls 的底层构造和 TLS 参数，
+/// 但不复用其自动跳转/构造失败回退直连的缓存路径。任何构造错误原样返回。
+fn account_route_client(proxy: Option<&ResolvedProxy>, accept_any_cert: bool) -> Result<reqwest::Client, String> {
+    build_client_with(proxy, &crate::server::config::timeout_settings(), true, accept_any_cert)
+}
+
+fn local_chain_proxy(endpoint: &super::proxy_chain::ChainEndpoint) -> Result<ResolvedProxy, String> {
+    let address: std::net::SocketAddr = endpoint.local_addr.parse()
+        .map_err(|_| "代理链本地端点无效".to_string())?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err("代理链本地端点必须是有效的 loopback 地址".to_string());
+    }
+    Ok(ResolvedProxy {
+        source: "custom".to_string(),
+        protocol: "http".to_string(),
+        host: address.ip().to_string(),
+        port: Some(address.port()),
+        // 两跳认证由 chain_endpoint 处理，本地 CONNECT 端点不能继承第二跳认证。
+        username: String::new(),
+        password: String::new(),
+        label: endpoint.label.clone(),
+    })
+}
+
+fn account_route_error(detail: String) -> String {
+    if detail.to_ascii_lowercase().contains("unknownissuer") {
+        format!("{detail}；TLS 签发者不受信任：请配置客户端信任的 CA，或核对提供商的 TLS 设置（仅 vertex 的显式 insecureTls: true 可关闭校验）；测试不会自动开启 insecureTls")
+    } else {
+        detail
+    }
+}
+
+/// HTTP 目标也必须经两跳 CONNECT。reqwest 对 http:// 发 absolute-form GET，
+/// 而现有 proxy_chain 只接受 CONNECT；这里显式建隧道后只发根路径 GET。
+/// HTTPS 仍交给 reqwest 完成 CONNECT + TLS，并使用与真实转发相同的 TLS builder。
+async fn test_plain_http_chain(local: &ResolvedProxy, target: &url::Url) -> Result<u16, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn read_head(stream: &mut tokio::net::TcpStream) -> Result<u16, String> {
+        let mut head = Vec::new();
+        let mut byte = [0; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if head.len() >= 65_536 {
+                return Err("HTTP 响应头超过 64 KiB".to_string());
+            }
+            stream.read_exact(&mut byte).await.map_err(|error| format!("读取 HTTP 响应失败: {error}"))?;
+            head.push(byte[0]);
+        }
+        let text = std::str::from_utf8(&head).map_err(|_| "HTTP 响应头无效".to_string())?;
+        let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+        if !matches!(parts.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+            return Err("未收到有效 HTTP 响应".to_string());
+        }
+        parts.next().filter(|code| code.len() == 3).and_then(|code| code.parse::<u16>().ok())
+            .filter(|code| (100..600).contains(code)).ok_or_else(|| "HTTP 状态码无效".to_string())
+    }
+    let host = &target[url::Position::BeforeHost..url::Position::AfterHost];
+    let authority = format!("{host}:{}", target.port_or_known_default().ok_or("目标端口无效")?);
+    let mut stream = tokio::net::TcpStream::connect((local.host.as_str(), local.port.ok_or("代理链端口无效")?))
+        .await.map_err(|error| format!("连接代理链失败: {error}"))?;
+    stream.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await.map_err(|error| format!("建立 CONNECT 隧道失败: {error}"))?;
+    if read_head(&mut stream).await? != 200 {
+        return Err("代理链 CONNECT 未成功，未收到目标 HTTP 响应".to_string());
+    }
+    stream.write_all(format!("GET / HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {DEFAULT_USER_AGENT}\r\nAccept: application/json\r\nConnection: close\r\n\r\n").as_bytes())
+        .await.map_err(|error| format!("发送目标 GET 失败: {error}"))?;
+    // 不跟随 Location，也不把代理的 200 Connection Established 当成目标响应。
+    loop {
+        let status = read_head(&mut stream).await?;
+        if status >= 200 || status == 101 {
+            return Ok(status);
+        }
+    }
+}
+
+/// 账号实际链路探针：仅 GET 上游 origin + '/'，不发账号/provider 凭证、
+/// 不查出口 IP、不跟跳转。成功仅表示收到 HTTP 响应，不代表模型权限/生成可用。
+/// 总预算包括代理链初始化、CONNECT 与目标响应，所有失败均无直连/单跳兜底。
+pub async fn test_account_route(
+    proxy: Option<&ResolvedProxy>,
+    front: Option<&ResolvedProxy>,
+    target_url: &str,
+    accept_any_cert: bool,
+) -> Value {
+    let started = std::time::Instant::now();
+    let probe = async {
+        validate_account_route(proxy, front)?;
+        let target = url::Url::parse(target_url).map_err(|_| "测试目标 URL 无效".to_string())?;
+        if !matches!(target.scheme(), "http" | "https") || target.host_str().is_none()
+            || target.path() != "/" || target.query().is_some() || target.fragment().is_some()
+            || !target.username().is_empty() || target.password().is_some() || target.port() == Some(0)
+        {
+            return Err("测试目标必须是无凭证的 HTTP/HTTPS origin + '/'".to_string());
+        }
+        let chained = match (front, proxy) {
+            (Some(front), Some(back)) => {
+                let endpoint = super::proxy_chain::chain_endpoint(front, back)
+                    .ok_or_else(|| "创建两跳代理链失败，测试已停止（不会回退单跳或直连）".to_string())?;
+                Some(local_chain_proxy(&endpoint)?)
+            }
+            _ => None,
+        };
+        if let Some(local) = chained.as_ref().filter(|_| target.scheme() == "http") {
+            return test_plain_http_chain(local, &target).await;
+        }
+        // SOCKS 的客户端构造可能阻塞 DNS；放到阻塞池，外层 15 秒预算才能
+        // 覆盖它，超时后也不会在后台发送目标请求（这里只构造客户端）。
+        let effective_proxy = chained.as_ref().or(proxy).cloned();
+        let client = tokio::task::spawn_blocking(move || account_route_client(effective_proxy.as_ref(), accept_any_cert))
+            .await.map_err(|error| format!("创建测试客户端失败: {error}"))??;
+        let response = client.get(target).header("Accept", "application/json")
+            .timeout(Duration::from_millis(DEFAULT_TEST_TIMEOUT_MS))
+            .send().await.map_err(|error| describe_error_detail(&error))?;
+        Ok(response.status().as_u16())
+    };
+    let result = match tokio::time::timeout(Duration::from_millis(DEFAULT_TEST_TIMEOUT_MS), probe).await {
+        Ok(result) => result,
+        Err(_) => Err("连接超时（15 秒，包含完整代理链）".to_string()),
+    };
+    let mut data = json!({
+        "success": result.is_ok(),
+        "durationMs": started.elapsed().as_millis() as u64,
+        "targetUrl": target_url,
+        "tlsVerification": if accept_any_cert { "disabled" } else { "strict" },
+        "chained": front.is_some() && proxy.is_some(),
+        "proxy": describe_public(proxy),
+        "frontProxy": describe_public(front),
+        "note": "成功仅表示收到目标 HTTP 响应，不代表账号鉴权、模型权限或付费生成成功",
+    });
+    match result {
+        Ok(status) => data["status"] = json!(status),
+        Err(error) => data["error"] = json!(account_route_error(error)),
+    }
+    data
 }
 
 /// 出口 IP 查询（附加信息，失败只返回空串）。
@@ -580,7 +774,7 @@ pub fn describe_stream_break(text: &str) -> Option<String> {
 /// `std::error::Error::source()` 做同样的下钻。
 ///
 /// 去重是必要的：reqwest 的若干层 source 文案会重复（如 `error sending request`）。
-pub fn describe_error_detail(error: &reqwest::Error) -> String {
+pub fn describe_error_detail(error: &(impl std::error::Error + 'static)) -> String {
     let mut parts: Vec<String> = Vec::new();
     // 顶层 reqwest 错误自己的文案（含 URL 与超时语义）
     let head = error.to_string();
@@ -611,6 +805,165 @@ pub fn describe_public(proxy: Option<&ResolvedProxy>) -> Value {
             "host": proxy.host,
             "port": proxy.port_json(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod account_route_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+
+    fn proxy(port: u16) -> ResolvedProxy {
+        ResolvedProxy {
+            source: "custom".into(), protocol: "http".into(), host: "127.0.0.1".into(),
+            port: Some(port), username: String::new(), password: String::new(), label: "local test".into(),
+        }
+    }
+
+    async fn head(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            assert!(bytes.len() < 65_536);
+            bytes.push(stream.read_u8().await.expect("complete HTTP headers"));
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    // 保证测试失败也会终止本测试的监听/转发任务；不使用真实网络或数据库。
+    struct Task(JoinHandle<()>);
+    impl Drop for Task {
+        fn drop(&mut self) { self.0.abort(); }
+    }
+
+    async fn origin(status: u16, location: Option<String>) -> (String, tokio::sync::oneshot::Receiver<String>, Task) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task = Task(tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = head(&mut stream).await;
+            sender.send(request).unwrap();
+            let location = location.map(|value| format!("Location: {value}\r\n")).unwrap_or_default();
+            stream.write_all(format!("HTTP/1.1 {status} Test\r\n{location}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        }));
+        (url, receiver, task)
+    }
+
+    async fn connect_hop(expected_target: String, reject: bool) -> (ResolvedProxy, tokio::sync::oneshot::Receiver<String>, Task) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = proxy(listener.local_addr().unwrap().port());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task = Task(tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let request = head(&mut client).await;
+            assert_eq!(request.lines().next().unwrap(), format!("CONNECT {expected_target} HTTP/1.1"));
+            sender.send(request).unwrap();
+            if reject {
+                client.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                return;
+            }
+            // expected_target 由本测试的 loopback listener 生成，不解析任意请求目标。
+            let mut upstream = TcpStream::connect(&expected_target).await.unwrap();
+            client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        }));
+        (proxy, receiver, task)
+    }
+
+    #[test]
+    fn route_validation_and_local_endpoint_are_fail_closed() {
+        let back = proxy(8080);
+        let mut front = proxy(8081);
+        assert!(validate_account_route(None, Some(&front)).is_err());
+        front.protocol = "socks5".into();
+        assert!(validate_account_route(Some(&back), Some(&front)).is_err());
+        assert!(validate_account_route(Some(&front), Some(&back)).is_err());
+        assert!(validate_account_route(Some(&front), None).is_ok());
+        for port in [None, Some(0)] {
+            front.port = port;
+            assert!(validate_account_route(Some(&front), None).is_err());
+        }
+        for address in ["bad", "192.0.2.1:8080", "127.0.0.1:0"] {
+            assert!(local_chain_proxy(&super::super::proxy_chain::ChainEndpoint { local_addr: address.into(), label: "test".into() }).is_err());
+        }
+        let local = local_chain_proxy(&super::super::proxy_chain::ChainEndpoint { local_addr: "127.0.0.1:8080".into(), label: "test".into() }).unwrap();
+        assert_eq!(local.protocol, "http");
+        assert!(local.username.is_empty() && local.password.is_empty());
+        assert!(account_route_client(Some(&ResolvedProxy { port: None, ..back }), false).is_err());
+    }
+
+    #[test]
+    fn cache_identity_separates_credentials_and_temporary_generations() {
+        let mut a=proxy(1234); let mut b=a.clone(); let settings=TimeoutSettings::default();
+        b.password="different".into();
+        assert_ne!(cache_key_with_tls(Some(&a),&settings,false),cache_key_with_tls(Some(&b),&settings,false));
+        a.source="temporary:one".into(); b=a.clone(); b.source="temporary:two".into();
+        assert_ne!(cache_key_with_tls(Some(&a),&settings,false),cache_key_with_tls(Some(&b),&settings,false));
+    }
+    #[test]
+    fn unknown_issuer_is_explained_without_changing_tls() {
+        let detail = account_route_error("invalid peer certificate: UnknownIssuer".into());
+        assert!(detail.contains("CA") && detail.contains("提供商") && detail.contains("不会自动"));
+        assert_eq!(account_route_error("connection refused".into()), "connection refused");
+        let settings = TimeoutSettings::default();
+        assert_ne!(cache_key_with_tls(None, &settings, false), cache_key_with_tls(None, &settings, true));
+    }
+
+    #[tokio::test]
+    async fn direct_http_response_does_not_follow_redirects_or_send_credentials() {
+        let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect = format!("http://localhost:{}/secret", trap.local_addr().unwrap().port());
+        let (url, request, _task) = origin(302, Some(redirect)).await;
+        let result = test_account_route(None, None, &url, false).await;
+        assert_eq!(result["success"], true);
+        assert_eq!(result["status"], 302);
+        assert_eq!(result["targetUrl"], url);
+        assert_eq!(result["tlsVerification"], "strict");
+        assert_eq!(result["chained"], false);
+        assert!(result.get("ip").is_none());
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get / http/1.1\r\n"));
+        assert!(!request.contains("authorization:") && !request.contains("api-key:") && !request.contains("cookie:"));
+        assert!(tokio::time::timeout(Duration::from_millis(100), trap.accept()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn two_connect_hops_reach_http_origin_with_separate_proxy_auth() {
+        let (url, request, _origin) = origin(401, None).await;
+        let target = url.trim_start_matches("http://").trim_end_matches('/').to_string();
+        let (mut back, back_request, _back) = connect_hop(target, false).await;
+        back.username = "back".into(); back.password = "secret".into();
+        let (mut front, front_request, _front) = connect_hop(format!("127.0.0.1:{}", back.port.unwrap()), false).await;
+        front.username = "front".into(); front.password = "secret".into();
+        let result = tokio::time::timeout(Duration::from_secs(3), test_account_route(Some(&back), Some(&front), &url, false)).await.unwrap();
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["status"], 401);
+        assert_eq!(result["chained"], true);
+        assert_eq!(result["tlsVerification"], "strict");
+        assert!(front_request.await.unwrap().contains("Proxy-Authorization: Basic ZnJvbnQ6c2VjcmV0"));
+        assert!(back_request.await.unwrap().contains("Proxy-Authorization: Basic YmFjazpzZWNyZXQ="));
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get / http/1.1\r\n"));
+        assert!(!request.contains("authorization:") && !request.contains("api-key:") && !request.contains("cookie:"));
+        assert!(!result.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn failed_connect_never_falls_back_to_back_proxy_or_direct() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let back_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let back = proxy(back_listener.local_addr().unwrap().port());
+        let (front, request, _front) = connect_hop(back_listener.local_addr().unwrap().to_string(), true).await;
+        let url = format!("http://{}/", target.local_addr().unwrap());
+        let result = tokio::time::timeout(Duration::from_secs(3), test_account_route(Some(&back), Some(&front), &url, false)).await.unwrap();
+        assert_eq!(result["success"], false, "{result}");
+        assert_eq!(result["chained"], true);
+        assert!(result.get("status").is_none());
+        assert!(request.await.is_ok());
+        assert!(tokio::time::timeout(Duration::from_millis(100), back_listener.accept()).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(100), target.accept()).await.is_err());
     }
 }
 

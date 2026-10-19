@@ -143,6 +143,21 @@ fn is_available(account: &Value) -> bool {
         .unwrap_or(true)
 }
 
+/// 这条会话是不是企业版账号（`account.enterpriseId` 非空）。
+///
+/// 企业版没有个人成长 / 补偿体系：上游对签到、活动补偿这类个人计费端点
+/// 固定回 400 code 10001（参考实现 workbuddy2api-panel 的 A/B 实测，
+/// 2026-10-07）。活动补偿那一步据此直接跳过，省一次注定失败的请求 ——
+/// 判据只此一份，与 `AuthService`「enterpriseId 为 null 就不显示企业标记」
+/// 同一口径（空串按个人版处理）。
+fn is_enterprise_session(session: &Value) -> bool {
+    session
+        .get("account")
+        .and_then(|account| account.get("enterpriseId"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+}
+
 /// 账号列表快照（`store.listAccounts().accounts`）
 fn accounts_of(store: &AccountStore) -> Vec<Value> {
     store
@@ -313,10 +328,12 @@ pub async fn checkin_for(
         }
         "workbuddy-intl" => {
             // WorkBuddy 国际版：没有国内版的普通签到接口，走「每日活跃」链路 ——
-            // 探测活动 → 条件领取 → 免费模型保活（`billing::activity` 的
-            // `workbuddy_daily_activity`，模型链配置见 `billing::keepalive`）。
-            // 活跃保活成功不伪造普通签到成功：只有 claim 的 success /
-            // alreadyCompleted 才会落 `checkinAt`，保活读数在行的 `activity` 格。
+            // 探测活动 → 条件领取 → 免费模型保活 + 网页会话（`billing::activity`
+            // 的 `workbuddy_daily_activity`，模型链配置见 `billing::keepalive`）。
+            // 落 `checkinAt` 的判据是 [`day_completed`]：领取成功 / 上报成功 /
+            // 网页会话建成任一即算「今日已完成」（活动模块下线时领取恒为
+            // 「活动未开启」，但日活实际完成、积分异步到账，见 day_completed
+            // 的说明）；读数细节在行的 `activity` 格。
             let Some(entry) = store.get_session_by_id(&id) else {
                 return json!({
                     "id": id,
@@ -415,6 +432,65 @@ pub async fn checkin_for(
             .map(welfare_claim_of);
             claim_result(id, name, &display, true, claim)
         }
+        "chatglm" => {
+            // 智谱清言：本家的「签到」是**每日登录积分**
+            // （`POST /chatglm/member-api/member/daily_login_score`，返回
+            // `result.score` 为本次到账数）。访客账号没有积分体系，实现如实
+            // 返回中性未领取（`success:false` + 说明文案），不落失败台账 ——
+            // 见 `chatglm::checkin` 的模块头。
+            let claim =
+                crate::server::core::providers::chatglm::checkin::claim_daily_login_score(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            // ── 领取类：会员积分活动与季节性活动 ────────────────────
+            // 本家的「领取类」没有独立的界面入口，与 WorkBuddy 的一次性运营
+            // 奖励同一处置：**挂在签到末尾顺带领**（活动期才有得领，非活动期
+            // 实现自己回中性文案，不算失败）。读数细节进 `bonus` 格。
+            // 注意顺序：`claim_result` 会消费 `id`，所以先领再构造结果行。
+            let bonus =
+                crate::server::core::providers::chatglm::checkin::claim_bonus(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            let bonus_ok = bonus
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("success").and_then(Value::as_bool))
+                .unwrap_or(false);
+            logging::log(
+                "[Checkin]",
+                &format!(
+                    "智谱清言账号 {display}: 活动领取 {}",
+                    if bonus_ok { "成功" } else { "无可领取" }
+                ),
+            );
+            // ── 每日任务：任务中心 `categories[code=daily]` ─────────
+            // 用户口径：每日任务接我们的每日签到（新手任务另走 onboarding）。
+            // 与「每日登录积分」并列在同一次签到里执行：登录积分是签到本身，
+            // 每日任务是签到后顺手领的日常。上游按天重置（UTC+8 零点），
+            // 重复领幂等（`points_awarded:0`），见 `chatglm::tasks` 模块头。
+            let daily =
+                crate::server::core::providers::chatglm::tasks::claim_daily_tasks(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            let mut row = claim_result(id, name, &display, true, claim);
+            if let Some(object) = row.as_object_mut() {
+                object.insert(
+                    "bonus".to_string(),
+                    match &bonus {
+                        Ok(value) => value.clone(),
+                        Err(message) => serde_json::json!({ "success": false, "msg": message }),
+                    },
+                );
+                object.insert(
+                    "dailyTasks".to_string(),
+                    match &daily {
+                        Ok(value) => value.clone(),
+                        Err(message) => serde_json::json!({ "success": false, "msg": message }),
+                    },
+                );
+            }
+            row
+        }
         // 兜底只服务默认那家（WorkBuddy 国内版）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
@@ -433,7 +509,51 @@ pub async fn checkin_for(
                 .claim_daily_checkin(Some(&entry.session))
                 .await
                 .map_err(|error| error.message);
-            claim_result(id, name, &display, false, claim)
+            let mut row = claim_result(id, name, &display, false, claim);
+            // ── 一次性运营奖励：挂在签到末尾顺带领 ────────────────
+            // 新手礼包与活动补偿（如 2026-10 的 DeepSeek 故障补偿 500 积分）
+            // 都没有自己的入口，官方口径是去「用量管理 / 个人中心」手动点领取
+            // —— 网关替账号走这两下（参考实现 workbuddy2api-hub 的连登管家把
+            // 两条一起挂在签到后，同一口径）。每号一次，已领 / 无可领取静默
+            // 跳过，不影响签到结果本身；真的到账才出声（日志 + 行内读数）。
+            // 企业版没有个人成长 / 补偿体系（上游固定回 400 code 10001），
+            // 直接不发这两条。
+            if !is_enterprise_session(&entry.session) {
+                let mut rewards: Vec<Value> = Vec::new();
+                for reward in [
+                    billing.claim_gift(&entry.session).await,
+                    billing.claim_compensation(&entry.session).await,
+                ] {
+                    match reward {
+                        Ok(reward) => {
+                            let credited = reward.get("success").and_then(Value::as_bool)
+                                == Some(true)
+                                && reward.get("credit").and_then(Value::as_i64).unwrap_or(0) > 0;
+                            if credited {
+                                let message =
+                                    reward.get("msg").and_then(Value::as_str).unwrap_or("");
+                                logging::log(
+                                    "[Accounts]",
+                                    &format!("账号 {display}: {message}"),
+                                );
+                            }
+                            rewards.push(reward);
+                        }
+                        Err(error) => {
+                            logging::verbose(
+                                "[Accounts]",
+                                &format!("账号 {display} 运营奖励未领取: {}", error.message),
+                            );
+                        }
+                    }
+                }
+                if !rewards.is_empty() {
+                    if let Some(object) = row.as_object_mut() {
+                        object.insert("rewards".to_string(), Value::Array(rewards));
+                    }
+                }
+            }
+            row
         }
         other => json!({
             "id": id,
@@ -542,6 +662,54 @@ pub fn checkin_completed_today(claim: &Value) -> bool {
     message.contains("已签到") || message.contains("已领取")
 }
 
+/// 行的 `activity` 段是否携带「活跃上报成功」读数（`report.succeeded`）。
+///
+/// WorkBuddy 国际版每日活跃的构成：活跃上报（`/v2/report`）点亮成长中心
+/// 连登；「当日活跃」计数的判定通道是网页会话（[`web_conversation_ok`]，
+/// issue #277）。领取依赖上游活动开放。
+pub fn activity_report_ok(row: &Value) -> bool {
+    row.get("activity")
+        .and_then(|activity| activity.get("report"))
+        .and_then(|report| report.get("succeeded"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 行的 `activity` 段是否携带「网页会话建成」读数（`webConversation.succeeded`）。
+///
+/// 上游把「当日活跃」（每日 30 积分的判定）记在网页通道的 agent 会话上
+/// （issue #277 的抓包结论，见 `billing::activity::create_web_conversation`）。
+pub fn web_conversation_ok(row: &Value) -> bool {
+    row.get("activity")
+        .and_then(|activity| activity.get("webConversation"))
+        .and_then(|web| web.get("succeeded"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 结果行是否代表「今天已完成」—— 落账（`checkinAt`）、调度与台账三处共用的
+/// 唯一判据。
+///
+/// 两条来源任一成立即算完成：
+///   1. **claim 说完成**（[`checkin_completed_today`]）：真领到 / 上游说已领；
+///   2. **国际版每日活跃链路完成**：活跃上报或网页会话任一成功 —— 活动模块
+///      下线（`active:false`，issue #277 评论里的 code 12302 状态）时领取恒为
+///      「活动未开启」，但这一天的日活实际完成、积分由上游按活跃异步发放
+///      （实测：全量账号收到 Bonus Pack，而领取接口仍是「活动未开启」）。
+///      旧口径只看 claim，于是这批账号在签到中心永远显示「待签」、与台账
+///      已记的 `already/ok` 自相矛盾。
+///
+/// 只保活对话成功（`pokeSucceeded`）**不算**完成：它只是「账号有调用」，
+/// 上游的活跃计数不认它；失败（网络错误 / 凭证失效）也不算 —— 失败行照旧
+/// 显示待签，与 [`checkin_completed_today`] 的收紧原则一致。
+pub fn day_completed(row: &Value) -> bool {
+    row.get("claim")
+        .map(checkin_completed_today)
+        .unwrap_or(false)
+        || activity_report_ok(row)
+        || web_conversation_ok(row)
+}
+
 /// 这条领取结果是「中性未领取」—— 不是成功、不是已签、也不是失败，而是
 /// 「此刻没有可领的活动」。Qoder 国际版的活动窗口每天 10:00（UTC+8）才开，
 /// 定时签到在这个窗口之前跑完时结果必然长这样；自动签到调度据此判断
@@ -605,11 +773,9 @@ pub async fn run_checkin(
         // 写盘失败只记日志、不改签到结果 —— 上游那边积分已经领到了，
         // 因为一次落盘失败就把成功的签到报成失败是本末倒置。
         if let Some(account_id) = row.get("id").and_then(Value::as_str) {
-            let completed = row
-                .get("claim")
-                .map(checkin_completed_today)
-                .unwrap_or(false);
-            if completed && !store.mark_checkin(account_id, logging::now_ms()) {
+            // 判据是 [`day_completed`]（claim 说完成，或国际版活跃链路完成）——
+            // 与台账的 outcome 判定同源；判据只此一份，别在这里再写一份。
+            if day_completed(&row) && !store.mark_checkin(account_id, logging::now_ms()) {
                 logging::verbose(
                     "[Accounts]",
                     &format!("账号 {account_id} 的签到时间未能落盘（账号可能已被删除）"),
@@ -628,9 +794,12 @@ pub async fn run_checkin(
         );
         results.push(row);
     }
-    // 「真实领取」与「今日已领取」都表示本日签到已完成；只有活跃保活不计入
-    // succeeded，避免把普通签到时间与活跃任务混为一谈 —— 保活读数单独统计在
-    // `active`（`activity.pokeSucceeded`），它的成功不落 `checkinAt`。
+    // 「真实领取」与「今日已领取」都表示本日成功领到分，计入 succeeded；
+    // 活跃链路（保活对话 / 活跃上报 / 网页会话）单独统计在 `active` ——
+    // 它不产生「领取」，不并入 succeeded，免得把两类事混成一个数。
+    // 注意 succeeded 只是这行日志的计数：落 `checkinAt` 的判据是
+    // [`day_completed`]（活跃链路完成同样落账），两者刻意不同 —— 前者计量
+    // 「真领到的分」，后者回答「今天是否已完成」。
     let succeeded = results
         .iter()
         .filter(|item| {
@@ -646,14 +815,10 @@ pub async fn run_checkin(
                 .and_then(|activity| activity.get("pokeSucceeded"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-                // 活跃上报（/v2/report，点亮国际版连登的那条通道）成功同样算
-                // 「完成活跃」—— 这才是国际版日活的主动作；保活对话只是补充。
-                || item
-                    .get("activity")
-                    .and_then(|activity| activity.get("report"))
-                    .and_then(|report| report.get("succeeded"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
+                // 活跃上报（/v2/report，点亮国际版连登的那条通道）与网页会话
+                // （issue #277：「当日活跃」计数的判定通道）成功同样算「完成活跃」。
+                || activity_report_ok(item)
+                || web_conversation_ok(item)
         })
         .count();
     if skipped > 0 {
@@ -683,6 +848,32 @@ pub async fn run_checkin(
             reason,
         );
     }
+    // ── 连登管家：补签 → 档位兑换 → 抽奖（挂签到末尾，与参考项目同款）──
+    //
+    // 为什么挂在这里而不是独立排程：三件事的判据都依赖「今天签到了没有」
+    // （连登天数当天 +1 之后才可能解锁新档位），紧跟签到跑最准；而签到是
+    // 手动与定时共用的唯一入口（`run_checkin` 是两条链的共同执行体），
+    // 挂这里天然覆盖两条路径，不必各写一遍。
+    //
+    // ── 为什么是**后台任务**而不是 await ────────────────────────
+    // 三件事每个账号要 4~6 个上游请求（热力图 / 连登状态 / 兑换 / 抽奖余额 /
+    // 逐次抽奖），加上账号间 800ms 错峰，十几个账号就是几十秒到几分钟 ——
+    // 而管理 API 有 60 秒单请求超时（`gateway::REQUEST_TIMEOUT_MS`）。同步
+    // await 会让前端「立即全部签到」超时报错，而后端其实已经跑完，用户以为
+    // 失败了会再点一次。所以这里**只起任务不等待**：签到结果立刻返回，
+    // 连登管家的收益异步进日志与账号余额。
+    //
+    // 失败**不影响**签到结果：三件事在上游都是幂等的附加收益，且都只服务
+    // 国内版个人账号（门控在 `run_for_accounts` 里）。任何一步出错只进日志，
+    // 绝不把一次成功的签到报成失败 —— 与上面 mark_checkin / record_row 的
+    // 取舍同构。
+    //
+    // 只在**批量轮次**跑（`id.is_none()`）：单账号手动签到是「我只想签这一个」，
+    // 顺手替它兑换抽奖会让用户以为点错了按钮；批量（定时 / 手动全量）才是
+    // 「维护一遍所有账号」的意图。
+    if id.is_none() {
+        spawn_streak_bonus(store.clone(), targets.clone());
+    }
     Ok(json!({
         "results": results,
         "succeeded": succeeded,
@@ -690,6 +881,40 @@ pub async fn run_checkin(
         "total": results.len(),
         "skipped": skipped,
     }))
+}
+
+/// 连登管家：后台跑「补签 → 档位兑换 → 抽奖」，不阻塞签到响应。
+///
+/// 抽成独立函数的原因有三条：
+///   1. **不阻塞**：见 `run_checkin` 里那段「为什么是后台任务」；
+///   2. **隔离失败**：里面任何错误都只进日志，不会冒泡到签到结果；
+///   3. **串行闸**：同一时刻只允许一轮在跑（手动连点签到不会叠出两轮
+///      重复兑换 / 抽奖 —— 上游幂等，但重复打请求本身是浪费且招风控）。
+fn spawn_streak_bonus(store: AccountStore, targets: Vec<Value>) {
+    /// 进程内串行闸：`swap(true)` 抢到才跑，跑完复位。
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        logging::verbose("[Streak]", "上一轮连登管家仍在执行，本次跳过");
+        return;
+    }
+    crate::spawn_task(async move {
+        let reports = crate::server::core::providers::workbuddy::growth::streak::run_for_accounts(
+            &store, &targets,
+        )
+        .await;
+        let done: usize = reports.iter().map(|report| report.done).sum();
+        let failed: usize = reports.iter().map(|report| report.failed).sum();
+        if done > 0 || failed > 0 {
+            logging::log(
+                "[Streak]",
+                &format!(
+                    "连登管家完成：{done} 项动作{}",
+                    if failed > 0 { format!("，{failed} 项失败") } else { String::new() }
+                ),
+            );
+        }
+        RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 #[cfg(test)]

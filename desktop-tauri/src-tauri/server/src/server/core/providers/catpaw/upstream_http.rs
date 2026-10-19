@@ -121,7 +121,7 @@ pub(super) async fn post_json(
     if let Some(capture) = capture {
         capture.reset_request(&url, "catpaw", &headers, body);
     }
-    let response = builder.send().await.map_err(|error| {
+    let response = crate::server::core::upstream::request::send_builder(builder).await.map_err(|error| {
         CatPawError::upstream(format!(
             "上游请求失败（{}）: {}",
             describe_proxy(proxy),
@@ -278,7 +278,7 @@ pub(super) async fn turn_request(
     for (key, value) in request_headers(&ctx.credentials, "text/event-stream") {
         builder = builder.header(key, value);
     }
-    let response = builder.send().await.map_err(|error| {
+    let response = crate::server::core::upstream::request::send_builder(builder).await.map_err(|error| {
         CatPawError::upstream(format!(
             "上游请求失败（{}）: {}",
             describe_proxy(request.proxy.as_ref()),

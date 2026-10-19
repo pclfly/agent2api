@@ -46,6 +46,23 @@ pub fn shim_js() -> &'static str {
     r#"(function () {
   'use strict';
 
+  // ── 清掉登录页转来的放行标记（`?from=login`）─────────────
+  // 服务端在 `/` 上会拦「会话无效的导航」并送回登录页（见
+  // server::http::panel_boot_redirect）。中转环境里会话只存在于 localStorage
+  // 的 `x-panel-token` 头，而顶层导航带不了自定义头，所以登录页跳过来时带这个
+  // 标记、服务端放行这一趟。标记必须在页面跑起来后从地址栏抹掉：留着它，
+  // 会话过期后用户刷新页面仍会绕过那道判定，进去又是一屏 401。
+  (function () {
+    try {
+      var url = new URL(window.location.href);
+      if (!url.searchParams.has('from')) return;
+      url.searchParams.delete('from');
+      var search = url.searchParams.toString();
+      window.history.replaceState(null, '',
+        url.pathname + (search ? '?' + search : '') + url.hash);
+    } catch (e) { /* 老浏览器 / 被禁用：留着标记只是多一次放行，不影响正确性 */ }
+  })();
+
   // ── API Key 的存取 ────────────────────────────────────────
   var KEY_STORAGE = 'agent2api.webKey';
   function readStoredKey() {
@@ -1012,11 +1029,25 @@ pub fn shim_js() -> &'static str {
     testProxy: function (payload) {
       var body = {};
       if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-        if (typeof payload.id === 'string' && payload.id) body.id = payload.id;
+        if (typeof payload.accountId === 'string' && payload.accountId) {
+          body.accountId = payload.accountId;
+          ['proxy', 'frontProxy'].forEach(function (key) {
+            if (Object.prototype.hasOwnProperty.call(payload, key)) body[key] = payload[key];
+          });
+        } else if (typeof payload.id === 'string' && payload.id) body.id = payload.id;
         else if (Object.prototype.hasOwnProperty.call(payload, 'proxy')) body.proxy = payload.proxy;
       }
       return call('POST', '/api/proxies/test', body);
     },
+    // Agent（本机 AI 客户端的配置接管；与桌面壳 bridge.rs 的同名方法成对
+    // 存在 —— 只加一边时另一形态下的页面会报「桥接方法缺失」。契约见
+    // api::agents 的模块头：写操作都返回整份 {clients}，就地替换）
+    getAgents: function () { return call('GET', '/api/agents'); },
+    saveAgentProfiles: function (payload) { return call('POST', '/api/agents/profiles', payload || {}); },
+    applyAgentProfile: function (payload) { return call('POST', '/api/agents/apply', payload || {}); },
+    previewAgentProfile: function (payload) { return call('POST', '/api/agents/preview', payload || {}); },
+    restoreAgentClient: function (payload) { return call('POST', '/api/agents/restore', payload || {}); },
+    importAgentClient: function (payload) { return call('POST', '/api/agents/import', payload || {}); },
     // 代理池（「网络代理」页；与桌面壳 bridge.rs 的同名方法成对存在，
     // 契约见 api::proxies 的模块头 —— 只加一边时另一形态下的页面会报
     // 「桥接方法缺失」，标题栏那一族有同样的教训）
@@ -1193,6 +1224,10 @@ pub fn shim_js() -> &'static str {
     // WorkBuddy 国际版日活保活的模型链（与 bridge.rs 的同名方法成对维护）
     getCheckinKeepalive: function () { return call('GET', '/api/checkin-keepalive'); },
     saveCheckinKeepalive: function (models) { return call('POST', '/api/checkin-keepalive', { models: models }); },
+    // 猫猫旅行定时排程（国内版；与 bridge.rs 的同名方法成对维护）
+    getTravelSchedule: function () { return call('GET', '/api/travel-schedule'); },
+    saveTravelSchedule: function (patch) { return call('POST', '/api/travel-schedule', patch); },
+    runTravelScheduleNow: function () { return call('POST', '/api/travel-schedule/run', {}); },
     // WorkBuddy 国际版日活任务的手动粒度入口（mode: full | claim | keepalive）
     runCheckinActivity: function (id, mode) { return call('POST', '/api/checkin-activity', { id: id, mode: mode }); },
     // 签到中心的聚合快照（与 bridge.rs 的同名方法同一路径）
@@ -1239,6 +1274,10 @@ pub fn shim_js() -> &'static str {
     // GitHub 令牌：读只报 {filled, origin}，写传 {token: '…' | null}
     getUpdateToken: function () { return call('GET', '/api/update/token'); },
     setUpdateToken: function (payload) { return call('POST', '/api/update/token', payload); },
+    // 「加入 beta 版」：读只报 {enabled}，写传 {enabled: true|false}（与桌面 bridge
+    // 逐字同形 —— 两侧接口名与签名必须一致，界面代码零改动地跑在两边）
+    getUpdateBeta: function () { return call('GET', '/api/update/beta'); },
+    setUpdateBeta: function (payload) { return call('POST', '/api/update/beta', payload); },
     downloadUpdate: function (payload) { return invokeShell('download_update', payload); },
     updateProgress: function () { return invokeShell('update_progress'); },
     cancelUpdate: function () { return invokeShell('cancel_update'); },
@@ -1260,6 +1299,15 @@ pub fn shim_js() -> &'static str {
     getSanitize: function () { return call('GET', '/api/sanitize'); },
     saveSanitize: function (enabled) {
       return call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true });
+    },
+
+    // ── 开发者角色兼容 ──
+    // 与桌面桥（src/bridge.rs 的 getDeveloperRoleCompat / saveDeveloperRoleCompat）
+    // 同一映射：两边接口名与签名必须一致，界面代码零改动地跑在两边
+    //（漏一侧的症状见 getClineHeaders 那段）。
+    getDeveloperRoleCompat: function () { return call('GET', '/api/developer-role-compat'); },
+    saveDeveloperRoleCompat: function (enabled) {
+      return call('PUT', '/api/developer-role-compat', { developerRoleCompat: enabled === true });
     },
 
     // ── Cline 伪装头（转发头逐键覆盖）──
@@ -1345,6 +1393,26 @@ pub fn shim_js() -> &'static str {
       await call('POST', '/api/panel/logout', {});
       // 服务端已撤销会话链；本地保管的双令牌一并清掉。
       clearPanelAuth();
+    },
+
+    // ── 直连网关的凭证（AI 助手页专用；桌面 bridge 的同名方法见 bridge.rs）
+    // 助手页为流式对话直接 fetch 网关基址、不经 call（见 ui-islands 的
+    // assistant-state.ts），那条请求带什么凭证由这里说了算 —— 口径必须与
+    // httpCall 完全一致，否则会出现「设置页能读、助手页 401」这种分叉：
+    //   · 直连环境：会话在 HttpOnly cookie 里，同源请求浏览器自动带，
+    //     这张表通常为空（令牌不进 JS 正是我们想保住的性质）；
+    //   · 宿主中转（cookie 往返不通）：令牌在 localStorage，必须放进
+    //     `x-panel-token`（自定义头被剥时还有标准的 Authorization 兜底）；
+    //   · 未注册管理员的部署：用户输入的网关 Key 是唯一凭证。
+    directCredentials: function () {
+      var headers = {};
+      var access = storedPanelToken('access');
+      if (access) {
+        headers['x-panel-token'] = access;
+        headers['Authorization'] = 'Bearer ' + access;
+      }
+      if (apiKey) headers['x-api-key'] = apiKey;
+      return Promise.resolve(headers);
     },
 
     // ── 机器人校验开关（登录 / 注册的 ALTCHA proof-of-work）──

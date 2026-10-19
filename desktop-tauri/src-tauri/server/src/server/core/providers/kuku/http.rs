@@ -17,7 +17,17 @@
 
 use serde_json::Value;
 
-use crate::server::core::auth_http::send_raw;
+async fn send_raw(method: &str, url: &str, body: Option<&Value>, headers: &[(String,String)], proxy: Option<&ResolvedProxy>, timeout: Option<u64>) -> Result<crate::server::core::auth_http::ApiResponse, crate::server::core::upstream::request::SendError> {
+    let client = egress::client_for(proxy);
+    let mut builder = if method == "POST" { client.post(url) } else { client.get(url) };
+    for (key,value) in headers { builder = builder.header(key,value); }
+    if let Some(body) = body { builder = builder.json(body); }
+    if let Some(ms) = timeout { builder = builder.timeout(std::time::Duration::from_millis(ms)); }
+    let response = crate::server::core::upstream::request::send_builder(builder).await?;
+    let status = response.status().as_u16(); let ok = response.status().is_success();
+    let text = response.text().await.map_err(crate::server::core::upstream::request::SendError::from)?;
+    Ok(crate::server::core::auth_http::ApiResponse { status, ok, payload:serde_json::from_str(&text).ok() })
+}
 use crate::server::core::egress;
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::errors::GatewayError;
@@ -26,7 +36,15 @@ use crate::server::errors::GatewayError;
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
 
 /// 把传输错误翻译成网关错误（超时 → 504，其余 → 502）。
-fn transport_error(what: &str, error: reqwest::Error) -> GatewayError {
+fn transport_error(what: &str, error: crate::server::core::upstream::request::SendError) -> GatewayError {
+    if error.is_timeout() {
+        GatewayError::with_status(504, format!("{what}超时，请稍后重试"))
+    } else {
+        GatewayError::with_status(502, format!("{what}失败：{}", egress::describe_error_detail(&error)))
+    }
+}
+
+fn send_transport_error(what: &str, error: crate::server::core::upstream::request::SendError) -> GatewayError {
     if error.is_timeout() {
         GatewayError::with_status(504, format!("{what}超时，请稍后重试"))
     } else {
@@ -124,10 +142,9 @@ pub async fn post_form_value(
     if let Some(timeout) = timeout_ms {
         builder = builder.timeout(std::time::Duration::from_millis(timeout));
     }
-    let response = builder
-        .send()
+    let response = crate::server::core::upstream::request::send_builder(builder)
         .await
-        .map_err(|error| transport_error("KukuAI 请求", error))?;
+        .map_err(|error| send_transport_error("KukuAI 请求", error))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         let text = response.text().await.unwrap_or_default();
@@ -158,11 +175,9 @@ pub async fn sse_post(
     for (name, value) in headers {
         request = request.header(name.as_str(), value);
     }
-    let response = request
-        .json(body)
-        .send()
+    let response = crate::server::core::upstream::request::send_builder(request.json(body))
         .await
-        .map_err(|error| transport_error(what, error))?;
+        .map_err(|error| send_transport_error(what, error))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         let text = response.text().await.unwrap_or_default();

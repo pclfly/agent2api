@@ -72,6 +72,17 @@ pub struct TransportRequest {
     /// 账号未配代理时本家是否**跟随系统代理**出网（编排层按适配器的能力位填，
     /// 默认 false = 直连）。为 true 的家见 `ProviderAdapter::system_proxy_when_unset`。
     pub system_proxy_when_unset: bool,
+    /// 是否放宽 TLS 校验（不验证书链）。**只由 `vertex` 协议在提供商记录
+    /// 显式声明 `insecureTls: true` 时置真** —— 用于上游经 MITM 型出网代理
+    /// （它现签证书、签发者不在信任链里）。默认 false，其余协议一律严格校验。
+    pub accept_any_cert: bool,
+    /// 链式出网的前置代理（可选）：先经它出去，再由 `proxy` 做第二跳
+    /// （典型形态：Clash 选地区 → Vault 注入凭据）。为 None 时 `proxy` 单独生效。
+    ///
+    /// 为什么不在 `proxy` 里表达两跳：`ResolvedProxy` 描述的是**一个**代理，
+    /// 而 HTTP 的 CONNECT 一次只能指定一跳。两跳需要真实建两级隧道，
+    /// 由 `core::proxy_chain` 在本地开中转端口来兑现（见该模块的模块头）。
+    pub front_proxy: Option<ResolvedProxy>,
 }
 
 /// 归一化后的上游错误：`{code, message}`
@@ -150,10 +161,35 @@ pub async fn send_chat_request(
 ) -> Result<reqwest::Response, UpstreamRequestError> {
     // 客户端三选一：账号级代理 → 跟随系统代理（本家能力位，见
     // `TransportRequest::system_proxy_when_unset`）→ 直连
-    let client = match plan.proxy.as_ref() {
-        Some(proxy) => egress::client_for(Some(proxy)),
+    //
+    // 账号代理若同时带前置代理（`front_proxy`），先在本机起一个两跳中转，
+    // 把出口指向它 —— reqwest 仍只看到「一个普通代理」，两跳由
+    // `proxy_chain` 内部兑现（Clash 选地区 → Vault 注入凭据）。
+    let chained = match (plan.front_proxy.as_ref(), plan.proxy.as_ref()) {
+        (Some(front), Some(back)) => crate::server::core::proxy_chain::chain_endpoint(front, back),
+        _ => None,
+    };
+    let effective_proxy = match (chained.as_ref(), plan.proxy.as_ref()) {
+        (Some(chain), Some(back)) => {
+            let mut local = back.clone();
+            let (host, port) = chain
+                .local_addr
+                .rsplit_once(':')
+                .unwrap_or((chain.local_addr.as_str(), "0"));
+            local.host = host.to_string();
+            local.port = port.parse::<u16>().ok();
+            // 中转不需要认证：凭据已封装在隧道建立时
+            local.username = String::new();
+            local.password = String::new();
+            local.label = chain.label.clone();
+            Some(local)
+        }
+        (_, back) => back.cloned(),
+    };
+    let client = match effective_proxy.as_ref() {
+        Some(proxy) => egress::client_for_with_tls(Some(proxy), plan.accept_any_cert),
         None if plan.system_proxy_when_unset => egress::client_for_system_proxy(),
-        None => egress::client_for(None),
+        None => egress::client_for_with_tls(None, plan.accept_any_cert),
     };
     let mut builder = client.post(&plan.url).body(plan.payload.clone());
     for (key, value) in &plan.headers {
@@ -164,6 +200,15 @@ pub async fn send_chat_request(
     }
     // 出口说明（失败文案用）：文案照抄 Node 的 fetchViaProxy
     let via = match &plan.proxy {
+        // 链式出口：把两跳都写出来，排障时能一眼看出「地区节点 + 注入代理」
+        Some(proxy) if plan.front_proxy.is_some() => {
+            let front = plan.front_proxy.as_ref();
+            format!(
+                "经链式代理（前置 {} → 第二跳 {}）",
+                front.map(|p| format!("{}:{}", p.host, p.port.unwrap_or(0))).unwrap_or_default(),
+                proxy.host
+            )
+        }
         Some(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
         Some(proxy) => format!("经代理 {}", proxy.host),
         // 跟随系统代理的家（Antigravity）在账号未配代理时走的是系统代理，
@@ -175,7 +220,9 @@ pub async fn send_chat_request(
     // 等待响应头有上限（见 headers_timeout 的说明）：超时后 future 被丢弃，
     // 上游连接随之关闭（与客户端断开时的取消是同一机制）
     let headers_budget = headers_timeout();
-    match tokio::time::timeout(headers_budget, builder.send()).await {
+    let sent = send_builder_with_tls(builder, plan.accept_any_cert, plan.front_proxy.as_ref()).await;
+    let result: Result<_, tokio::time::error::Elapsed> = Ok(sent);
+    match result {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) => {
             // `send()` 阶段的超时只可能来自连接（等待响应头由外层计时器管，
@@ -196,11 +243,12 @@ pub async fn send_chat_request(
                     egress::describe_error_detail(&error)
                 )
             };
-            Err(UpstreamRequestError { message, reason })
+            Err(UpstreamRequestError { message, reason, local: error.local })
         }
         Err(_elapsed) => {
             let seconds = headers_budget.as_secs();
             Err(UpstreamRequestError {
+                local: false,
                 reason: format!("等待响应超时({seconds}秒)"),
                 message: format!("等待响应超时({seconds}秒，出口 {via})"),
             })
@@ -208,9 +256,227 @@ pub async fn send_chat_request(
     }
 }
 
+/// Send a prebuilt request without regenerating body, credentials, or session headers.
+/// Stateful providers call this at each HTTP exchange, never replaying a conversation.
+#[derive(Debug)]
+pub(crate) struct SendError { message: String, timeout: bool, pub local: bool }
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+}
+impl std::error::Error for SendError {}
+impl From<reqwest::Error> for SendError {
+    fn from(error: reqwest::Error) -> Self { Self { message:egress::describe_error_detail(&error), timeout:error.is_timeout(), local:error.is_builder() } }
+}
+impl SendError { pub fn is_timeout(&self) -> bool { self.timeout } }
+pub(crate) async fn send_builder(builder: reqwest::RequestBuilder) -> Result<reqwest::Response, SendError> {
+    send_builder_with_tls(builder, false, None).await
+}
+async fn send_builder_with_tls(builder: reqwest::RequestBuilder, tls: bool, front: Option<&ResolvedProxy>) -> Result<reqwest::Response, SendError> {
+    let (original_client, request) = builder.build_split();
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            if let Some(context) = crate::server::core::proxy_rotate::context() { context.lock().await.local_failure = true; }
+            return Err(SendError::from(error));
+        }
+    };
+    let origin = request.url().clone();
+    let replay = request.try_clone();
+    let mut first = Some(request);
+    let context = crate::server::core::proxy_rotate::context();
+    let active = match &context { Some(c) => { let mut a = c.lock().await; a.begin_exchange(); a.active() }, None => false };
+    // Each HTTP exchange owns its tried set. Background heartbeat/cleanup exchanges
+    // may overlap; they share sticky publication, never mutate each other's attempts.
+    let mut exchange = match &context { Some(c) => c.lock().await.clone(), None => Default::default() };
+    exchange.set_origin(&origin);
+    let deadline = if active { exchange.deadline.unwrap_or_else(|| tokio::time::Instant::now() + headers_timeout()) }
+        else { tokio::time::Instant::now() + headers_timeout() };
+    let mut failed = false;
+    let mut last = None;
+    let mut sends = 0;
+    let mut retries_500 = 0;
+    let mut retried_throttle = false;
+    loop {
+        if tokio::time::Instant::now() >= deadline || sends >= crate::server::core::proxy_rotate::MAX_ATTEMPTS {
+            return last.unwrap_or_else(|| Err(SendError { message:"轮询总选路预算已耗尽".into(), timeout:true, local:false }));
+        }
+        let client = if active {
+            let context = context.as_ref().expect("active context");
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let selected = match tokio::time::timeout(remaining, exchange.select(failed)).await {
+                Ok(selected) => selected,
+                Err(_) => return last.unwrap_or_else(|| Err(SendError { message:"轮询出口等待超时".into(), timeout:true, local:false })),
+            };
+            context.lock().await.adopt(&exchange);
+            match selected {
+                Ok(Some(mut proxy)) => {
+                    egress::validate_account_route(Some(&proxy), front)
+                        .map_err(|message| SendError { message, timeout:false, local:true })?;
+                    if let Some(front) = front {
+                        let endpoint = crate::server::core::proxy_chain::chain_endpoint(front, &proxy)
+                            .ok_or_else(|| SendError { message:"建立代理链失败".into(), timeout:false, local:true })?;
+                        let address: std::net::SocketAddr = endpoint.local_addr.parse()
+                            .map_err(|e| SendError { message:format!("代理链端点无效: {e}"), timeout:false, local:true })?;
+                        proxy.host = address.ip().to_string(); proxy.port = Some(address.port());
+                        proxy.username.clear(); proxy.password.clear();
+                    }
+                    egress::client_for_with_tls(Some(&proxy), tls).as_ref().clone()
+                },
+                _ if last.is_some() => return last.take().unwrap(),
+                Err(message) => return Err(SendError { message, timeout:false, local:true }),
+                _ => return Err(SendError { message:"轮询没有可用出口".into(), timeout:false, local:true }),
+            }
+        } else { original_client.clone() };
+        let Some(copy) = first.take().or_else(|| replay.as_ref().and_then(reqwest::Request::try_clone)) else {
+            return last.unwrap_or_else(|| Err(SendError { message:"请求体不可重放".into(), timeout:false, local:true }));
+        };
+        if let Some(context) = &context { context.lock().await.network_started = true; }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        sends += 1;
+        let mut result = match tokio::time::timeout(remaining, client.execute(copy)).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => Err(SendError { message:egress::describe_error_detail(&e), timeout:e.is_timeout(), local:e.is_builder() }),
+            Err(_) => Err(SendError { message:"等待响应超时".into(), timeout:true, local:false }),
+        };
+        if let Some(lease) = exchange.lease() {
+            result = result.map(|response| hold_response_lease(response, lease));
+        }
+        if !active { return result; }
+        let status = result.as_ref().ok().map(|r| r.status().as_u16());
+        let retry_after = result.as_ref().ok().map(|r| retry_after_delay(r.headers())).unwrap_or_default();
+        let mut sample = String::new();
+        if status.is_some_and(|s| s == 403 || s == 429) {
+            if let Ok(response) = result {
+                let (response, body) = buffer_error_sample(response, deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_secs(2))).await;
+                sample = String::from_utf8_lossy(&body).into_owned(); result = Ok(response);
+            }
+        }
+        let same_exit_throttle = status == Some(429) && !exchange.all_errors() && !retried_throttle
+            && short_throttle(&sample, retry_after) && retry_status(429,&sample,false,0).is_none();
+        if same_exit_throttle && replay.is_some() && sends < crate::server::core::proxy_rotate::MAX_ATTEMPTS
+            && retry_after < deadline.saturating_duration_since(tokio::time::Instant::now()) {
+            retried_throttle = true;
+            last = Some(match result { Ok(response) => Ok(buffer_error_response(response, deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_secs(2))).await), error => error });
+            crate::server::logging::log("[ProxyRotate]", &format!("attempt={sends} retry=short_throttle_same_exit status=429"));
+            tokio::time::sleep(retry_after).await;
+            failed = false; continue;
+        }
+        let reason = match &result {
+            Ok(response) => retry_status(response.status().as_u16(), &sample, exchange.all_errors(), retries_500),
+            Err(error) if !error.local => Some("transport"),
+            _ => None,
+        };
+        if reason.is_some() { exchange.finish_health(true, retry_after); }
+        else if status.is_some_and(|s| s < 400) {
+            exchange.finish_health(false, Duration::ZERO);
+            if let Some(context) = &context { context.lock().await.adopt(&exchange); }
+            result = result.map(|response| hold_response_health(response, exchange.clone()));
+        }
+        // Unknown quota/auth errors are returned unchanged to provider refresh/classification.
+        // No wait/replay after successful headers; the actual response Body keeps its lease.
+        if reason.is_none() || replay.is_none() { return result; }
+        if status == Some(500) { retries_500 += 1; }
+        last = Some(match result {
+            Ok(response) => Ok(buffer_error_response(response, deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_secs(2))).await),
+            error => error,
+        });
+        if let Some(context) = &context { context.lock().await.release_exchange_lease(); }
+        if sends >= crate::server::core::proxy_rotate::MAX_ATTEMPTS || retry_after >= deadline.saturating_duration_since(tokio::time::Instant::now()) { return last.unwrap(); }
+        // Fixed reason codes only: no URL, account, proxy label, response or credentials.
+        crate::server::logging::log("[ProxyRotate]", &format!("attempt={sends} retry={} status={}", reason.unwrap(), status.unwrap_or(0)));
+        if !retry_after.is_zero() { tokio::time::sleep(retry_after).await; }
+        failed = true;
+    }
+}
+
+fn short_throttle(body: &str, delay: Duration) -> bool {
+    let body = body.to_ascii_lowercase();
+    !delay.is_zero() && delay <= Duration::from_secs(5)
+        && !["quota", "credit", "billing", "insufficient", "daily limit", "monthly limit", "余额", "额度", "配额"].iter().any(|s| body.contains(s))
+        && ["too many requests", "rate limit", "rate_limit", "throttl"].iter().any(|s| body.contains(s))
+}
+fn retry_status(status: u16, body: &str, all_errors: bool, retries_500: usize) -> Option<&'static str> {
+    if all_errors && (400..600).contains(&status) { return Some("all_errors"); }
+    match status {
+        502..=504 => Some("gateway"),
+        500 if retries_500 == 0 => Some("server_500_once"),
+        403 | 429 => {
+            let body = body.to_ascii_lowercase();
+            // Explicit exit-scoped signals only, never generic "quota/rate limit".
+            ["ip_rate_limit", "ip rate limit", "rate limit per ip", "rate limit exceeded for ip",
+             "ip address blocked", "ip_address_blocked", "unsupported_country", "country not supported",
+             "region not supported", "geo_blocked", "地区不支持", "ip限流", "ip 限流"]
+                .iter().any(|signal| body.contains(signal)).then_some("exit_restricted")
+        }
+        _ => None,
+    }
+}
+fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Duration {
+    let Some(value) = headers.get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()) else { return Duration::ZERO };
+    if let Ok(seconds) = value.trim().parse::<u64>() { return Duration::from_secs(seconds.min(86400)); }
+    chrono::DateTime::parse_from_rfc2822(value).ok()
+        .map(|date| Duration::from_secs((date.timestamp() - chrono::Utc::now().timestamp()).clamp(0,86400) as u64)).unwrap_or_default()
+}
+// Inspect only a bounded prefix, retaining the untouched remainder for provider errors.
+async fn buffer_error_sample(response: reqwest::Response, budget: Duration) -> (reqwest::Response, Vec<u8>) {
+    use futures::StreamExt;
+    let raw: axum::http::Response<reqwest::Body> = response.into();
+    let (parts, body) = raw.into_parts();
+    let mut stream = reqwest::Response::from(axum::http::Response::new(body)).bytes_stream();
+    let mut chunks = Vec::new(); let mut sample = Vec::new();
+    let _ = tokio::time::timeout(budget, async {
+        while let Some(chunk) = stream.next().await {
+            let done = match &chunk { Ok(bytes) => { let left = (64 * 1024usize).saturating_sub(sample.len()); sample.extend_from_slice(&bytes[..bytes.len().min(left)]); sample.len() >= 64*1024 }, Err(_) => true };
+            chunks.push(chunk); if done { break; }
+        }
+    }).await;
+    let body = reqwest::Body::wrap_stream(futures::stream::iter(chunks).chain(stream));
+    (reqwest::Response::from(axum::http::Response::from_parts(parts, body)), sample)
+}
+
+fn hold_response_health(response: reqwest::Response, mut exchange: crate::server::core::proxy_rotate::Attempts) -> reqwest::Response {
+    use futures::StreamExt;
+    let raw: axum::http::Response<reqwest::Body> = response.into();
+    let (parts, body) = raw.into_parts();
+    let source = reqwest::Response::from(axum::http::Response::new(body)).bytes_stream();
+    let held = source.map(move |chunk| {
+        if chunk.is_err() { exchange.retire_failed_stream(); }
+        chunk
+    });
+    reqwest::Response::from(axum::http::Response::from_parts(parts, reqwest::Body::wrap_stream(held)))
+}
+
+fn hold_response_lease<T: Send + Sync + 'static>(response: reqwest::Response, lease: std::sync::Arc<T>) -> reqwest::Response {
+    use futures::StreamExt;
+    let raw: axum::http::Response<reqwest::Body> = response.into();
+    let (parts, body) = raw.into_parts();
+    let source = reqwest::Response::from(axum::http::Response::new(body)).bytes_stream();
+    let held = source.map(move |chunk| { let _lease = &lease; chunk });
+    reqwest::Response::from(axum::http::Response::from_parts(parts, reqwest::Body::wrap_stream(held)))
+}
+async fn buffer_error_response(response: reqwest::Response, budget: Duration) -> reqwest::Response {
+    use futures::StreamExt;
+    let raw: axum::http::Response<reqwest::Body> = response.into();
+    let (mut parts,body) = raw.into_parts();
+    let mut stream = reqwest::Response::from(axum::http::Response::new(body)).bytes_stream();
+    let mut bytes = Vec::new();
+    let _ = tokio::time::timeout(budget, async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let left = (64 * 1024usize).saturating_sub(bytes.len());
+            bytes.extend_from_slice(&chunk[..chunk.len().min(left)]);
+            if bytes.len() == 64 * 1024 { break; }
+        }
+    }).await;
+    drop(stream); // Drop the old sidecar body owner before resolving the next exit.
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+    reqwest::Response::from(axum::http::Response::from_parts(parts, reqwest::Body::from(bytes)))
+}
+
 /// 传输层失败（统一收敛成 502，与 Node 的 fetchViaProxy 一致）
 #[derive(Clone, Debug)]
 pub struct UpstreamRequestError {
+    pub local: bool,
     pub message: String,
     /// 简短原因（重试链里「这次为什么重试」的展示文案）：
     /// 「连接中超时(N秒)」/「等待响应超时(N秒)」/「上游连接失败」。
@@ -221,6 +487,291 @@ pub struct UpstreamRequestError {
 impl UpstreamRequestError {
     pub fn to_gateway_error(&self) -> GatewayError {
         GatewayError::with_status(502, self.message.clone())
+    }
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+    use crate::server::core::proxy_rotate::{Attempts, ATTEMPTS};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn proxy(status: u16, body: &'static str) -> (Value, tokio::sync::mpsc::UnboundedReceiver<String>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { break };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") { match s.read_u8().await { Ok(b) => head.push(b), Err(_) => return } }
+                let text = String::from_utf8(head.clone()).unwrap();
+                let len = text.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|s| s.parse::<usize>().ok())).unwrap_or(0);
+                let mut payload = vec![0;len]; s.read_exact(&mut payload).await.unwrap(); head.extend(payload);
+                let _ = tx.send(String::from_utf8(head).unwrap());
+                s.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        (json!({"id":format!("mock-{port}"),"source":"manual","protocol":"http","host":"127.0.0.1","port":port}), rx, task)
+    }
+    #[test]
+    fn smart_matrix_and_retry_after_are_conservative() {
+        for status in [400,401,402,404,408,409,413,422,500,501] {
+            assert!(retry_status(status,"",false,1).is_none(),"{status}");
+        }
+        for status in [403,429] {
+            for body in ["quota exhausted","rate limit exceeded","insufficient credits","forbidden", "token expired"] {
+                assert!(retry_status(status,body,false,0).is_none());
+            }
+            assert_eq!(retry_status(status,"IP_RATE_LIMIT",false,0),Some("exit_restricted"));
+            assert_eq!(retry_status(status,"unsupported_country",false,0),Some("exit_restricted"));
+        }
+        assert!(retry_status(500,"",false,0).is_some());
+        for status in [502,503,504] { assert!(retry_status(status,"",false,1).is_some()); }
+        for status in [400,401,403,413,429,500] { assert_eq!(retry_status(status,"",true,3),Some("all_errors")); }
+        let mut headers=reqwest::header::HeaderMap::new(); headers.insert("retry-after","12".parse().unwrap());
+        assert_eq!(retry_after_delay(&headers),Duration::from_secs(12));
+        headers.insert("retry-after",(chrono::Utc::now()+chrono::Duration::seconds(60)).to_rfc2822().parse().unwrap());
+        assert!((58..=60).contains(&retry_after_delay(&headers).as_secs()));
+    }
+    #[tokio::test]
+    async fn deterministic_errors_do_not_visit_second_exit_and_keep_original_body() {
+        for (status,body) in [(400,"bad request"),(401,"refresh token"),(403,"forbidden"),(413,"too large"),(422,"invalid"),(429,"quota exhausted")] {
+            let (a,mut arx,at)=proxy(status,body).await; let (b,mut brx,bt)=proxy(200,"wrong").await;
+            let key=new_request_id(); let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,vec![a,b])));
+            ATTEMPTS.scope(route,async {
+                let response=send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed")).await.unwrap();
+                assert_eq!(response.status(),status); assert_eq!(response.text().await.unwrap(),body);
+            }).await;
+            assert!(arx.recv().await.is_some()); assert!(brx.try_recv().is_err());
+            at.abort();bt.abort();crate::server::core::proxy_rotate::retire(&key);
+        }
+    }
+    #[tokio::test]
+    async fn only_one_500_retry_but_gateway_failures_have_five_attempt_cap() {
+        for (status,count) in [(500,2),(503,5)] {
+            let mut items=Vec::new();let mut receivers=Vec::new();let mut tasks=Vec::new();
+            for _ in 0..7 { let (item,rx,task)=proxy(status,"failure").await;items.push(item);receivers.push(rx);tasks.push(task); }
+            let key=new_request_id();let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,items)));
+            ATTEMPTS.scope(route,async { assert_eq!(send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed")).await.unwrap().status(),status); }).await;
+            for (i,rx) in receivers.iter_mut().enumerate() { assert_eq!(rx.try_recv().is_ok(),i<count); }
+            for task in tasks { task.abort(); } crate::server::core::proxy_rotate::retire(&key);
+        }
+    }
+    #[tokio::test]
+    async fn aggressive_errors_and_explicit_ip_restrictions_can_rotate() {
+        for aggressive in [false,true] {
+            let (a,mut arx,at)=proxy(if aggressive {401}else{403},"ip_address_blocked").await;
+            let (b,mut brx,bt)=proxy(200,"ok").await;let key=new_request_id();
+            let attempts=if aggressive {Attempts::mock_aggressive(&key,vec![a,b])}else{Attempts::mock(&key,vec![a,b])};
+            ATTEMPTS.scope(Arc::new(tokio::sync::Mutex::new(attempts)),async {assert_eq!(send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed")).await.unwrap().text().await.unwrap(),"ok");}).await;
+            assert!(arx.recv().await.is_some());assert!(brx.recv().await.is_some());at.abort();bt.abort();crate::server::core::proxy_rotate::retire(&key);
+        }
+    }
+    #[tokio::test]
+    async fn connection_failure_rotates_without_rebuilding_payload() {
+        let dead=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=dead.local_addr().unwrap().port();drop(dead);
+        let (b,mut rx,task)=proxy(200,"ok").await;let key=new_request_id();
+        let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,vec![json!({"id":format!("dead-{port}"),"source":"manual","host":"127.0.0.1","port":port}),b])));
+        ATTEMPTS.scope(route,async {assert_eq!(send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed-payload")).await.unwrap().status(),200);}).await;
+        assert!(rx.recv().await.unwrap().ends_with("fixed-payload"));task.abort();crate::server::core::proxy_rotate::retire(&key);
+    }
+    #[tokio::test]
+    async fn preparation_and_http_share_deadline() {
+        let (a,mut rx,task)=proxy(200,"late").await;let key=new_request_id();
+        let mut attempts=Attempts::mock(&key,vec![a]); attempts.deadline=Some(tokio::time::Instant::now()-Duration::from_millis(1));
+        let route=Arc::new(tokio::sync::Mutex::new(attempts));
+        let error=ATTEMPTS.scope(route,send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed"))).await.unwrap_err();
+        assert!(error.timeout);assert!(rx.try_recv().is_err());task.abort();
+    }
+    #[tokio::test]
+    async fn short_retry_after_retries_same_exit_once_but_quota_does_not() {
+        for (body,expected) in [("Too many requests",2),("quota exhausted",1)] {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+            let hits=Arc::new(std::sync::atomic::AtomicUsize::new(0));let counter=hits.clone();
+            let server=tokio::spawn(async move {loop {let (mut s,_)=listener.accept().await.unwrap();let mut buf=[0;4096];let _=s.read(&mut buf).await;counter.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                s.write_all(format!("HTTP/1.1 429 Test\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();}});
+            let (b,mut rx,task)=proxy(200,"wrong").await;let key=new_request_id();
+            let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,vec![json!({"id":format!("short-{port}"),"source":"manual","host":"127.0.0.1","port":port}),b])));
+            let start=std::time::Instant::now();
+            ATTEMPTS.scope(route,async {let r=send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed")).await.unwrap();assert_eq!(r.status(),429);assert_eq!(r.text().await.unwrap(),body);}).await;
+            if expected==2 {assert!(start.elapsed()>=Duration::from_secs(1));}
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst),expected);assert!(rx.try_recv().is_err());
+            server.abort();task.abort();crate::server::core::proxy_rotate::retire(&key);
+        }
+    }
+    #[tokio::test]
+    async fn retry_after_over_budget_returns_original_response_without_rotation() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+        let server=tokio::spawn(async move { let (mut s,_)=listener.accept().await.unwrap();let mut buf=[0;4096];let _=s.read(&mut buf).await;
+            s.write_all(b"HTTP/1.1 429 Test\r\nRetry-After: 3600\r\nContent-Length: 13\r\nConnection: close\r\n\r\nip_rate_limit").await.unwrap(); });
+        let (b,mut rx,task)=proxy(200,"wrong").await;let key=new_request_id();
+        let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,vec![json!({"id":format!("retry-{port}"),"source":"manual","host":"127.0.0.1","port":port}),b])));
+        ATTEMPTS.scope(route,async { let r=send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed")).await.unwrap();assert_eq!(r.status(),429);assert_eq!(r.headers()["retry-after"],"3600");assert_eq!(r.text().await.unwrap(),"ip_rate_limit"); }).await;
+        assert!(rx.try_recv().is_err());server.await.unwrap();task.abort();crate::server::core::proxy_rotate::retire(&key);
+    }
+    #[tokio::test]
+    async fn successful_sse_outlives_selection_deadline() {
+        use futures::StreamExt;
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+        // Share an absolute deadline: the body must arrive after it, while header
+        // selection has enough headroom on a busy parallel Windows test runner.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let server=tokio::spawn(async move { let (mut s,_)=listener.accept().await.unwrap();let mut buf=[0;4096];let _=s.read(&mut buf).await;
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: first\n\n").await.unwrap();
+            tokio::time::sleep_until(deadline + Duration::from_millis(50)).await;s.write_all(b"data: later\n\n").await.unwrap(); });
+        let key=new_request_id();let mut a=Attempts::mock(&key,vec![json!({"id":format!("sse-{port}"),"source":"manual","host":"127.0.0.1","port":port})]);
+        a.deadline=Some(deadline);
+        ATTEMPTS.scope(Arc::new(tokio::sync::Mutex::new(a)),async { let r=send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed")).await.unwrap();let mut stream=r.bytes_stream();let mut bytes=Vec::new();while let Some(chunk)=stream.next().await {bytes.extend(chunk.unwrap());}assert!(String::from_utf8(bytes).unwrap().contains("later")); }).await;
+        server.await.unwrap();crate::server::core::proxy_rotate::retire(&key);
+    }
+    #[tokio::test]
+    async fn http_500_switches_once_and_preserves_payload_headers_then_sticks() {
+        let (a, mut arx, at) = proxy(500,"failed").await;
+        let (b, mut brx, bt) = proxy(200,"ok").await;
+        let key = new_request_id();
+        let route = Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key, vec![a,b])));
+        ATTEMPTS.scope(route.clone(), async {
+            for _ in 0..2 {
+                let request = reqwest::Client::new().post("http://example.invalid/chat")
+                    .header("authorization","Bearer fixed-key").header("x-session-id","unchanged")
+                    .body("{\"messages\":[\"same\"]}");
+                assert_eq!(send_builder(request).await.unwrap().text().await.unwrap(),"ok");
+            }
+        }).await;
+        let first = arx.recv().await.unwrap();
+        let second = brx.recv().await.unwrap();
+        assert_eq!(first,second);
+        assert_eq!(second,brx.recv().await.unwrap());
+        assert!(arx.try_recv().is_err());
+        crate::server::core::proxy_rotate::retire(&key); at.abort(); bt.abort();
+    }
+    #[tokio::test]
+    async fn actual_response_body_owns_lease_after_head_consumed() {
+        use futures::StreamExt;
+        struct Lease(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Lease { fn drop(&mut self) { self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst); } }
+        let drops=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lease=Arc::new(Lease(drops.clone()));
+        let (tx,rx)=tokio::sync::mpsc::channel::<Result<bytes::Bytes,std::io::Error>>(2);
+        let response=reqwest::Response::from(axum::http::Response::new(reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(rx))));
+        let response=hold_response_lease(response,lease.clone());drop(lease);
+        let mut stream=response.bytes_stream();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst),0);
+        tx.send(Ok(bytes::Bytes::from_static(b"partial"))).await.unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(),"partial");
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst),0);
+        drop(tx);assert!(stream.next().await.is_none());drop(stream);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst),1);
+    }
+    #[tokio::test]
+    async fn new_http_exchange_can_retry_after_previous_exchange_exhaustion() {
+        let (a,mut rx,task)=proxy(401,"original error body").await;
+        let key=new_request_id();
+        let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,vec![a])));
+        ATTEMPTS.scope(route,async {
+            for token in ["old","refreshed"] {
+                let response=send_builder(reqwest::Client::new().post("http://example.invalid/").header("authorization",token).body("same")).await.unwrap();
+                assert_eq!(response.status(),401); assert_eq!(response.text().await.unwrap(),"original error body");
+            }
+            // The project's spawn helper must retain this route beyond its parent scope.
+            let inherited=crate::spawn_task(async { crate::server::core::proxy_rotate::context().is_some() }).await.unwrap();
+            assert!(inherited);
+        }).await;
+        assert!(rx.recv().await.unwrap().contains("authorization: old"));
+        assert!(rx.recv().await.unwrap().contains("authorization: refreshed"));
+        task.abort();crate::server::core::proxy_rotate::retire(&key);
+    }
+    #[tokio::test]
+    async fn local_builder_error_does_not_send_or_rotate() {
+        let (a, mut rx, task) = proxy(200,"ok").await;
+        let key = new_request_id();
+        let route = Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,vec![a])));
+        ATTEMPTS.scope(route, async {
+            let result = send_builder(reqwest::Client::new().post("http://example.invalid/").header("bad\nheader","v")).await;
+            assert!(result.unwrap_err().local);
+        }).await;
+        assert!(rx.try_recv().is_err()); task.abort();
+    }
+    #[tokio::test]
+    async fn noncloneable_body_is_sent_once_without_rotation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut s,_) = listener.accept().await.unwrap();
+            let mut bytes=[0;4096]; let _ = s.read(&mut bytes).await.unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        });
+        let stream = futures::stream::iter(vec![Ok::<_,std::io::Error>(bytes::Bytes::from_static(b"hello"))]);
+        let response = send_builder(reqwest::Client::new().post(format!("http://{address}/")).body(reqwest::Body::wrap_stream(stream))).await.unwrap();
+        assert_eq!(response.status(),200); task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_send_does_not_try_another_exit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port=listener.local_addr().unwrap().port();
+        let (b,mut rx, task) = proxy(200,"ok").await;
+        let key=new_request_id();
+        let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,vec![json!({"id":"stalled","source":"manual","host":"127.0.0.1","port":port}),b])));
+        let result=tokio::time::timeout(Duration::from_millis(100),ATTEMPTS.scope(route,send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed")))).await;
+        assert!(result.is_err()); assert!(rx.try_recv().is_err());
+        crate::server::core::proxy_rotate::retire(&key); task.abort();
+    }
+    #[tokio::test]
+    async fn old_body_error_does_not_retire_new_exchange_through_forward_stream_context() {
+        use futures::StreamExt;
+        use crate::server::core::upstream::{ForwardStream, connections::{ConnectionGuard, Connections}, sse::FramePolicy, usage::RequestTelemetry};
+        let (a,_,at)=proxy(200,"a").await;let (b,_,bt)=proxy(200,"b").await;
+        let key=new_request_id();let origin=url::Url::parse("http://snapshot.invalid/").unwrap();
+        let mut old=Attempts::mock(&key,vec![a.clone()]);old.set_origin(&origin);old.select(false).await.unwrap();old.finish_health(false,Duration::ZERO);
+        let context=Arc::new(tokio::sync::Mutex::new(old.clone()));
+        let (tx,rx)=tokio::sync::mpsc::channel::<Result<bytes::Bytes,std::io::Error>>(1);
+        let raw=reqwest::Response::from(axum::http::Response::new(reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(rx))));
+        let response=hold_response_health(raw,old);
+        let inner=response.bytes_stream().map(|chunk|chunk.map_err(std::io::Error::other));
+        let mut forwarded=ATTEMPTS.scope(context.clone(),async {ForwardStream::from_translated(Box::pin(inner),None,ConnectionGuard::new(Connections::new()),Arc::new(RequestTelemetry::new()),FramePolicy::default())}).await;
+        crate::server::core::proxy_rotate::retire(&key);
+        let mut new=Attempts::mock(&key,vec![b.clone()]);new.set_origin(&origin);let expected=new.select(false).await.unwrap().unwrap();new.finish_health(false,Duration::ZERO);
+        context.lock().await.adopt(&new);
+        tx.send(Err(std::io::Error::other("old body failure"))).await.unwrap();drop(tx);
+        while forwarded.next().await.is_some() {}
+        tokio::task::yield_now().await;tokio::time::sleep(Duration::from_millis(20)).await;
+        // Re-acquire health: the old mutable-context callback would have poisoned B.
+        let mut verify=Attempts::mock(&key,vec![b]);verify.set_origin(&origin);
+        assert_eq!(verify.select(false).await.unwrap().unwrap().port,expected.port);
+        let mut failed=Attempts::mock("old-body-origin",vec![a]);failed.set_origin(&origin);assert!(failed.select(false).await.is_err());
+        at.abort();bt.abort();crate::server::core::proxy_rotate::retire(&key);
+    }
+    #[tokio::test]
+    async fn actual_body_failure_records_origin_health_after_sticky_retirement() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+        let (release,wait)=tokio::sync::oneshot::channel();
+        let server=tokio::spawn(async move {let (mut s,_)=listener.accept().await.unwrap();let mut buf=[0;4096];let _=s.read(&mut buf).await;
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\npartial").await.unwrap();let _=wait.await;});
+        let key=new_request_id();let items=vec![json!({"id":format!("body-health-{port}"),"source":"manual","host":"127.0.0.1","port":port})];
+        let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,items.clone())));
+        let response=ATTEMPTS.scope(route,send_builder(reqwest::Client::new().post("http://body-health.invalid/").body("fixed"))).await.unwrap();
+        crate::server::core::proxy_rotate::retire(&key);release.send(()).unwrap();assert!(response.bytes().await.is_err());
+        let mut next=Attempts::mock(&key,items.clone());next.set_origin(&url::Url::parse("http://body-health.invalid/").unwrap());assert!(next.select(false).await.is_err());
+        let mut other=Attempts::mock(&key,items);other.set_origin(&url::Url::parse("http://other-health.invalid/").unwrap());assert!(other.select(false).await.is_ok());
+        server.await.unwrap();crate::server::core::proxy_rotate::retire(&key);
+    }
+    #[tokio::test]
+    async fn successful_headers_and_partial_body_never_replay() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port=listener.local_addr().unwrap().port();
+        let partial=tokio::spawn(async move {
+            let (mut s,_)=listener.accept().await.unwrap(); let mut buf=[0;4096]; let _=s.read(&mut buf).await;
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\ndata: partial\n\n").await.unwrap();
+        });
+        let (b,mut rx, task)=proxy(200,"duplicate").await;
+        let key=new_request_id();
+        let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,vec![json!({"id":"partial","source":"manual","host":"127.0.0.1","port":port}),b])));
+        ATTEMPTS.scope(route,async {
+            let response=send_builder(reqwest::Client::new().post("http://example.invalid/").body("fixed")).await.unwrap();
+            assert!(response.bytes().await.is_err());
+        }).await;
+        assert!(rx.try_recv().is_err()); partial.await.unwrap(); task.abort(); crate::server::core::proxy_rotate::retire(&key);
     }
 }
 

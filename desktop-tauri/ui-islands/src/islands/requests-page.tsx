@@ -609,7 +609,7 @@ function countRetries(entry: RequestEntry): number {
 
 /** 展示名：最新目录 → 后端有效名称 → 原始 ID；账号字段不参与解析。 */
 function providerLabelOf(id: string, backendLabel?: string): string {
-  return resolveProviderLabel(id, backendLabel, shared().wbProviders?.labelOf)
+  return t(resolveProviderLabel(id, backendLabel, shared().wbProviders?.labelOf))
 }
 
 /** 行 key 的去重：ts 在同一毫秒可能重复（并发请求），重复的补一个序号后缀，避免 React 报重复 key */
@@ -641,7 +641,7 @@ async function refreshFilterOptions(): Promise<void> {
   try {
     const filters = await shared().workbuddyDesktop?.getStatsRequestFilters()
     const providers: ProviderOption[] = (Array.isArray(filters?.providers) ? filters.providers : [])
-      .map(item => ({ value: String(item?.id || ''), label: String(item?.label || item?.id || '') }))
+      .map(item => ({ value: String(item?.id || ''), label: t(String(item?.label || item?.id || '')) }))
       .filter(item => item.value)
     const models: string[] = (Array.isArray(filters?.models) ? filters.models : [])
       .map(name => String(name || ''))

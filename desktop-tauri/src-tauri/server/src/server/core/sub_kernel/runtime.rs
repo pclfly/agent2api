@@ -220,6 +220,229 @@ fn read_provider_definitions(providers: &[ProviderInput]) -> HashMap<String, Val
     defs
 }
 
+#[cfg(test)]
+mod temporary_lease_tests {
+    use super::*;
+    fn fixture() -> std::sync::Arc<TemporaryNode> {
+        let dir=std::env::temp_dir().join(format!("agent2api-lease-test-{}",random_secret()));
+        std::fs::create_dir(&dir).unwrap(); std::fs::write(dir.join("config.yaml"),"local mock secret").unwrap();
+        std::sync::Arc::new(TemporaryNode { proxy:crate::server::core::proxies::ResolvedProxy {
+            source:"temporary:mock".into(), protocol:"http".into(), host:"127.0.0.1".into(), port:Some(1), username:String::new(),password:String::new(),label:"test".into()
+        },child:std::sync::Mutex::new(None),dir })
+    }
+    #[tokio::test]
+    async fn dead_child_is_not_reused_while_old_body_still_owns_node() {
+        let node=fixture();let old_body=node.clone();let mut pool=TemporaryPool::default();
+        #[cfg(windows)]
+        let mut command={let mut c=tokio::process::Command::new("cmd.exe");c.args(["/D","/C","exit 0"]);c};
+        #[cfg(not(windows))]
+        let mut command={let mut c=tokio::process::Command::new("sh");c.args(["-c","exit 0"]);c};
+        let mut child=command.kill_on_drop(true).spawn().unwrap();child.wait().await.unwrap();
+        *node.child.lock().unwrap()=Some(child);
+        pool.nodes.insert("node".into(),std::sync::Arc::downgrade(&node));pool.attach("account",&node).unwrap();
+        assert!(pool.reusable("node").is_none());assert!(!pool.nodes.contains_key("node"));
+        assert_eq!(pool.owners.len(),1);assert!(old_body.dir.exists());
+        // The vacant reuse key can be republished without overwriting/dropping old owners.
+        let replacement=fixture();pool.attach("account",&replacement).unwrap();pool.nodes.insert("node".into(),std::sync::Arc::downgrade(&replacement));
+        assert_eq!(pool.owners.len(),2);assert!(!pool.nodes["node"].ptr_eq(&std::sync::Arc::downgrade(&old_body)));
+        assert!(pool.reusable("node").is_none()); // no child is also never reusable
+    }
+    #[test]
+    fn temporary_pool_limits_share_nodes_and_count_retired_streams() {
+        let mut pool=TemporaryPool::default(); let a=fixture();let b=fixture();let c=fixture();
+        pool.attach("account",&a).unwrap();pool.attach("account",&a).unwrap();assert_eq!(pool.owners.len(),1);
+        pool.attach("account",&b).unwrap();assert!(pool.attach("account",&c).is_err());
+        pool.attach("another",&a).unwrap();
+        let stream=a.clone();drop(a);pool.prune();assert!(pool.attach("account",&c).is_err());
+        drop(stream);pool.prune();pool.attach("account",&c).unwrap();
+        assert_eq!(pool.owners.iter().filter(|(a,_)|a=="account").count(),2);
+        for i in 0..MAX_TEMPORARY_NODES {pool.nodes.insert(i.to_string(),std::sync::Arc::downgrade(&b));}
+        assert_eq!(pool.nodes.len(),MAX_TEMPORARY_NODES);
+        drop(b);pool.prune();assert!(pool.nodes.is_empty());
+    }
+    #[tokio::test]
+    async fn retired_lease_keeps_concurrent_owner_and_removes_secret_after_last_drop() {
+        let owner=fixture(); let stream=owner.clone(); let dir=owner.dir.clone();
+        drop(owner); assert!(dir.join("config.yaml").exists());
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2),async { while dir.exists() { tokio::time::sleep(Duration::from_millis(10)).await; } }).await.unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_provisioning_drops_directory_guard() {
+        let owner=fixture(); let dir=owner.dir.clone();
+        let task=tokio::spawn(async move { let _guard=owner; std::future::pending::<()>().await; });
+        tokio::task::yield_now().await; task.abort(); let _=task.await;
+        tokio::time::timeout(Duration::from_secs(2),async { while dir.exists() { tokio::time::sleep(Duration::from_millis(10)).await; } }).await.unwrap();
+    }
+}
+
+/// An independent, single-node kernel. Never touches main config/state/controller.
+#[derive(Debug)]
+pub struct TemporaryNode {
+    pub proxy: crate::server::core::proxies::ResolvedProxy,
+    child: std::sync::Mutex<Option<tokio::process::Child>>,
+    dir: std::path::PathBuf,
+}
+impl Drop for TemporaryNode {
+    fn drop(&mut self) {
+        let mut child = self.child.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(child) = &mut child { let _ = child.start_kill(); }
+        let dir = self.dir.clone();
+        // Reap even when the request/runtime is being cancelled. Only this owned child.
+        std::thread::spawn(move || {
+            for _ in 0..100 {
+                let exited = child.as_mut().map(|c| c.try_wait().ok().flatten().is_some()).unwrap_or(true);
+                if exited && std::fs::remove_dir_all(&dir).is_ok() { break; }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+}
+
+static TEMPORARY_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn temporary_stopping() -> bool { TEMPORARY_STOPPING.load(std::sync::atomic::Ordering::SeqCst) }
+fn temporary_nodes() -> &'static std::sync::Mutex<Vec<std::sync::Weak<TemporaryNode>>> {
+    static NODES: std::sync::OnceLock<std::sync::Mutex<Vec<std::sync::Weak<TemporaryNode>>>> = std::sync::OnceLock::new();
+    NODES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+pub fn shutdown_temporary_nodes() {
+    let nodes = {
+        let mut nodes = temporary_nodes().lock().unwrap_or_else(|e| e.into_inner());
+        TEMPORARY_STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::mem::take(&mut *nodes)
+    };
+    for node in nodes.into_iter().filter_map(|n| n.upgrade()) {
+        if let Some(mut child) = node.child.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = child.start_kill();
+            for _ in 0..100 {
+                if child.try_wait().ok().flatten().is_some() { break; }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&node.dir);
+    }
+}
+const MAX_TEMPORARY_NODES: usize = 16;
+const MAX_TEMPORARY_PER_ACCOUNT: usize = 2;
+const MAX_TEMPORARY_OWNERS: usize = 512;
+#[derive(Default)]
+struct TemporaryPool {
+    nodes: HashMap<String, std::sync::Weak<TemporaryNode>>,
+    owners: Vec<(String, std::sync::Weak<TemporaryNode>)>,
+}
+impl TemporaryPool {
+    fn prune(&mut self) {
+        self.nodes.retain(|_, n| n.strong_count() > 0);
+        self.owners.retain(|(_, n)| n.strong_count() > 0);
+    }
+    fn reusable(&mut self, key: &str) -> Option<std::sync::Arc<TemporaryNode>> {
+        let node = self.nodes.get(key).and_then(std::sync::Weak::upgrade)?;
+        let alive = node.child.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        if alive { Some(node) } else {
+            // A body/owner Arc only proves resource ownership, not child liveness.
+            // Retain owner accounting and old handles; retire only the reuse index.
+            self.nodes.remove(key); None
+        }
+    }
+    fn attach(&mut self, account: &str, node: &std::sync::Arc<TemporaryNode>) -> Result<(), String> {
+        if self.owners.iter().any(|(a,n)| a == account && n.ptr_eq(&std::sync::Arc::downgrade(node))) { return Ok(()); }
+        self.check_account(account)?;
+        self.owners.push((account.to_string(), std::sync::Arc::downgrade(node))); Ok(())
+    }
+    fn check_account(&self, account: &str) -> Result<(), String> {
+        if self.owners.len() >= MAX_TEMPORARY_OWNERS || self.owners.iter().filter(|(a,_)| a == account).count() >= MAX_TEMPORARY_PER_ACCOUNT {
+            return Err("临时节点账号并发上限已达（2），保留在途请求".into());
+        }
+        Ok(())
+    }
+}
+fn temporary_pool() -> &'static tokio::sync::Mutex<TemporaryPool> {
+    static POOL: std::sync::OnceLock<tokio::sync::Mutex<TemporaryPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| tokio::sync::Mutex::new(TemporaryPool::default()))
+}
+/// Serialize provisioning and publish once per subscription node, across accounts.
+/// Weak pool entries never own a process; sticky/request/body leases do. Holding this
+/// cancellable async lock also counts the single provisioning slot in the global cap.
+/// Retired-but-in-flight leases continue counting against both limits.
+pub async fn temporary_node(account: &str, provider_id: &str, node: &str) -> Result<std::sync::Arc<TemporaryNode>, String> {
+    let mut pool = temporary_pool().lock().await;
+    if temporary_stopping() { return Err("服务正在关闭".into()); }
+    pool.prune();
+    let key = node_key(provider_id, node);
+    if let Some(existing) = pool.reusable(&key) {
+        pool.attach(account, &existing)?; return Ok(existing);
+    }
+    pool.check_account(account)?;
+    if pool.nodes.len() >= MAX_TEMPORARY_NODES { return Err("临时节点全局上限已达（16），保留在途请求".into()); }
+    let owned = start_temporary_node(provider_id, node).await?;
+    pool.attach(account, &owned)?;
+    pool.nodes.insert(key, std::sync::Arc::downgrade(&owned));
+    Ok(owned)
+}
+async fn start_temporary_node(provider_id: &str, node: &str) -> Result<std::sync::Arc<TemporaryNode>, String> {
+    let providers = crate::server::core::subscriptions::enabled_provider_inputs();
+    if !providers.iter().any(|p| p.id == provider_id) {
+        return Err("订阅不存在或已禁用".into());
+    }
+    let mut definition = read_provider_definitions(&providers).remove(&node_key(provider_id, node))
+        .ok_or_else(|| "订阅缓存里没有该节点定义".to_string())?;
+    // References to other nodes cannot silently fall back to direct in a one-node kernel.
+    if definition.get("dialer-proxy").is_some() {
+        return Err("该订阅节点依赖 dialer-proxy，不能独立开放临时端口".into());
+    }
+    definition["name"] = json!("temporary-exit");
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let generation = random_secret();
+    let dir = std::env::temp_dir().join(format!("agent2api-egress-{generation}"));
+    std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+    let owned = std::sync::Arc::new(TemporaryNode {
+        proxy: crate::server::core::proxies::ResolvedProxy {
+            source: format!("temporary:{generation}"), protocol:"http".into(), host:"127.0.0.1".into(), port:Some(port),
+            username:String::new(), password:String::new(), label:format!("{node}（临时 :{port}）"),
+        }, child:std::sync::Mutex::new(None), dir:dir.clone(),
+    });
+    let result = async {
+        let config = json!({
+            "mode":"rule", "log-level":"silent", "ipv6":false,
+            "profile":{"store-selected":false},
+            "proxies":[definition], "rules":["MATCH,REJECT"],
+            "listeners":[{"name":"temporary-in", "type":"mixed", "listen":"127.0.0.1", "port":port, "proxy":"temporary-exit"}]
+        });
+        std::fs::write(dir.join("config.yaml"), serde_yaml::to_string(&config).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let binary = crate::server::core::sub_kernel::kernel_dir().join(crate::server::core::sub_kernel::kernel_binary_name());
+        let mut command = tokio::process::Command::new(binary);
+        command.arg("-d").arg(&dir).arg("-f").arg(dir.join("config.yaml"))
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
+        drop(listener);
+        {
+            let mut nodes = temporary_nodes().lock().unwrap_or_else(|e| e.into_inner());
+            if temporary_stopping() { return Err("服务正在关闭".into()); }
+            nodes.retain(|n| n.strong_count() > 0);
+            nodes.push(std::sync::Arc::downgrade(&owned));
+            *owned.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(command.spawn().map_err(|e| format!("临时节点启动失败: {e}"))?);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if temporary_stopping() { return Err("服务正在关闭".into()); }
+            {
+                let mut child = owned.child.lock().unwrap_or_else(|e| e.into_inner());
+                if child.as_mut().ok_or("临时进程已停止")?.try_wait().map_err(|e| e.to_string())?.is_some() { return Err("临时节点进程已退出".into()); }
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() { break; }
+            if tokio::time::Instant::now() >= deadline { return Err("临时节点监听超时".into()); }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<(), String>(())
+    }.await;
+    result?;
+    if temporary_stopping() { return Err("服务正在关闭".into()); }
+    Ok(owned)
+}
+
 // ─── 控制器调用（本地 REST，Bearer secret）─────────────────
 
 /// 控制器 GET（响应失败一律 None —— 轮询语义里「还没就绪」与「失败」同路）

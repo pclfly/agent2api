@@ -280,7 +280,7 @@ impl ProviderAdapter for CodeArtsAdapter {
             }
             // 真实发出量：只有这里知道（上游那道墙按它判），也是观测要的那个数
             let wire_bytes = payload.len() as i64;
-            let response = match request.body(payload).send().await {
+            let response = match crate::server::core::upstream::request::send_builder(request.body(payload)).await {
                 Ok(response) => response,
                 Err(error) => {
                     session.stop().await;

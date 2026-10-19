@@ -1,5 +1,7 @@
 # AGENT.md
 
+> **本地 Server-only 约束**：本工作区日常调试、测试和编译仅针对 `agent2api-server`，具体规则与命令见根目录 `AGENTS.md`。下文是上游完整发版参考，不应默认执行桌面构建或安装包发布。
+
 > 本文档面向维护者与 AI 代理：Agent2API（workbuddy）桌面端 + Docker 镜像的**标准发版流程**。
 > 所有发布动作都由 `.github/workflows/` 下的两个工作流自动完成，人工只负责「提交、打 tag、挂 GitHub Release、验收」。
 

@@ -123,6 +123,12 @@ const TIP_MODELS = t('所选范围内每个模型各消耗了多少 Token，按�
 const TIP_PROVIDERS_PIE = t('所选范围内每个提供商各消耗了多少 Token，按用量从多到少排，扇区角度即占比。同一个模型名可能有多家都能提供，网关按设置页「转发路由」的优先级依次尝试，所以占比也反映了实际落到谁身上。中心是这一维的合计（等于概览里的总 Token），右侧每行给出该提供商的 Token 用量与百分比。「未知」是指那批请求没记下承载它的提供商 —— 主要是记录提供商这个功能上线之前的旧明细，其次是请求在选定上游之前就失败了。')
 const TIP_CACHE_RATES = t('命中率 = 缓存读取 Token / 输入 Token（promptTokens）。窗口越短越贴近「此刻」：上游把缓存读取与输入分开上报时，该比值合法地可能超过 100%，此处不夹取值、如实展示。')
 const TIP_DAILY_TREND = t('每天的总 Token 用量（输入 + 输出）。柱顶标出当天的读数；区间很长、柱子挤到放不下时只标最高的那几天，其余悬停柱子即可读到。')
+/**
+ * 时间范围控件旁的小问号。两个容易误读的口径都在这里说清：
+ * 「近 N 天」是含今天在内往前数 N 天（所以是 N-1 天前到今天），不是「前 N 天」；
+ * 「昨天」是本地自然日的昨天一整天，与「今天」共用同一套日界线。
+ */
+const TIP_RANGE = t('时间范围。「今天」是本地自然日今天 0 点到现在；「昨天」是昨天一整天（0 点到 24 点）；「近 7 天 / 近 30 天」含今天在内往前数，即今天与之前的 6 / 29 天，不是「不含今天的 7 / 30 天」。')
 
 /* ─── 模块级状态（跨渲染的守卫、缓存与入口登记）────── */
 
@@ -581,8 +587,23 @@ function ReportPage() {
   const rangeRef = React.useRef(range)
   /** 自定义区间同理（见 rangeRef 的说明）：日期一次改一个端，异步回调必须读到配好对的那份 */
   const customRef = React.useRef(custom)
+  /**
+   * 上一次**已应用**的那份数据的签名（JSON 文本）。
+   *
+   * 自动刷新是定时轮询（间隔见「定时任务」页），而两次轮询之间数据常常一个字都没变
+   * （没有新请求、没有跨整点）—— 那种时候 `setData` 进来一个内容相同的新对象，React
+   * 照样会把整页重渲染一遍：365 格热力图、两条折线、环形图、四张排行的元素全部重建一次，
+   * 而屏幕上不会有任何变化。这张签名就是用来挡掉那一轮的。
+   *
+   * 比较用 JSON 文本而不是逐字段：报表是一棵形状固定的数据树，写逐字段比较等于把
+   * 「报表有哪些字段」复制一份到这里（后端加字段就漏一个）。序列化这份数据（几十 KB）
+   * 的成本在毫秒以下，而它省掉的是整页渲染。错误态写空串 —— 从「读取失败」恢复成
+   * 正常数据时必然是一次真正的内容变化，不该被这张签名挡住。
+   */
+  const signatureRef = React.useRef('')
 
-  const applyData = React.useCallback((next: PageData) => {
+  const applyData = React.useCallback((next: PageData, signature: string) => {
+    signatureRef.current = signature
     setData(next)
   }, [])
 
@@ -608,7 +629,12 @@ function ReportPage() {
       if (token !== seq) return summaryValue
       if (!payload || typeof payload !== 'object') throw new Error('后端未返回报表数据')
       summaryValue = payload
-      applyData({ summary: payload, error: null })
+      // 内容与上一轮完全一致就不落 state（见 signatureRef 的说明）：轮询到「没有变化」
+      // 是常态，那一轮不该付整页重渲染的代价
+      const signature = JSON.stringify(payload)
+      if (signature !== signatureRef.current) {
+        applyData({ summary: payload, error: null }, signature)
+      }
       return summaryValue
     } catch (error) {
       if (token !== seq) return summaryValue
@@ -616,7 +642,7 @@ function ReportPage() {
       summaryValue = null
       // silent：只压掉控制台噪音（首屏自持加载 / 轮询用），错误态照常显示在页面上
       if (!options.silent) console.warn('读取报表数据失败:', message)
-      applyData({ summary: null, error: message || t('未知错误') })
+      applyData({ summary: null, error: message || t('未知错误') }, '')
       return null
     }
   }, [applyData])
@@ -627,7 +653,7 @@ function ReportPage() {
   const renderData = React.useCallback((next?: StatsSummary | null): void => {
     if (next === undefined) return
     summaryValue = next || null
-    if (next) applyData({ summary: next, error: null })
+    if (next) applyData({ summary: next, error: null }, JSON.stringify(next))
   }, [applyData])
 
   /** 换档位：内存为准，localStorage 只负责跨次启动恢复；换完立刻重拉一次 */
@@ -761,6 +787,9 @@ function ReportPage() {
       <section className='panel'>
         <div className='panel-head'>
           <h2>{t('统计概览')}</h2>
+          {/* 「近 N 天」是否含今天，光看选项文案有歧义（含今天 = 往前数 N-1 天）。
+              说明挂成小问号而不是写进选项：控件里已有 7 段，再加后缀会把整行撑开 */}
+          <TipQ text={TIP_RANGE} />
           <span className='panel-sub' id='report-range-label'>{RANGE_LABEL[rangeKey] || ''}</span>
           <div className='head-actions'>
             <SegmentedControl options={RANGE_OPTIONS} value={range}

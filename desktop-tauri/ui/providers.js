@@ -186,12 +186,18 @@
    * Bedrock 的填写差异（表单提示里已注明）：API Key 栏填
    * `AccessKeyId:SecretAccessKey`（可选第三段 region），Base URL 可留空
    * （按 region 拼标准端点）或填 `https://bedrock-runtime.<region>.amazonaws.com`。
+   *
+   * Vertex 的填写差异：Base URL 填**模型公共前缀**（到 `.../publishers/google/models`
+   * 为止，不含模型名），模型 id 直接填 `gemini-4-argon` 这类短名（进 URL 路径）。
+   * API Key 可留空 —— 留空表示真实密钥由出网代理（如 Agent Vault 的 MITM 代理）
+   * 注入；直连真实 Vertex 时把 API Key 填进去即可。
    */
   const PROTOCOL_OPTIONS = [
     { value: 'chat_completions', label: 'OpenAI - Chat Completions' },
     { value: 'responses', label: 'OpenAI - Responses' },
     { value: 'anthropic', label: 'Anthropic - Messages' },
     { value: 'bedrock', label: 'AWS Bedrock - Converse' },
+    { value: 'vertex', label: 'Google Vertex - Gemini' },
   ];
 
   /** 按 id 取展示名：空值给空串、查不到就原样回显 id（调用方自行决定占位符） */

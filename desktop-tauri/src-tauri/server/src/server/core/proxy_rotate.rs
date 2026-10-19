@@ -1,273 +1,504 @@
-//! 出网代理的**轮询档**（按请求轮换出口 = 换 IP）。
-//!
-//! ── 为什么要有它（唯一允许的对象是 OpenCode Zen）──────────────
-//! OpenCode Zen 免费档不用 API Key，限流按 **IP** 判：某个 IP 的免费额度用完，
-//! 上游对它的后续请求一律 429。同一个出口死磕只会一直 429，而把出口摊开到多个
-//! IP 上，每条请求都从还有额度的 IP 出去 —— 这就是轮询档的全部目的。
-//! 别的家（订阅制 / 按 Key 计费）不按 IP 限流，轮换出口只会让上游看到一串
-//! 互不相关的 IP（风控上反而是坏事），所以写入侧有一道闸门：只有 OpenCode Zen
-//! 账号能存下这个形状（见 `account_store::store_crud::apply_patch`）。
-//!
-//! ── 存储形状（账号 proxy 字段，见 `core::proxies` 的模块头）──────
-//! ```json
-//! { "source": "rotate", "all": true }                     // 轮询池里全部启用的出口
-//! { "source": "rotate", "all": false, "proxyIds": ["px_…"] }  // 轮询指定的几条
-//! ```
-//! `all: true` 的含义是「**此刻**池里全部启用的出口」：池里增删条目后候选集合
-//! 自然跟着变，不必回写账号记录（用户加了一个新节点就自动进轮询）。
-//!
-//! ── 游标：进程级、按账号各一条 ───────────────────────────────
-//! 轮询状态不落库：它的作用只是「让相邻两次请求落到不同出口」，重启后从头开始
-//! 完全不影响正确性（落库反而要处理「条目被删后游标指向不存在的条目」这类
-//! 无意义的持久状态）。键是账号 id —— 每条账号各转各的（多条 Zen 账号共用一个
-//! 池时，各自从自己的进度往后走）。
-//!
-//! 取用是**先取号再解析**：号取到了但那条解析失败（条目被禁用 / 订阅节点还没
-//! 分配端口）就顺延下一条，最多绕一圈。这样「池里有一条坏的」不会让轮询停在
-//! 坏条目上，也不会让请求直接失败 —— 坏条目只是被跳过。
-//!
-//! ── 与代理池的关系 ──────────────────────────────────────────
-//! 候选只来自「网络代理」页的池条目（`core::proxy_pool`），按 id 引用；解析复用
-//! `proxy_pool::resolve_reference`，于是失败文案（条目不存在 / 已禁用 / Clash
-//! 监听器没了）与单条引用档逐字一致，界面上与排障时只有一套说法。
-//! 与池的**反向**依赖（池的条目解析走 `core::proxies`）不构成递归：池里不可能
-//! 出现 rotate 形状的条目（`proxy_pool::normalize_item` 只产出 manual，同步只
-//! 产出 clash / subscription）。
-
-use std::collections::HashMap;
-use std::sync::Mutex;
-
+//! Sticky account egress. Reads never rotate; only failed network attempts advance.
+//! Rotation changes routing, not provider/account entitlements.
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use serde_json::Value;
+use super::{proxies::ResolvedProxy, proxy_pool};
 
-use crate::server::core::proxies::ResolvedProxy;
-// 条目的「有效启用」（来源侧启用 ∧ 非本地禁用）直接复用池的判定，不再另写一份
-// —— 只读 `enabled` 的判据会让「在「网络代理」页关掉的节点照样被轮询选中」：
-// 用户按下开关却看不出任何效果，且每次选中都解析失败再顺延。
-use crate::server::core::proxy_pool::is_enabled;
-
-/// 指定轮询时**配置里最多留多少条 id**：与 `core::proxies` 的归一上限同源
-/// （两处都写 64 会被改歪一处，所以只在这里定义，归一那边引用它）。
 pub const MAX_IDS: usize = 64;
-
-/// 轮询游标表的大小上限（超出时整表清空）。
-///
-/// 键是账号 id，正常规模在几十个以内 —— 这个上限只防「账号被反复重建」这类
-/// 病态增长（每条记录一个新 id）。清空是安全的：游标只是一段进度，丢了从头转。
 const MAX_CURSORS: usize = 512;
-
-/// 账号 id → 下一次从第几个候选开始（进程级，见模块头）
-static CURSORS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
-
-fn lock_cursors() -> std::sync::MutexGuard<'static, Option<HashMap<String, u64>>> {
-    match CURSORS.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+pub(crate) const MAX_ATTEMPTS: usize = 5;
+const MAX_TEMPORARY_ATTEMPTS: usize = 2;
+const MAX_HEALTH: usize = 1024;
+const HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+#[derive(Default)]
+struct HealthTable { entries: HashMap<(String, String), Health> }
+struct Health {
+    failures: u32,
+    until: std::time::Instant,
+    touched: std::time::Instant,
+    revision: u64,
+    probe: std::sync::Weak<()>,
 }
-
-/// 取号：返回本次从候选列表的第几位开始，并把游标推到下一位。
-///
-/// `len` 必须非 0（调用方已挡）；条目数变化时取模自然收敛到新列表长度。
-fn take_cursor(key: &str, len: usize) -> usize {
-    let mut guard = lock_cursors();
-    let cursors = guard.get_or_insert_with(HashMap::new);
-    if cursors.len() >= MAX_CURSORS && !cursors.contains_key(key) {
-        cursors.clear();
-    }
-    let entry = cursors.entry(key.to_string()).or_insert(0);
-    let start = (*entry as usize) % len;
-    *entry = entry.wrapping_add(1);
-    start
+struct HealthPermit { key: (String, String), revision: u64, _probe: Arc<()> }
+fn health() -> &'static Mutex<HealthTable> {
+    static STATE: OnceLock<Mutex<HealthTable>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HealthTable::default()))
 }
-
-// ─── 配置读取 ───────────────────────────────────────────────
-
-/// `all` 的读法：缺键 / null 当**真**。
-///
-/// 与写入侧（归一恒写显式布尔）配起来，「缺键」只可能来自手工改库；那时按
-/// 「全部」解释比按「一条都不轮」解释安全 —— 前者是这条配置的默认语义，
-/// 后者会让转发直接回退直连。
-fn is_all(config: &Value) -> bool {
-    match config.get("all") {
-        None | Some(Value::Null) => true,
-        Some(Value::Bool(flag)) => *flag,
-        // 脏值（字符串 / 数字）按「不是 false 即为真」的 JS 口径：只认显式 false
-        Some(_) => true,
-    }
-}
-
-/// 配置里显式列出的 id（`all: false` 那一支；去空、去重、保序、截断到 [`MAX_IDS`]）
-fn configured_ids(config: &Value) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    let Some(items) = config.get("proxyIds").and_then(Value::as_array) else {
-        return ids;
-    };
-    for item in items {
-        let Some(text) = item.as_str() else { continue };
-        let id = text.trim();
-        if id.is_empty() || ids.iter().any(|existing| existing == id) {
-            continue;
+impl HealthTable {
+    fn acquire(&mut self, key: (String, String), now: std::time::Instant) -> Option<HealthPermit> {
+        self.entries.retain(|_, h| now.saturating_duration_since(h.touched) < HEALTH_TTL || h.probe.strong_count() > 0 || h.until > now);
+        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_HEALTH {
+            if let Some(oldest) = self.entries.iter().filter(|(_,h)| h.failures == 0 && h.probe.strong_count() == 0).min_by_key(|(_,h)| h.touched).map(|(k,_)| k.clone()) {
+                self.entries.remove(&oldest);
+            } else {
+                // A full health cache is not evidence that a previously unseen exit is bad.
+                return Some(HealthPermit { key, revision:0, _probe:Arc::new(()) });
+            }
         }
-        ids.push(id.to_string());
-        if ids.len() >= MAX_IDS {
-            break;
+        let h = self.entries.entry(key.clone()).or_insert_with(|| Health { failures:0, until:now, touched:now, revision: generation(), probe:std::sync::Weak::new() });
+        if h.until > now || (h.failures > 0 && h.probe.strong_count() > 0) { return None; }
+        h.touched = now;
+        let probe = Arc::new(());
+        if h.failures > 0 { h.probe = Arc::downgrade(&probe); }
+        Some(HealthPermit { key, revision:h.revision, _probe:probe })
+    }
+    fn finish(&mut self, permit: &HealthPermit, failure: bool, retry_after: std::time::Duration, now: std::time::Instant) -> Option<Arc<HealthPermit>> {
+        let Some(h) = self.entries.get_mut(&permit.key).filter(|h| h.revision == permit.revision) else { return None };
+        if !failure {
+            h.failures = 0; h.until = now; h.touched = now; h.revision = generation();
+            let probe = Arc::new(()); h.probe = Arc::downgrade(&probe);
+            return Some(Arc::new(HealthPermit { key:permit.key.clone(), revision:h.revision, _probe:probe }));
+        }
+        h.failures = h.failures.saturating_add(1);
+        let delay = std::time::Duration::from_secs((2u64 << h.failures.min(7)).min(300)).max(retry_after);
+        h.until = now + delay; h.touched = now; h.revision = generation(); h.probe = std::sync::Weak::new();
+        None
+    }
+}
+#[derive(Clone)]
+struct Selected {
+    generation: u64,
+    id: String,
+    proxy: ResolvedProxy,
+    lease: Option<Arc<super::sub_kernel::runtime::TemporaryNode>>,
+    touched: std::time::Instant,
+}
+const STICKY_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+fn expire_idle(state: &mut HashMap<String, Selected>, key: &str, generation: u64, now: std::time::Instant) -> bool {
+    if state.get(key).is_some_and(|s| s.generation == generation && now.saturating_duration_since(s.touched) >= STICKY_IDLE) { state.remove(key); }
+    state.get(key).is_some_and(|s| s.generation == generation)
+}
+fn reap_idle() {
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    struct Guard;
+    impl Drop for Guard { fn drop(&mut self) { RUNNING.store(false, std::sync::atomic::Ordering::SeqCst); } }
+    // One bounded reaper, not one task per selection. Intentionally no spawn_task:
+    // inheriting the request context would pin the very lease being reclaimed.
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+        let guard = Guard;
+        runtime.spawn(async move {
+            let _guard = guard;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let now = std::time::Instant::now();
+                let mut state = selections().lock().unwrap_or_else(|e| e.into_inner());
+                let stale: Vec<_> = state.iter().filter(|(_,s)| s.lease.is_some()).map(|(k,s)|(k.clone(),s.generation)).collect();
+                for (key,generation) in stale { expire_idle(&mut state, &key, generation, now); }
+            }
+        });
+    }
+}
+fn touch(key: &str, generation: u64) {
+    if let Some(s) = selections().lock().unwrap_or_else(|e| e.into_inner()).get_mut(key).filter(|s| s.generation == generation) { s.touched = std::time::Instant::now(); }
+}
+fn selections() -> &'static Mutex<HashMap<String, Selected>> {
+    static STATE: OnceLock<Mutex<HashMap<String, Selected>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn is_all(config: &Value) -> bool { config.get("all").and_then(Value::as_bool) != Some(false) }
+fn text<'a>(v: &'a Value, key: &str) -> &'a str { v.get(key).and_then(Value::as_str).unwrap_or("") }
+fn configured_ids(config: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(items) = config.get("proxyIds").and_then(Value::as_array) {
+        for id in items.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+            if !ids.iter().any(|old| old == id) { ids.push(id.to_string()); }
+            if ids.len() == MAX_IDS { break; }
         }
     }
     ids
 }
-
-fn text_of(value: &Value, key: &str) -> String {
-    value.get(key).and_then(Value::as_str).unwrap_or("").to_string()
-}
-
-/// 轮询候选的条目 id（按配置取，见模块头）。
-///
-/// `all: true` → 池里**全部启用**条目（禁用项不参与：它在池里就是「先别用它」
-/// 的意思，而轮询是逐请求选路，没有「这次先跳过」的余地 —— 硬选中它只会每次
-/// 都解析失败再顺延，多绕一圈）。顺序即池的存储顺序（新加的在前）。
 pub fn candidate_ids(config: &Value) -> Vec<String> {
-    if !is_all(config) {
-        return configured_ids(config);
-    }
-    crate::server::core::proxy_pool::raw_items()
-        .iter()
-        .filter(|item| is_enabled(item))
-        .filter_map(|item| {
-            let id = text_of(item, "id");
-            if id.is_empty() { None } else { Some(id) }
-        })
-        .collect()
+    let items = proxy_pool::raw_items();
+    ordered_ids(config, &items)
 }
-
-/// 条目的**廉价**可用性（不查 Clash 快照、不发网络）：用于展示摘要里的
-/// 「可用 N 条」。真正的取用判定在解析那一步（`proxy_pool::resolve_reference`）。
-fn entry_ready(item: &Value) -> Result<(), String> {
-    match text_of(item, "source").as_str() {
-        "subscription" => {
-            if item.get("port").and_then(Value::as_u64).is_none() {
-                return Err("订阅节点还没有分配监听端口".to_string());
-            }
-            Ok(())
-        }
-        "clash" => Ok(()),
-        _ => {
-            let host = text_of(item, "host");
-            let port = item.get("port").and_then(Value::as_u64).unwrap_or(0);
-            if host.is_empty() || port == 0 {
-                return Err("条目地址不完整".to_string());
-            }
-            Ok(())
-        }
-    }
+fn ordered_ids(config: &Value, items: &[Value]) -> Vec<String> {
+    let configured = configured_ids(config);
+    let mut candidates: Vec<&Value> = if is_all(config) {
+        items.iter().filter(|item| proxy_pool::is_enabled(item)).collect()
+    } else {
+        configured.iter().filter_map(|id| items.iter().find(|item| text(item, "id") == id && proxy_pool::is_enabled(item))).collect()
+    };
+    // Stable partition: ready listeners first; unopened subscription nodes last.
+    candidates.sort_by_key(|item| unopened(item));
+    candidates.into_iter().map(|v| text(v, "id").to_string()).filter(|s| !s.is_empty()).collect()
 }
-
-// ─── 取用 ───────────────────────────────────────────────────
-
-/// 从 `start` 起绕一圈找第一条能解析的候选；一条都解析不出来时给出**第一条的
-/// 原因**（它最有代表性：坏在哪，用户第一条就该看到那句话）+ 一句总起。
-///
-/// `ids` 由调用方算好传进来（候选要读一次池，一条请求只该读一次）。
-fn pick_at(ids: &[String], start: usize, all: bool) -> Result<ResolvedProxy, String> {
-    if ids.is_empty() {
-        return Err(if all {
-            "轮询没有可用出口：「网络代理」页还没有启用的代理".to_string()
-        } else {
-            "轮询没有可用出口：账号设置里选中的代理都不在了（可能已被删除）".to_string()
-        });
-    }
-    let mut first_error: Option<String> = None;
-    for offset in 0..ids.len() {
-        let id = &ids[(start + offset) % ids.len()];
-        match crate::server::core::proxy_pool::resolve_reference(id) {
-            Ok(proxy) => return Ok(proxy),
-            Err(reason) => {
-                if first_error.is_none() {
-                    first_error = Some(reason);
-                }
-            }
-        }
-    }
-    Err(format!(
-        "轮询的出口都不可用：{}",
-        first_error.unwrap_or_else(|| "没有可用的代理".to_string())
-    ))
+fn unopened(item: &Value) -> bool {
+    text(item, "source") == "subscription" && item.get("port").and_then(Value::as_u64).filter(|p| *p > 0 && *p <= 65535).is_none()
 }
-
-/// 轮询取下一个出口（游标按 `key` 前进；`key` = 账号 id）。
-///
-/// `key` 为空串时退化为「第一条可用」：没有可归属的账号身份就谈不上轮询进度，
-/// 此时确定性优先（同一个调用方每次拿到同一条，便于复现与排障）。
+fn generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+fn remember(key: &str, selected: Selected) -> Selected {
+    if key.is_empty() || super::sub_kernel::runtime::temporary_stopping() { return selected; }
+    let mut state = selections().lock().unwrap_or_else(|e| e.into_inner());
+    if super::sub_kernel::runtime::temporary_stopping() { return selected; }
+    if state.len() >= MAX_CURSORS && !state.contains_key(key) { state.clear(); }
+    // Publish only into a vacant slot: a slow resolver must not overwrite a winner.
+    let fresh = !state.contains_key(key);
+    let chosen = state.entry(key.to_string()).or_insert(selected).clone();
+    drop(state);
+    if fresh && chosen.lease.is_some() { reap_idle(); }
+    chosen
+}
+pub(crate) fn retire(key: &str) {
+    selections().lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+}
+pub(crate) fn shutdown() {
+    selections().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    health().lock().unwrap_or_else(|e| e.into_inner()).entries.clear();
+}
+fn current(config: &Value, key: &str) -> Option<Selected> {
+    let ids = candidate_ids(config);
+    let mut state = selections().lock().unwrap_or_else(|e| e.into_inner());
+    if state.get(key).is_some_and(|s| ids.contains(&s.id)) { state.get(key).cloned() }
+    else { state.remove(key); None }
+}
+/// Compatibility name: this is a sticky read, never an advancing cursor.
 pub fn next(config: &Value, key: &str) -> Result<ResolvedProxy, String> {
-    let ids = candidate_ids(config);
-    // 空候选时不必取号（`take_cursor` 要求 len 非 0）——直接由 pick_at 报空
-    let start = if ids.is_empty() || key.is_empty() {
-        0
-    } else {
-        take_cursor(key, ids.len())
-    };
-    pick_at(&ids, start, is_all(config))
-}
-
-/// 不前进游标的静态解析：给**展示**与**非转发**链路用（描述账号代理、
-/// 余额查询这类「一次调用不代表一次转发」的地方）。
-///
-/// 取第一条可用条目 —— 它回答的是「这条配置现在能不能用、大概走哪儿」，
-/// 而不是「这次该走哪儿」。
-pub fn first_usable(config: &Value) -> Result<ResolvedProxy, String> {
-    let ids = candidate_ids(config);
-    pick_at(&ids, 0, is_all(config))
-}
-
-// ─── 展示摘要（账号列表 / 日志文案用，不动游标）───────────────
-
-/// 摘要读数：候选条数与其中可用的条数（判据见 [`entry_ready`]）
-pub struct Summary {
-    /// 是否「全部出口」档
-    pub all: bool,
-    /// 候选条数（all=false 时只数**还存在**的条目）
-    pub total: usize,
-    /// 其中看起来可用的条数（廉价判据，见 [`entry_ready`]）
-    pub usable: usize,
-    /// 一条候选都不可用时的原因（可用时为 None）
-    pub error: Option<String>,
-}
-
-/// 算一份摘要（读一次池，不做网络与 Clash 快照）。
-pub fn summary(config: &Value) -> Summary {
-    let all = is_all(config);
-    let items = crate::server::core::proxy_pool::raw_items();
-    let mut total = 0usize;
-    let mut usable = 0usize;
-    let mut consider = |item: &Value| {
-        total += 1;
-        if is_enabled(item) && entry_ready(item).is_ok() {
-            usable += 1;
-        }
-    };
-    if all {
-        for item in items.iter().filter(|item| is_enabled(item)) {
-            consider(item);
-        }
-    } else {
-        for id in configured_ids(config) {
-            if let Some(item) = items
-                .iter()
-                .find(|item| text_of(item, "id") == id)
-            {
-                consider(item);
-            }
+    if let Some(selected) = current(config, key) { return Ok(selected.proxy); }
+    for id in candidate_ids(config) {
+        if let Ok(proxy) = proxy_pool::resolve_reference(&id) {
+            return Ok(remember(key, Selected { generation: generation(), id, proxy, lease: None, touched: std::time::Instant::now() }).proxy);
         }
     }
-    let error = if total == 0 {
-        Some(if all {
-            "「网络代理」页还没有启用的代理".to_string()
-        } else {
-            "轮询里选中的代理都不在了（可能已被删除）".to_string()
-        })
-    } else if usable == 0 {
-        Some("轮询里的代理都不可用（已禁用或未就绪）".to_string())
-    } else {
-        None
-    };
-    Summary { all, total, usable, error }
+    Err("轮询没有已就绪出口；转发时将按需尝试未分配端口的订阅节点".into())
+}
+pub fn first_usable(config: &Value) -> Result<ResolvedProxy, String> { next(config, "") }
+pub struct Summary { pub all: bool, pub total: usize, pub usable: usize, pub error: Option<String> }
+pub fn summary(config: &Value) -> Summary {
+    let items = proxy_pool::raw_items();
+    let ids = ordered_ids(config, &items);
+    let usable = ids.iter().filter(|id| items.iter().any(|v| text(v,"id") == *id && !unopened(v))).count();
+    Summary { all: is_all(config), total: ids.len(), usable, error: if ids.is_empty() { Some("轮询没有启用的候选出口".into()) } else { None } }
+}
+
+/// Per-request attempt set prevents wrapping back to a failed exit. Strong leases keep
+/// retired sidecars alive until all requests/streams that used them have finished.
+#[derive(Clone, Default)]
+pub(crate) struct Attempts {
+    key: String,
+    config: Option<Value>,
+    tried: HashSet<String>,
+    selected: Option<Selected>,
+    leases: Vec<Arc<super::sub_kernel::runtime::TemporaryNode>>,
+    pub network_started: bool,
+    pub local_failure: bool,
+    origin: String,
+    permit: Option<Arc<HealthPermit>>,
+    stream_health: Option<Arc<HealthPermit>>,
+    pub deadline: Option<tokio::time::Instant>,
+    used: usize,
+    temporary_used: usize,
+    exchanged: bool,
+    #[cfg(test)]
+    items: Option<Vec<Value>>,
+}
+impl Attempts {
+    pub fn configure(&mut self, key: &str, config: Option<&Value>) {
+        self.leases.clear();
+        self.permit = None; self.stream_health = None; self.origin.clear(); self.used = 0; self.temporary_used = 0; self.exchanged = false;
+        self.deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(crate::server::config::timeout_settings().headers_ms()));
+        self.network_started = false;
+        self.local_failure = false;
+        self.key = key.to_string();
+        self.config = config.filter(|v| super::proxies::is_rotate_config(v)).cloned();
+        self.tried.clear();
+        self.selected = self.config.as_ref().and_then(|c| current(c, key));
+    }
+    pub fn active(&self) -> bool { self.config.is_some() }
+    pub fn all_errors(&self) -> bool { self.config.as_ref().and_then(|v| v.get("failureMode")).and_then(Value::as_str) == Some("all_errors") }
+    pub fn set_origin(&mut self, url: &url::Url) { self.origin = url.origin().ascii_serialization(); }
+    pub fn remaining(&self) -> std::time::Duration {
+        self.deadline.map(|d| d.saturating_duration_since(tokio::time::Instant::now())).unwrap_or_default()
+    }
+    pub fn finish_health(&mut self, failure: bool, retry_after: std::time::Duration) {
+        if let Some(permit) = self.permit.take() { self.stream_health = health().lock().unwrap_or_else(|e| e.into_inner()).finish(&permit, failure, retry_after, std::time::Instant::now()); }
+    }
+    fn acquire(&mut self, id: &str) -> bool {
+        if self.origin.is_empty() { return true; }
+        self.permit = health().lock().unwrap_or_else(|e| e.into_inner()).acquire((id.to_string(), self.origin.clone()), std::time::Instant::now()).map(Arc::new);
+        self.permit.is_some()
+    }
+    pub fn begin_exchange(&mut self) {
+        self.permit = None; self.stream_health = None;
+        if self.exchanged || self.deadline.is_none() {
+            self.deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(crate::server::config::timeout_settings().headers_ms()));
+            self.used = 0; self.temporary_used = 0;
+        }
+        self.exchanged = true;
+        self.tried.clear();
+        #[cfg(test)]
+        if self.items.is_some() { return; }
+        if let Some(config) = &self.config { self.selected = current(config, &self.key).or(self.selected.take()); }
+    }
+    fn items(&self) -> Vec<Value> {
+        #[cfg(test)]
+        if let Some(items) = &self.items { return items.clone(); }
+        proxy_pool::raw_items()
+    }
+    #[cfg(test)]
+    pub fn mock_aggressive(key: &str, items: Vec<Value>) -> Self {
+        let mut attempts = Self::mock(key,items);
+        attempts.config.as_mut().unwrap()["failureMode"] = serde_json::json!("all_errors"); attempts
+    }
+    #[cfg(test)]
+    pub fn mock(key: &str, items: Vec<Value>) -> Self {
+        Self { key:key.into(), config:Some(serde_json::json!({"source":"rotate","all":true})), items:Some(items), ..Self::default() }
+    }
+    pub fn release_exchange_lease(&mut self) { self.selected = None; self.leases.clear(); }
+    pub fn adopt(&mut self, exchange: &Self) {
+        if exchange.selected.as_ref().map(|s| s.generation).unwrap_or(0) >= self.selected.as_ref().map(|s| s.generation).unwrap_or(0) {
+            self.selected = exchange.selected.clone();
+            self.origin = exchange.origin.clone();
+            self.stream_health = exchange.stream_health.clone();
+        }
+        self.leases = exchange.leases.clone();
+    }
+    pub fn retire_failed_stream(&mut self) {
+        if let Some(old) = self.selected.take() {
+            let mut state = selections().lock().unwrap_or_else(|e| e.into_inner());
+            if state.get(&self.key).is_some_and(|s| s.generation == old.generation) {
+                state.remove(&self.key);
+            }
+        }
+        // Sticky ownership and stream health are independent: idle retirement or a
+        // concurrent switch must not hide a real failure of this stream's exit.
+        // Only its saved successful-header revision may fail, never a newer result.
+        if let Some(permit) = self.stream_health.take() {
+            health().lock().unwrap_or_else(|e| e.into_inner()).finish(&permit, true, std::time::Duration::ZERO, std::time::Instant::now());
+        }
+    }
+    pub fn lease(&self) -> Option<Arc<super::sub_kernel::runtime::TemporaryNode>> {
+        self.selected.as_ref().and_then(|s| s.lease.clone())
+    }
+    pub async fn select(&mut self, failed: bool) -> Result<Option<ResolvedProxy>, String> {
+        let Some(config) = self.config.clone() else { return Ok(None) };
+        if failed {
+            self.permit = None;
+            if let Some(old) = self.selected.take() {
+                self.tried.insert(old.id.clone());
+                let mut state = selections().lock().unwrap_or_else(|e| e.into_inner());
+                // A late failure must not retire a newer concurrent selection.
+                if state.get(&self.key).is_some_and(|s| s.generation == old.generation) { state.remove(&self.key); }
+                else if let Some(newer) = state.get(&self.key).filter(|s| !self.tried.contains(&s.id)).cloned() {
+                    self.selected = Some(newer);
+                }
+                // The transport has buffered the failed HTTP body before retiring this
+                // request's lease. Other in-flight owners keep their sidecars alive.
+                if let Some(lease) = old.lease { self.leases.retain(|l| !Arc::ptr_eq(l, &lease)); }
+            }
+        }
+        if let Some(s) = self.selected.clone() {
+            if !self.tried.contains(&s.id) && (self.permit.is_some() || self.acquire(&s.id)) {
+                if failed || self.used == 0 {
+                    if self.used >= MAX_ATTEMPTS { return Err("轮询尝试预算已耗尽（5 次）".into()); }
+                    self.used += 1;
+                }
+                touch(&self.key, s.generation);
+                self.leases.clear();
+                if let Some(l) = &s.lease { self.leases.push(l.clone()); }
+                return Ok(Some(s.proxy));
+            }
+            self.tried.insert(s.id.clone());
+            self.selected = None;
+            let mut state = selections().lock().unwrap_or_else(|e| e.into_inner());
+            if state.get(&self.key).is_some_and(|old| old.generation == s.generation) { state.remove(&self.key); }
+        }
+        let items = self.items();
+        let mut last = "轮询出口已耗尽".to_string();
+        for id in ordered_ids(&config, &items) {
+            if self.tried.contains(&id) { continue; }
+            let Some(item) = items.iter().find(|v| text(v,"id") == id) else { continue };
+            if self.used >= MAX_ATTEMPTS { return Err("轮询尝试预算已耗尽（5 次）".into()); }
+            if unopened(item) && self.temporary_used >= MAX_TEMPORARY_ATTEMPTS { continue; }
+            if !self.acquire(&id) { self.tried.insert(id); continue; }
+            self.used += 1;
+            if unopened(item) { self.temporary_used += 1; }
+            let result = if unopened(item) {
+                super::sub_kernel::runtime::temporary_node(&self.key, text(item,"providerId"), text(item,"node")).await
+                    .map(|lease| (lease.proxy.clone(), Some(lease)))
+            } else {
+                proxy_pool::resolve_item(item).and_then(|r| r.resolved().cloned())
+                    .ok_or_else(|| "代理节点不可用".to_string()).map(|p| (p, None))
+            };
+            match result {
+                Ok((proxy, lease)) => {
+                    let selected = remember(&self.key, Selected { generation: generation(), id: id.clone(), proxy, lease, touched: std::time::Instant::now() });
+                    if self.tried.contains(&selected.id) { return Err("并发选路仍指向本请求已失败出口".into()); }
+                    if selected.id != id && !self.acquire(&selected.id) { return Err("并发选路出口正在冷却".into()); }
+                    self.leases.clear();
+                    if let Some(l) = &selected.lease { self.leases.push(l.clone()); }
+                    let proxy = selected.proxy.clone();
+                    self.selected = Some(selected);
+                    return Ok(Some(proxy));
+                }
+                Err(error) => { self.finish_health(true, std::time::Duration::ZERO); self.tried.insert(id); last = error; }
+            }
+        }
+        Err(last)
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static ATTEMPTS: Arc<tokio::sync::Mutex<Attempts>>;
+}
+pub(crate) fn context() -> Option<Arc<tokio::sync::Mutex<Attempts>>> { ATTEMPTS.try_with(Arc::clone).ok() }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[tokio::test]
+    async fn stream_failure_survives_idle_or_sticky_switch_but_not_new_health_result() {
+        for mode in ["idle","switch","new-success","new-failure"] {
+            let key=format!("stream-revision-{mode}");let id=format!("node-{mode}");
+            let items=vec![json!({"id":id,"source":"manual","host":"127.0.0.1","port":32111})];
+            let mut stream=Attempts::mock(&key,items);stream.set_origin(&url::Url::parse("https://revision.test/").unwrap());
+            stream.select(false).await.unwrap();stream.finish_health(false,std::time::Duration::ZERO);
+            let health_key=(id.clone(),stream.origin.clone());
+            let mut newer=None;
+            if mode=="idle" {let old=stream.selected.as_ref().unwrap();expire_idle(&mut selections().lock().unwrap(),&key,old.generation,old.touched+STICKY_IDLE);}
+            else {let mut replacement=stream.selected.clone().unwrap();replacement.generation=generation();replacement.id="another-node".into();newer=Some(replacement.generation);selections().lock().unwrap().insert(key.clone(),replacement);}
+            if mode.starts_with("new-") {
+                let mut table=health().lock().unwrap();let now=std::time::Instant::now();let p=table.acquire(health_key.clone(),now).unwrap();
+                table.finish(&p,mode=="new-failure",std::time::Duration::ZERO,now);
+            }
+            let revision=health().lock().unwrap().entries[&health_key].revision;
+            stream.retire_failed_stream();
+            let table=health().lock().unwrap();let h=&table.entries[&health_key];
+            if mode=="new-success" {assert_eq!(h.failures,0);assert_eq!(h.revision,revision);}
+            else if mode=="new-failure" {assert_eq!(h.failures,1);assert_eq!(h.revision,revision);}
+            else {assert_eq!(h.failures,1);assert_ne!(h.revision,revision);}
+            drop(table);
+            if let Some(generation)=newer {assert_eq!(selections().lock().unwrap()[&key].generation,generation);}
+            retire(&key);
+        }
+    }
+    #[test]
+    fn health_origin_backoff_half_open_cancel_and_success_reset() {
+        use std::time::{Duration, Instant};
+        let mut table = HealthTable::default(); let now = Instant::now();
+        let key = ("node".into(), "https://one.test".into());
+        let first = table.acquire(key.clone(), now).unwrap();
+        let late = table.acquire(key.clone(), now).unwrap();
+        table.finish(&first, true, Duration::ZERO, now);
+        table.finish(&late, false, Duration::ZERO, now); // stale success cannot reset newer failure
+        assert!(table.acquire(key.clone(), now).is_none());
+        assert!(table.acquire(("node".into(), "https://two.test".into()), now).is_some());
+        let probe = table.acquire(key.clone(), now + Duration::from_secs(4)).unwrap();
+        assert!(table.acquire(key.clone(), now + Duration::from_secs(4)).is_none());
+        drop(probe); // cancellation immediately releases the half-open reservation
+        let probe = table.acquire(key.clone(), now + Duration::from_secs(4)).unwrap();
+        table.finish(&probe, true, Duration::ZERO, now + Duration::from_secs(4));
+        assert!(table.acquire(key.clone(), now + Duration::from_secs(11)).is_none());
+        let probe = table.acquire(key.clone(), now + Duration::from_secs(12)).unwrap();
+        table.finish(&probe, false, Duration::ZERO, now + Duration::from_secs(12));
+        assert!(table.acquire(key.clone(), now + Duration::from_secs(12)).is_some());
+        table.finish(&late, true, Duration::ZERO, now + Duration::from_secs(12));
+        assert_eq!(table.entries[&key].failures, 0); // stale failure cannot retire new health generation
+    }
+    #[test]
+    fn health_capacity_ttl_and_retry_after() {
+        use std::time::{Duration, Instant};
+        let mut table = HealthTable::default(); let now = Instant::now();
+        for i in 0..MAX_HEALTH { assert!(table.acquire((i.to_string(), "origin".into()), now).is_some()); }
+        assert!(table.acquire(("overflow".into(), "origin".into()), now).is_some());
+        assert_eq!(table.entries.len(), MAX_HEALTH);
+        for h in table.entries.values_mut() { h.failures=1; h.until=now+std::time::Duration::from_secs(900); }
+        assert_eq!(table.acquire(("uncached".into(),"origin".into()),now).unwrap().revision,0);
+        assert_eq!(table.entries.len(),MAX_HEALTH);
+        table.entries.clear();
+        let key = ("after-ttl".into(), "origin".into());
+        let p = table.acquire(key.clone(), now + HEALTH_TTL).unwrap();
+        assert_eq!(table.entries.len(), 1);
+        table.finish(&p, true, Duration::from_secs(900), now + HEALTH_TTL);
+        assert!(table.acquire(key, now + HEALTH_TTL + Duration::from_secs(600)).is_none());
+    }
+    #[tokio::test]
+    async fn selection_budget_and_temporary_budget_are_bounded() {
+        let items: Vec<_> = (0..20).map(|i| json!({"id":format!("budget-{i}"),"source":"manual","host":"127.0.0.1","port":32200+i})).collect();
+        let mut a = Attempts::mock("budget-test", items); a.begin_exchange();
+        for i in 0..MAX_ATTEMPTS { assert!(a.select(i > 0).await.unwrap().is_some()); }
+        assert!(a.select(true).await.is_err()); assert_eq!(a.used, MAX_ATTEMPTS);
+        retire("budget-test");
+        // Exhausting temporary budget must skip cold items without touching subscription DB.
+        let mut a = Attempts::mock("temp-budget", vec![json!({"id":"cold","source":"subscription"})]);
+        a.temporary_used = MAX_TEMPORARY_ATTEMPTS;
+        assert!(a.select(false).await.is_err()); assert_eq!(a.used, 0);
+    }
+    #[tokio::test]
+    async fn origin_cooldown_skips_sticky_exit_without_repeating_candidates() {
+        let items = vec![json!({"id":"cool-a","source":"manual","host":"127.0.0.1","port":32105}),json!({"id":"cool-b","source":"manual","host":"127.0.0.1","port":32106})];
+        let mut a = Attempts::mock("cool-test", items.clone());
+        a.set_origin(&url::Url::parse("https://cool.test/path?secret=hidden").unwrap());
+        assert_eq!(a.select(false).await.unwrap().unwrap().port, Some(32105));
+        a.finish_health(true, std::time::Duration::ZERO);
+        let mut b = Attempts::mock("cool-test", items); b.selected = a.selected.clone(); b.origin = a.origin.clone();
+        assert_eq!(b.select(false).await.unwrap().unwrap().port, Some(32106));
+        assert!(b.tried.contains("cool-a")); b.finish_health(false,std::time::Duration::ZERO);
+        retire("cool-test");
+    }
+    #[tokio::test]
+    async fn idle_expiry_is_generation_guarded_and_does_not_drop_active_owner() {
+        let mut a=Attempts::mock("idle-expiry",vec![json!({"id":"idle-node","source":"manual","host":"127.0.0.1","port":32109})]);
+        a.select(false).await.unwrap();let held=a.selected.clone().unwrap();
+        let mut state=HashMap::from([("idle-expiry".to_string(),held.clone())]);
+        assert!(expire_idle(&mut state,"idle-expiry",held.generation,held.touched+STICKY_IDLE-std::time::Duration::from_millis(1)));
+        assert!(!expire_idle(&mut state,"idle-expiry",held.generation+1,held.touched+STICKY_IDLE));
+        assert!(state.contains_key("idle-expiry"));
+        assert!(!expire_idle(&mut state,"idle-expiry",held.generation,held.touched+STICKY_IDLE));
+        assert_eq!(a.selected.unwrap().proxy.port,Some(32109));retire("idle-expiry");
+    }
+    #[test]
+    fn failure_mode_schema_roundtrips_and_defaults_to_smart() {
+        for all in [true,false] {
+            for mode in ["smart","all_errors"] {
+                let cfg=json!({"source":"rotate","all":all,"proxyIds":["a"],"failureMode":mode});
+                let out=super::super::proxies::normalize_account_proxy(&cfg).unwrap().unwrap();
+                assert_eq!(out["failureMode"],mode);
+            }
+        }
+        assert_eq!(super::super::proxies::normalize_account_proxy(&json!({"source":"rotate"})).unwrap().unwrap()["failureMode"],"smart");
+        assert!(super::super::proxies::normalize_account_proxy(&json!({"source":"rotate","failureMode":"invalid"})).is_err());
+    }
+    #[tokio::test]
+    async fn late_failure_uses_newer_selection_and_reads_are_sticky() {
+        let items = vec![json!({"id":"a", "source":"manual","host":"127.0.0.1","port":32101}), json!({"id":"b", "source":"manual","host":"127.0.0.1","port":32102})];
+        let mut a = Attempts::mock("late-failure", items.clone());
+        assert_eq!(a.select(false).await.unwrap().unwrap().port, Some(32101));
+        let mut b = Attempts::mock("late-failure", items);
+        b.selected = a.selected.clone();
+        assert_eq!(b.select(true).await.unwrap().unwrap().port, Some(32102));
+        assert_eq!(a.select(true).await.unwrap().unwrap().port, Some(32102));
+        for _ in 0..3 { assert_eq!(a.select(false).await.unwrap().unwrap().port, Some(32102)); }
+        retire("late-failure");
+    }
+    #[tokio::test]
+    async fn failed_partial_stream_is_not_replayed_and_next_exchange_skips_exit() {
+        let items=vec![json!({"id":"stream-a","source":"manual","host":"127.0.0.1","port":32103}),json!({"id":"stream-b","source":"manual","host":"127.0.0.1","port":32104})];
+        let mut a=Attempts::mock("stream-failure",items.clone());
+        a.set_origin(&url::Url::parse("https://stream.test/").unwrap());
+        assert_eq!(a.select(false).await.unwrap().unwrap().port,Some(32103));
+        a.finish_health(false,std::time::Duration::ZERO);
+        a.retire_failed_stream();
+        let mut different=Attempts::mock("stream-other",items.clone());different.set_origin(&url::Url::parse("https://other.test/").unwrap());
+        assert_eq!(different.select(false).await.unwrap().unwrap().port,Some(32103));retire("stream-other");
+        let mut single=Attempts::mock("stream-single",vec![items[0].clone()]);single.set_origin(&url::Url::parse("https://stream.test/").unwrap());
+        assert!(single.select(false).await.is_err());
+        health().lock().unwrap().entries.get_mut(&("stream-a".into(),"https://stream.test".into())).unwrap().until=std::time::Instant::now();
+        single.begin_exchange();assert_eq!(single.select(false).await.unwrap().unwrap().port,Some(32103));
+        single.finish_health(true,std::time::Duration::ZERO);retire("stream-single");
+        let mut next=Attempts::mock("stream-failure",items);next.set_origin(&url::Url::parse("https://stream.test/").unwrap());next.begin_exchange();
+        assert_eq!(next.select(false).await.unwrap().unwrap().port,Some(32104));
+        retire("stream-failure");
+    }
+    #[test]
+    fn assigned_first_disabled_excluded_and_explicit_order_preserved() {
+        let items = vec![json!({"id":"cold", "source":"subscription", "enabled":true}), json!({"id":"ready", "source":"subscription", "enabled":true,"port":1234}), json!({"id":"off","enabled":false,"port":1235})];
+        assert_eq!(ordered_ids(&json!({"all":true}), &items), vec!["ready", "cold"]);
+        assert_eq!(ordered_ids(&json!({"all":false,"proxyIds":["cold","off","ready","ready"]}), &items), vec!["ready", "cold"]);
+    }
 }

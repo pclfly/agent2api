@@ -45,6 +45,13 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    let route = server::core::proxy_rotate::context();
+    let future = async move {
+        match route {
+            Some(route) => server::core::proxy_rotate::ATTEMPTS.scope(route, future).await,
+            None => future.await,
+        }
+    };
     match Handle::try_current() {
         Ok(handle) => handle.spawn(future),
         Err(_) => global_runtime().spawn(future),

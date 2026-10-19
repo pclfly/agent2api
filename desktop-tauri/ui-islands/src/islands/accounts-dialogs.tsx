@@ -48,7 +48,7 @@ import {
 } from './accounts-shared'
 import {
   displayNameOf, providerFeatures, providerOf, supportsPlanChannel, supportsUsage,
-  isOpencodeZenProvider, supportsProxyRotate,
+  supportsProxyRotate,
   zcodePlanLabel, zcodePlanOf, ZCODE_PLAN_CODING, ZCODE_PLAN_START,
 } from './accounts-domain'
 import {
@@ -99,7 +99,7 @@ function labelOf(account: AccountLike | null | undefined): string {
 export type ProxyPayload =
   | null
   | { source: 'pool'; proxyId: string }
-  | { source: 'rotate'; all: boolean; proxyIds?: string[] }
+  | { source: 'rotate'; all: boolean; proxyIds?: string[]; failureMode: 'smart' | 'all_errors' }
   | { source: 'clash'; listenerUid: string }
   | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string }
 
@@ -111,6 +111,8 @@ export type ProxyDraft = {
   rotateAll: boolean
   /** 轮询档：指定要轮询的池条目 id（rotateAll 为 true 时不用） */
   rotateIds: string[]
+  /** 缺失或新建时默认智能切换 */
+  failureMode: 'smart' | 'all_errors'
   listenerUid: string
   protocol: 'http' | 'socks5'
   host: string
@@ -132,6 +134,7 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
     // `all` 缺键按「全部」读（后端同一个口径：那是这一档的默认语义）
     rotateAll: rotate ? config?.all !== false : true,
     rotateIds: rotate && Array.isArray(config?.proxyIds) ? config.proxyIds.map(String) : [],
+    failureMode: rotate && config?.failureMode === 'all_errors' ? 'all_errors' : 'smart',
     listenerUid: config?.source === 'clash' || source === 'clash' ? String(config?.listenerUid || '') : '',
     protocol: config?.protocol === 'socks5' ? 'socks5' : 'http',
     host: config?.host || '',
@@ -150,9 +153,10 @@ export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
   }
   if (draft.mode === 'rotate') {
     // 「全部」不写 proxyIds：池里以后新增的出口自动进轮询（后端归一也是这个形状）
-    if (draft.rotateAll) return { source: 'rotate', all: true }
+    const failureMode = draft.failureMode === 'all_errors' ? 'all_errors' : 'smart'
+    if (draft.rotateAll) return { source: 'rotate', all: true, failureMode }
     if (!draft.rotateIds.length) throw new Error(t('轮询至少要选择一条代理（或改选「全部」）'))
-    return { source: 'rotate', all: false, proxyIds: [...draft.rotateIds] }
+    return { source: 'rotate', all: false, proxyIds: [...draft.rotateIds], failureMode }
   }
   if (draft.mode === 'clash') {
     if (!draft.listenerUid) throw new Error(t('请先选择 Clash Verge 出口'))
@@ -172,6 +176,35 @@ export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
   }
 }
 
+export function accountRouteDrafts(account: AccountRecord | null | undefined) {
+  const hasFront = Boolean(account?.frontProxy?.config || account?.frontProxy?.source)
+  return {
+    first: draftOfProxy(hasFront ? account?.frontProxy : account?.proxy),
+    second: draftOfProxy(hasFront ? account?.proxy : null),
+    secondEnabled: hasFront,
+  }
+}
+
+export function readAccountProxyPatch(
+  firstDraft: ProxyDraft,
+  secondDraft: ProxyDraft,
+  isCustomAccount: boolean,
+  secondEnabled = false,
+): { proxy: ProxyPayload; frontProxy?: ProxyPayload } {
+  const first = readProxyDraft(firstDraft)
+  if (!isCustomAccount) return { proxy: first }
+  if (!secondEnabled) return { proxy: first, frontProxy: null }
+  const second = readProxyDraft(secondDraft)
+  if (!first || !second) throw new Error(t('启用第二跳时必须同时配置第一跳和第二跳代理'))
+  if (firstDraft.mode === 'rotate') throw new Error(t('链式代理的第一跳不支持轮询，请选择固定代理'))
+  if (firstDraft.mode === 'custom' && firstDraft.protocol !== 'http'
+    || secondDraft.mode === 'custom' && secondDraft.protocol !== 'http') {
+    throw new Error(t('链式代理目前仅支持 HTTP CONNECT，请为两跳选择 HTTP 或 mixed 监听端口'))
+  }
+  // 存储兼容旧结构：单跳用 proxy；双跳用 frontProxy → proxy。
+  return { proxy: second, frontProxy: first }
+}
+
 function clashOptionLabel(option: NonNullable<ClashSnapshot['options']>[number]): string {
   const inactive = option.profileActive === false ? t('（其他订阅，可能未生效）') : ''
   const disabled = option.enabled === false ? t('（已在 Clash 中禁用）') : ''
@@ -187,10 +220,9 @@ function clashOptionLabel(option: NonNullable<ClashSnapshot['options']>[number])
  *   · **已保存的代理** —— 引用「网络代理」页的池条目（推荐路径：出口在那里
  *     配一次、测一次，所有引用它的账号一起生效）。选项文案是
  *     「名字（协议 主机:端口）」，与账号页代理列同一格式（见 poolItemLabel）；
- *   · **轮询** —— 逐请求轮换池里的出口（换 IP）。**只在 `allowRotate` 为真时
- *     出现**（OpenCode Zen 免费档，判据见 accounts-domain 的 supportsProxyRotate
- *     —— 那个上游按 IP 限流）。默认「全部代理节点」（池里每个启用的出口轮流
- *     使用），取消勾选后从池里多选出要轮询的几条；
+ *   · **轮询（故障切换）** —— 粘性使用当前节点，按所选故障策略在尝试预算内切换。
+ *     所有账号均可选；`allowRotate` 只用于限制不支持该模式的链路位置。
+ *     默认全部启用的代理节点，取消勾选后可指定候选范围；
  *   · **Clash Verge** —— **只在账号当前就是直接引用 Clash 出口时出现**：
  *     那种存量记录要能改（切到别的档就消失，因为出口统一走池之后不再提供
  *     「新建一条 Clash 直引」的入口；想引用 Clash 出口请先到「网络代理」页
@@ -200,13 +232,19 @@ export function ProxyForm({
   draft,
   onChange,
   idPrefix,
-  allowRotate = false,
+  allowRotate = true,
+  noneLabel = t('无代理（直连）'),
+  ariaLabel = t('代理方式'),
+  showTest = true,
 }: {
   draft: ProxyDraft
   onChange: (next: ProxyDraft) => void
   idPrefix: string
-  /** 是否给出「轮询」档（只有 OpenCode Zen 账号为真，见函数说明） */
+  /** 此链路位置是否支持「轮询」档；不按提供商限制 */
   allowRotate?: boolean
+  noneLabel?: string
+  ariaLabel?: string
+  showTest?: boolean
 }) {
   const store = getStore()
   const clash = store.clash
@@ -352,18 +390,17 @@ export function ProxyForm({
   return (
     <div className='flex flex-col'>
       <RadioGroup value={draft.mode} onValueChange={value => set({ mode: value as ProxyDraft['mode'] })}
-        className='flex-row flex-wrap items-center gap-5' aria-label={t('代理方式')}>
+        className='flex-row flex-wrap items-center gap-5' aria-label={ariaLabel}>
         <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
-          <RadioGroupItem value='none' />{t('无代理（直连）')}
+          <RadioGroupItem value='none' />{noneLabel}
         </Label>
         <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
           <RadioGroupItem value='pool' />{t('已保存的代理')}
         </Label>
-        {/* 轮询档只对 OpenCode Zen 出现（见 allowRotate 的说明） */}
         {allowRotate ? (
           <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'
-            title={t('逐请求轮换出口（换 IP）：OpenCode Zen 免费档按 IP 限流，单个 IP 的额度用完会对它一律 429')}>
-            <RadioGroupItem value='rotate' />{t('轮询（换 IP）')}
+            title={t('粘性使用当前节点；默认智能切换，按故障语义、尝试预算与节点冷却决定是否切换')}>
+            <RadioGroupItem value='rotate' />{t('轮询（故障切换）')}
           </Label>
         ) : null}
         {/* Clash 直引档只对**已经是这种配置**的账号出现（见函数说明）：
@@ -422,8 +459,29 @@ export function ProxyForm({
 
       {draft.mode === 'rotate' ? (
         <div className='mt-3'>
-          {/* 「全部」是默认档：勾上 = 池里每个启用的出口轮流使用（新加的出口
-              自动进轮询，不必回来改这条账号）。取消勾选才出现多选。
+          <div className='field-row mb-2.5'>
+            <label htmlFor={`${idPrefix}-failure-mode`}>{t('切换策略')}</label>
+            <Select value={draft.failureMode}
+              onValueChange={value => set({ failureMode: value === 'all_errors' ? 'all_errors' : 'smart' })}>
+              <SelectTrigger id={`${idPrefix}-failure-mode`} className='min-w-[220px]'
+                aria-describedby={`${idPrefix}-failure-mode-help`}>
+                <SelectValue>
+                  {draft.failureMode === 'all_errors' ? t('所有上游错误都切换') : t('智能切换（推荐）')}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value='smart'>{t('智能切换（推荐）')}</SelectItem>
+                <SelectItem value='all_errors'>{t('所有上游错误都切换')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <p id={`${idPrefix}-failure-mode-help`} className='detail mb-2.5'>
+            {draft.failureMode === 'all_errors'
+              ? t('激进模式：所有上游错误都作为切换候选，仍受尝试预算与节点冷却约束，不保证遍历全部节点；不重放成功响应后的流。')
+              : t('智能模式：确定性的参数或鉴权错误不遍历节点；网络失败与 HTTP 500 有限尝试，HTTP 502–504 可切换，HTTP 403/429 按错误语义判断；受尝试预算与节点冷却约束。')}
+          </p>
+          {/* 「全部」是默认档：勾上 = 池里每个启用的出口都作为故障切换候选（新加的出口
+              自动加入，不必回来改这条账号）。取消勾选才出现多选。
               这一行刻意**不走 .field-row**：账号设置弹窗里它的直接 label 子元素
               会被 `.acct-dlg-main .field-row > label` 强制成 76px 定宽字段标签，
               「全部代理节点（推荐）」比 76px 长，nowrap 溢出会压住后面的说明
@@ -436,7 +494,7 @@ export function ProxyForm({
               {t('全部代理节点（推荐）')}
             </label>
             <span className='detail'>
-              {t('「网络代理」页里每个启用的出口轮流使用；之后新加的出口自动加入')}
+              {t('「网络代理」页里每个启用的节点都作为候选；之后新加的节点自动加入')}
             </span>
           </div>
           {!draft.rotateAll ? (
@@ -457,9 +515,15 @@ export function ProxyForm({
               : pool === null
                 ? t('正在读取代理列表…')
                 : pool.length
-                  ? t('每条请求换一个出口（按顺序轮流），上游看到的 IP 因此是变化的；出口的地址与端口由「网络代理」页管理')
-                  : t('「网络代理」页还没有出口 —— 去那里新增，或点「同步 Clash Verge」把 Clash 的出口导进来')}
+                  ? t('候选范围内优先使用已分配端口的节点；耗尽后，未分配端口的节点一次临时开放一个，失败则释放并尝试下一个')
+                  : t('「网络代理」页还没有出口 —— 去那里新增，或在「订阅管理」里点「同步 Clash Verge」把 Clash 的出口导进来')}
           </div>
+          <p className='detail mt-1.5'>
+            {t('粘性使用当前节点，不逐请求切换；满足所选策略且预算允许时，优先切到下一个已分配端口的候选节点。')}
+          </p>
+          <p className='detail mt-1.5'>
+            {t('切换节点不会主动关闭其他在途请求正在使用的端口。两种策略都不重放成功响应后的流；流中断仍可能失败，不会无损重放已输出内容。')}
+          </p>
         </div>
       ) : null}
 
@@ -504,7 +568,7 @@ export function ProxyForm({
           <p className='detail mt-1.5'>
             {t('这是既有配置（直接引用 Clash 出口，不经过代理池）。推荐改用上面的')}
             <b>{t('「已保存的代理」')}</b>
-            {t('：到「网络代理」页点「同步 Clash Verge」把出口导进池后即可选 —— 那样能集中测试、也能被多个账号共用。')}
+            {t('：到「网络代理」页的「订阅管理」里点「同步 Clash Verge」把出口导进池后即可选 —— 那样能集中测试、也能被多个账号共用。')}
           </p>
         </div>
       ) : null}
@@ -540,12 +604,12 @@ export function ProxyForm({
         </div>
       ) : null}
 
-      <div className='field-row mt-3'>
+      {showTest ? <div className='field-row mt-3'>
         <Button variant='outline' size='sm' disabled={testing} onClick={() => void test()}>
           {testing ? t('测试中…') : t('测试出口')}
         </Button>
         <span className='detail'>{testResult}</span>
-      </div>
+      </div> : null}
     </div>
   )
 }
@@ -594,20 +658,20 @@ function PlanChannelField({
         </SelectTrigger>
         <SelectContent>
           <SelectItem value={ZCODE_PLAN_CODING}>
-            {t('编码套餐（Coding Plan）— 走开放平台端点，用自己订阅的额度')}
+            {t('编码套餐（Coding Plan）— 走开放平台端点，消耗开放平台的额度（订阅套餐 / 资源包 / 充值余额）')}
           </SelectItem>
           <SelectItem value={ZCODE_PLAN_START}>
-            {t('活动套餐（Start Plan）— 走官方活动端点，用活动里领到的额度')}
+            {t('套餐池（Start Plan）— 走 zcode.z.ai 端点，消耗 ZCode 套餐池的额度（新用户体验额度 / 活动领取）')}
           </SelectItem>
         </SelectContent>
       </Select>
       {plan === ZCODE_PLAN_START && !hasJwt ? (
         <span className='detail text-destructive'>
-          {t('该账号没有套餐登录态（jwt），活动套餐会失败：请重新登录该账号')}
+          {t('该账号没有套餐登录态（jwt），套餐池通道会失败：请重新登录该账号')}
         </span>
       ) : null}
       {plan === ZCODE_PLAN_START ? (
-        <span className='detail' title={t('活动套餐的推理端点要求每条请求带一个阿里云验证码令牌；令牌由本应用在后台静默铸造，界面关闭时无法铸造')}>
+        <span className='detail' title={t('套餐池的推理端点要求每条请求带一个阿里云验证码令牌；令牌由本应用在后台静默铸造，界面关闭时无法铸造')}>
           {t('验证码令牌：{counts}', { counts: pool ? `${pool.ready} / ${pool.target || 3}` : t('读取中…') })}
           {pool && pool.ready === 0 ? t('（库存为空，正在补；补不上时转发会失败）') : ''}
         </span>
@@ -779,14 +843,19 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   const account = findAccount(id)
   const [enabled, setEnabled] = React.useState(account?.enabled !== false)
   const [name, setName] = React.useState(account?.name || '')
-  const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() => draftOfProxy(account?.proxy))
+  const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() => accountRouteDrafts(account).first)
+  const [secondProxyDraft, setSecondProxyDraft] = React.useState<ProxyDraft>(() => accountRouteDrafts(account).second)
+  const [secondEnabled, setSecondEnabled] = React.useState(() => accountRouteDrafts(account).secondEnabled)
+  const [routeTesting, setRouteTesting] = React.useState(false)
+  const [routeResult, setRouteResult] = React.useState<React.ReactNode>(null)
+  const [providerInsecureTls, setProviderInsecureTls] = React.useState(false)
   const [balanceToken, setBalanceToken] = React.useState('')
   // ZCode 的「使用哪个套餐」草稿（非 ZCode 账号恒为空串，那一段也不渲染）
   const [planChannel, setPlanChannel] = React.useState(() => zcodePlanOf(account))
   const [busy, setBusy] = React.useState(false)
   const [status, setStatus] = React.useState<React.ReactNode>('')
   const [provider, setProvider] = React.useState<{
-    id: string; name?: string; protocol?: string; baseUrl?: string; clientEmulation?: string
+    id: string; name?: string; protocol?: string; baseUrl?: string; clientEmulation?: string; insecureTls?: boolean
   } | null>(null)
   const [providerName, setProviderName] = React.useState('')
   const [providerProtocol, setProviderProtocol] = React.useState('chat_completions')
@@ -826,6 +895,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       setProviderProtocol(found.protocol || 'chat_completions')
       setProviderBaseUrl(found.baseUrl || '')
       setProviderEmulation(typeof found.clientEmulation === 'string' ? found.clientEmulation : '')
+      setProviderInsecureTls(found.insecureTls === true)
     }).catch(() => { /* 目录不可用：退化成「不是自定义家」，不注入那一段 */ })
     return () => { alive = false }
   }, [id])
@@ -850,14 +920,8 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   // 自定义账号：凭证段（API Key / 无需鉴权）只对它渲染。判据用 provider 前缀 ——
   // 与后端 `custom_account_provider` 一致（提供商被删后残留的账号同样该能改凭证）
   const isCustomAccount = providerOf(target).startsWith('custom-')
-  // 「轮询」档的可见性：只有 OpenCode Zen 免费档（按 IP 限流）。判据用**已读到的
-  // 提供商记录**（上面那个 effect 拉的）而不是目录缓存 —— 这一段的上下文里就有它，
-  // 且与「提供商」段编辑的是同一份现值（改了 emulation / baseUrl 未保存时，
-  // 档位仍按盘上的值给，保存后才变 —— 与后端闸门读盘上记录同一口径）。
-  // 记录本来就是这个档时**恒显示**（哪怕判据此刻为假：目录还没读到 / 提供商被
-  // 改过）：否则用户看不到自己这条账号现在是什么状态；后端只挡「真的改成轮询」
-  // 的保存，原样发回来不会 400。
-  const allowRotate = isOpencodeZenProvider(provider, target.baseUrl) || proxyDraft.mode === 'rotate'
+  // 所有账号均开放，不等待提供商目录加载，也不受套餐或 baseUrl 限制。
+  const allowRotate = supportsProxyRotate(target)
   // 余额方案那一段（「查询设置」里的查询凭证）：方案与「已配置」标记都由账号的
   // 公开形态回答 —— `scheme` 是这一家的方案 id，`has*` 是密字段的存在标记
   // （值永不回显，见后端 `store_view::balance_query_public`）
@@ -949,7 +1013,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   }
 
   /** 读「提供商」那一段的改动：没这一段（内置家）或字段都没动 → null（不提交） */
-  function readProviderPatch(): { error: string } | { id: string; name: string; protocol: string; baseUrl: string; clientEmulation: string } | null {
+  function readProviderPatch(): { error: string } | { id: string; name: string; protocol: string; baseUrl: string; clientEmulation: string; insecureTls: boolean } | null {
     if (!provider) return null
     const nextName = providerName.trim()
     const nextBase = providerBaseUrl.trim()
@@ -961,18 +1025,44 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
     if (
       provider.name === nextName && provider.protocol === providerProtocol
       && provider.baseUrl === nextBase && beforeEmulation === providerEmulation
+      && (provider.insecureTls === true) === providerInsecureTls
     ) return null
     return {
       id: provider.id, name: nextName, protocol: providerProtocol,
-      baseUrl: nextBase, clientEmulation: providerEmulation,
+      baseUrl: nextBase, clientEmulation: providerEmulation, insecureTls: providerInsecureTls,
+    }
+  }
+
+  async function testAccountRoute(): Promise<void> {
+    if (routeTesting || busy) return
+    if (provider && ((provider.insecureTls === true) !== providerInsecureTls
+      || provider.protocol !== providerProtocol || provider.baseUrl !== providerBaseUrl.trim())) {
+      setRouteResult(t('请先保存提供商协议、地址或 TLS 设置，再测试链路'))
+      return
+    }
+    setRouteTesting(true)
+    setRouteResult(null)
+    try {
+      const route = readAccountProxyPatch(proxyDraft, secondProxyDraft, true, secondEnabled)
+      const result = await shared().workbuddyDesktop?.testProxy?.({ accountId: id, ...route })
+      setRouteResult(<span className={result?.success ? 'text-success' : 'text-destructive'}>
+        {result?.success ? `✅ HTTP ${String(result.status)} — ${t('链路可达（不代表模型权限验证成功）')}`
+          : `❌ ${result?.error || t('连接失败')}`}
+        {result?.targetUrl ? ` · ${result.targetUrl}` : ''}
+        {result?.tlsVerification === 'disabled' ? ` · ${t('证书校验已关闭')}` : ''}
+      </span>)
+    } catch (error) {
+      setRouteResult(<span className='text-destructive'>{errorMessage(error)}</span>)
+    } finally {
+      setRouteTesting(false)
     }
   }
 
   async function save(): Promise<void> {
     if (busy) return
-    let proxy: ProxyPayload
+    let proxyPatch: ReturnType<typeof readAccountProxyPatch>
     try {
-      proxy = readProxyDraft(proxyDraft)
+      proxyPatch = readAccountProxyPatch(proxyDraft, secondProxyDraft, isCustomAccount, secondEnabled)
     } catch (error) {
       toast(errorMessage(error), 'err')
       return
@@ -1029,7 +1119,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       await shared().workbuddyDesktop?.updateAccount?.(id, {
         name: name.trim() || target.name,
         enabled,
-        proxy,
+        ...proxyPatch,
         ...balancePatch,
         ...planPatch,
         ...credentialPatch,
@@ -1224,13 +1314,50 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
                     <h3>{t('网络')}</h3>
                     <p>{t('这条账号访问上游走哪条线路。')}</p>
                   </div>
-                  <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix='account-proxy'
-                    allowRotate={allowRotate} />
-                  {account.proxy?.error ? (
-                    <p className='detail text-destructive'>
-                      {t('当前代理不可用：{error}（转发时会回退直连）', { error: account.proxy.error })}
-                    </p>
-                  ) : null}
+                  <section aria-label={t('第一跳（常规出口）')}>
+                    {isCustomAccount ? <h4 className='mb-2 text-sm font-medium'>{t('第一跳（常规出口）')}</h4> : null}
+                    <ProxyForm draft={proxyDraft} onChange={next => { setProxyDraft(next); setRouteResult(null) }}
+                      idPrefix='account-proxy' ariaLabel={t('第一跳代理方式')}
+                      allowRotate={allowRotate && !secondEnabled} showTest={!isCustomAccount} />
+                    {(accountRouteDrafts(account).secondEnabled ? account.frontProxy : account.proxy)?.error ? (
+                      <p className='detail text-destructive'>
+                        {(accountRouteDrafts(account).secondEnabled ? account.frontProxy : account.proxy)?.error}
+                      </p>
+                    ) : null}
+                  </section>
+                  {isCustomAccount ? <>
+                    <section className='mt-6' aria-label={t('第二跳（可选）')}>
+                      <Label className='inline-flex cursor-pointer items-center gap-2 font-medium'>
+                        <Checkbox checked={secondEnabled} aria-label={t('启用第二跳')}
+                          onCheckedChange={next => { setSecondEnabled(next === true); setRouteResult(null) }} />
+                        {t('启用第二跳')}
+                      </Label>
+                      <p className='detail my-2'>
+                        {t('默认只使用第一跳；开启后按「第一跳 → 第二跳 → 上游」连接。已有两跳配置保持原顺序。')}
+                      </p>
+                      {secondEnabled ? <>
+                        <ProxyForm draft={secondProxyDraft} onChange={next => { setSecondProxyDraft(next); setRouteResult(null) }}
+                          idPrefix='account-second-proxy' ariaLabel={t('第二跳代理方式')} showTest={false} />
+                        {accountRouteDrafts(account).secondEnabled && account.proxy?.error
+                          ? <p className='detail text-destructive'>{account.proxy.error}</p> : null}
+                      </> : null}
+                    </section>
+                    <p className='detail mt-3'>{t('订阅节点请选择「已保存的代理」，避免固定监听端口失效。两跳链路目前要求两端都支持 HTTP CONNECT。')}</p>
+                    {provider && providerProtocol === 'vertex' ? <div className='mt-4'>
+                      <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+                        <Checkbox checked={providerInsecureTls} aria-label={t('允许代理重签证书（跳过证书校验）')}
+                          onCheckedChange={next => { setProviderInsecureTls(next === true); setRouteResult(null) }} />
+                        {t('允许代理重签证书（跳过证书校验）')}
+                      </Label>
+                      <p className='detail'>{t('仅适用于 Vertex 提供商，影响该提供商全部账号的实际请求与链路测试。默认严格校验；开启后不验证证书签发者和主机身份。修改后先保存，再测试。')}</p>
+                    </div> : null}
+                    <div className='field-row mt-4'>
+                      <Button variant='outline' disabled={routeTesting || busy || !provider}
+                        onClick={() => void testAccountRoute()}>{routeTesting ? t('测试中…') : t('测试当前链路')}</Button>
+                    </div>
+                    <p className='detail mt-2'>{t('测试使用当前代理草稿及已保存的提供商 TLS 设置，连接实际上游站点，不发送模型生成请求。')}</p>
+                    <div className='detail mt-2' role='status'>{routeResult}</div>
+                  </> : null}
                 </div>
               ) : null}
             </div>
@@ -1273,13 +1400,7 @@ function BatchDialog({ ids, action, onClose }: { ids: string[]; action: string; 
     (cap, account) => Math.max(cap, Number(providerFeatures(providerOf(account)).concurrencyDefault) || 0),
     0,
   )
-  /**
-   * 「轮询」档在批量里只在**选中的账号全是 OpenCode Zen** 时给出。
-   *
-   * 后端的闸门是逐账号判的（非 Zen 账号存轮询会 400，见 apply_patch），所以
-   * 混选时给出这一档等于让用户提交一次必然部分失败的批量操作。空选区不给
-   * （那时连账号是谁都还不知道，见 supportsProxyRotate 的说明）。
-   */
+  /** 跨提供商混选也可轮询；空选区不显示可操作档位。 */
   const allowRotate = accounts.length > 0 && accounts.every(account => supportsProxyRotate(account))
 
   /** 批量删除是不可逆操作，按数量做二次确认（原生 confirm 在 Tauri WebView 里直接放行） */

@@ -36,6 +36,7 @@ fn merged_prompt_scope_uses_wire_model_and_empty_scope_never_falls_back() {
             client_headers: &headers,
             telemetry: &telemetry,
             sanitize_fingerprints: false,
+        developer_role_compat: false,
             prompt: PromptPlan::new(PromptChoice {
                 mode: PromptMode::Append, text: "global-must-not-leak", source: PromptSource::Inline,
             }, &providers),
@@ -68,6 +69,7 @@ fn merged_payload_keeps_other_providers_cn_suffix() {
     let ctx = ProviderContext {
         body: &body, stream: false, client_headers: &headers, telemetry: &telemetry,
         sanitize_fingerprints: false,
+        developer_role_compat: false,
         prompt: PromptPlan::new(PromptChoice {
             mode: PromptMode::Passthrough, text: "", source: PromptSource::None,
         }, &providers),
@@ -115,10 +117,32 @@ async fn mock_upstream(
             proxy: None,
             // 测试替身按默认能力位（false = 直连），与生产里不带这一步的家同款
             system_proxy_when_unset: false,
+            accept_any_cert: false,
+        front_proxy: None,
         },
         hits,
         task,
     )
+}
+
+#[tokio::test]
+async fn proxy_rotation_budget_is_not_multiplied_by_outer_provider_resend() {
+    use crate::server::core::proxy_rotate::{Attempts, ATTEMPTS};
+    for (status, expected) in [(500,2),(503,5),(401,1)] {
+        let mut items=Vec::new();let mut tasks=Vec::new();let mut counts=Vec::new();let mut transport=None;
+        for i in 0..7 {
+            let (request,hits,task)=mock_upstream(status,"application/json",r#"{"error":{"message":"test failure"}}"#).await;
+            let port=url::Url::parse(&request.url).unwrap().port().unwrap();
+            items.push(serde_json::json!({"id":format!("outer-{port}-{i}"),"source":"manual","host":"127.0.0.1","port":port}));
+            transport=Some(request);counts.push(hits);tasks.push(task);
+        }
+        let key=super::super::request::new_request_id();let route=Arc::new(tokio::sync::Mutex::new(Attempts::mock(&key,items)));
+        let mut budget=RetryBudget::new(3);
+        let outcome=ATTEMPTS.scope(route,send_with_retry(&ZCODE_ADAPTER,&transport.unwrap(),&mut budget,None,&RequestTelemetry::new(),false)).await;
+        assert!(outcome.is_err());assert_eq!(budget.remaining,3);
+        assert_eq!(counts.iter().map(|c|c.load(Ordering::SeqCst)).sum::<usize>(),expected);
+        for task in tasks {task.abort();}crate::server::core::proxy_rotate::retire(&key);
+    }
 }
 
 #[tokio::test]

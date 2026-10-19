@@ -77,10 +77,11 @@
    * 失败原样抛出（不在这里 toast）：调用方是账号设置弹窗，它要把「账号已保存、
    * 提供商未更新」这句话写在弹窗里，笼统报一句「保存失败」会把两件事混成一件。
    */
-  async function update({ id, name, protocol, baseUrl, clientEmulation }) {
+  async function update({ id, name, protocol, baseUrl, clientEmulation, insecureTls }) {
     if (!isCustomProviderId(id)) throw new Error(wbI18n.t('不是自定义提供商'));
     const body = { id, name, protocol, baseUrl };
     if (typeof clientEmulation === 'string') body.clientEmulation = clientEmulation;
+    if (typeof insecureTls === 'boolean') body.insecureTls = insecureTls;
     await providers.customRequest('POST', '/api/custom-providers/update', body);
     await refreshAfterChange();
   }

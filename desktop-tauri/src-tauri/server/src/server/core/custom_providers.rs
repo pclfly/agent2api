@@ -117,12 +117,23 @@ pub const PROTOCOL_ANTHROPIC: &str = "anthropic";
 ///   - 响应是 AWS Event Stream 二进制分帧，不是 SSE 文本行。
 pub const PROTOCOL_BEDROCK: &str = "bedrock";
 
+/// 协议枚举：Vertex AI Gemini
+///
+/// 与另四者的差异（见 `protocol::vertex_outbound` 的模块头）：
+///   - **鉴权可以留空**：真实密钥由出网代理（如 Agent Vault 的 MITM 代理）按
+///     host+path 模板注入 `x-goog-api-key`，客户端带什么都会被覆写；直连真实
+///     Vertex 时把 API Key 填进账号即可（按 api-key 形态发出）；
+///   - 模型名进 URL 路径（`<model>:streamGenerateContent?alt=sse`），不进请求体；
+///   - 响应是 SSE 文本行，帧内字段为 `candidates[].content.parts[]`。
+pub const PROTOCOL_VERTEX: &str = "vertex";
+
 /// 全部合法协议（校验用；顺序即错误文案与前端下拉的顺序）
 pub const PROTOCOLS: &[&str] = &[
     PROTOCOL_CHAT_COMPLETIONS,
     PROTOCOL_RESPONSES,
     PROTOCOL_ANTHROPIC,
     PROTOCOL_BEDROCK,
+    PROTOCOL_VERTEX,
 ];
 
 /// 展示名长度上限（字符数；1~64 是契约）
@@ -139,8 +150,12 @@ const MAX_REASONING_CHARS: usize = 32;
 /// ── per-provider 特判字段（预置目录带来的上游修正）的长度上限 ──
 /// urlSuffix（查询串，如 "?beta=true"）：查询串一般十几个字符，128 已宽容
 const MAX_URL_SUFFIX_CHARS: usize = 128;
-/// 静态额外头的条数上限：特判用不到几条（Anthropic-Beta / Referer 类），8 足够
-const MAX_HEADER_ENTRIES: usize = 8;
+/// 静态额外头的条数上限。多数家只需要一两条（Anthropic-Beta / Referer 类），
+/// 但**客户端形态伪装**的家要整包复刻官方客户端的头族：Cline Pass 预置卡就是
+/// 9 条（与 `providers/cline/headers.rs` 的 DEFAULT_HEADERS 同一套，缺一条
+/// 上游按客户端形态校验就会 403）。取 16 —— 容得下「整包复刻 + 几条自定义」，
+/// 又仍然拦得住把 headers 当配置文件乱塞的手改数据。
+const MAX_HEADER_ENTRIES: usize = 16;
 /// 静态额外头的键 / 值长度上限：头名 RFC 形态几十字符、值（Anthropic-Beta 的
 /// beta 清单）可能上百字符，512 不拦正常值、只拦把文档粘进来的手改数据
 const MAX_HEADER_NAME_CHARS: usize = 64;
@@ -294,6 +309,10 @@ fn item_of(object: &Map<String, Value>) -> Value {
         "headers": headers_of(object.get("headers")),
         "anthropicToolType": tool_type_of(object.get("anthropicToolType")),
         "clientEmulation": client_emulation,
+        // 放宽 TLS 的显式开关（仅 vertex 协议在转发侧生效；缺省 false）。
+        // 读侧容错：只认布尔真值，「"true"」这类字符串不算 —— 安全开关不接受
+        // 模糊输入。
+        "insecureTls": object.get("insecureTls").and_then(Value::as_bool).unwrap_or(false),
         // 余额查询方案：**读侧也会按 baseUrl 兜底识别**（存量记录没有这个键，
         // 见 BALANCE_SCHEMES 的说明），所以这里给的不是原始值而是归一结果
         "balanceScheme": balance_scheme_of_record(object),
@@ -682,6 +701,8 @@ pub fn create(payload: &Value) -> Result<Value, String> {
         "clientEmulation": validate_client_emulation(object.get("clientEmulation"))?,
         // 余额查询方案（预置卡片提交，见 BALANCE_SCHEMES 的说明）
         "balanceScheme": validate_balance_scheme(object.get("balanceScheme"))?,
+        // 放宽 TLS 的显式开关（只对 vertex 生效；见 update 与 forward 的说明）
+        "insecureTls": object.get("insecureTls").and_then(Value::as_bool).unwrap_or(false),
     });
     let mut items = read_items();
     items.push(item.clone());
@@ -757,6 +778,14 @@ pub fn update(id: &str, payload: &Value) -> Result<Value, String> {
             "clientEmulation".to_string(),
             Value::String(validate_client_emulation(Some(value))?),
         );
+    }
+    // 放宽 TLS 的显式开关：patch 语义（带键才动），只认布尔值。
+    // 安全开关不接受「"true"」这类模糊输入，宁可报错让调用方改对。
+    if let Some(value) = object.get("insecureTls") {
+        let flag = value
+            .as_bool()
+            .ok_or_else(|| "insecureTls 必须是布尔值".to_string())?;
+        merged.insert("insecureTls".to_string(), Value::Bool(flag));
     }
     // 余额查询方案：与上面同一 patch 语义（带键才动）。编辑弹窗不发它 ——
     // 方案是「这一家是谁」的派生事实，用户改协议 / 改名不该顺手把它改掉；
@@ -988,6 +1017,12 @@ pub async fn fetch_upstream_models(
     if protocol == PROTOCOL_BEDROCK {
         return fetch_bedrock_models(&base_url, provider_id, store).await;
     }
+    // vertex 的 baseUrl 语义是「模型公共前缀」（到 `/models` 为止），
+    // 清单地址由该前缀再拼一次 `/models` 不成立（会变成 `.../models/models`），
+    // 因此单独处理：去掉末尾的 `/models` 再拼。
+    if protocol == PROTOCOL_VERTEX {
+        return fetch_vertex_models(&base_url, provider_id, store, &provider).await;
+    }
     let url = if protocol == PROTOCOL_ANTHROPIC {
         format!("{base_url}/v1/models")
     } else {
@@ -1050,6 +1085,261 @@ pub async fn fetch_upstream_models(
 /// 上游清单接口是否成功（2xx 即可：个别网关会回 200 以外的成功码）
 fn response_ok(status: u16) -> bool {
     (200..300).contains(&status)
+}
+
+/// vertex 的模型清单拉取（[`fetch_upstream_models`] 的独立分支）。
+///
+/// ── 与前三家的差别 ──────────────────────────────────────────
+/// 前三家的 baseUrl 是「API 根」（`https://host/v1`），清单拼 `{base}/models`。
+/// vertex 的 baseUrl 语义是**模型公共前缀**，逐字等于
+/// `https://aiplatform.googleapis.com/v1/projects/<p>/locations/<l>/publishers/google/models`
+/// —— 它本身就以 `/models` 结尾，再拼一次会得到 `.../models/models`。
+/// 因此这里先剥掉末尾的 `/models`，再拼 `/models?pageSize=200`。
+///
+/// ── 鉴权 ────────────────────────────────────────────────────
+/// 有 Key 发 `x-goog-api-key`（Vertex 原生 api-key 形态），无 Key 一个头都不发
+/// （交给出网代理注入；空 key 会被 Google 判成 API_KEY_INVALID）。
+///
+/// ── 自建/注入型网关的兼容 ────────────────────────────────────
+/// 若上游回的**不是** Vertex 的 `{models:[{name:"models/gemini-..."}]}`
+/// 而是 OpenAI 式的 `{data:[{id}]}`（很多兼容网关如此），这里两种都认，
+/// 并把 `models/` 前缀剥掉 —— 用户填模型名时要的是 `gemini-4-argon`。
+async fn fetch_vertex_models(
+    base_url: &str,
+    provider_id: &str,
+    store: &AccountStore,
+    provider: &Value,
+) -> Result<Vec<String>, String> {
+    let credential = store
+        .first_custom_credential(provider_id)
+        .ok_or_else(|| {
+            "请先添加账号：拉取模型清单需要一条启用且可用（填了 apiKey，或声明了无需鉴权）的账号"
+                .to_string()
+        })?;
+    // baseUrl 是「到 /models 为止」的公共前缀：剥掉末尾的 /models 再拼清单地址
+    let root = base_url.trim().trim_end_matches('/');
+    let root = root.strip_suffix("/models").unwrap_or(root);
+    let url = format!("{root}/models?pageSize=200");
+
+    // 与转发同一口径：提供商显式声明 insecureTls 时放宽校验
+    // （上游经 MITM 型代理时其证书不被系统信任，见 egress 的说明）
+    let insecure = provider
+        .get("insecureTls")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let client = egress::client_for_with_tls(credential.proxy.as_ref(), insecure);
+    let mut builder = client
+        .get(&url)
+        .timeout(Duration::from_millis(FETCH_MODELS_TIMEOUT_MS))
+        .header("Accept", "application/json");
+    let api_key = credential.api_key.trim();
+    if !api_key.is_empty() {
+        builder = builder.header("x-goog-api-key", api_key);
+    }
+    let response = builder.send().await.map_err(|error| {
+        format!(
+            "上游请求失败: {}",
+            egress::describe_error_detail(&error)
+        )
+    })?;
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    if !response_ok(status) {
+        // 404 常见于「清单端点未被放行」：注入型代理（如 Agent Vault）按
+        // host+path 模板放行，模板通常是 `.../models/*`（生成端点），
+        // 清单端点 `.../models` 本身不在其中。这不是配置错误，而是该部署
+        // 不提供枚举能力 —— 给出可操作的提示，而不是让用户对着 404 猜。
+        if status == 404 {
+            // 清单端点不可用（注入型代理只放行 `.../models/*` 生成端点）：
+            // 退到**生成型探测** —— 对内置候选表逐个发一次
+            // `maxOutputTokens: 1` 的最小请求，按 200/404 判定模型是否存在。
+            // 代价是每个候选一次极小的计费调用（约 2~5 tokens），因此候选表
+            // 只放「值得探测」的名字，不做穷举。
+            return probe_vertex_models(base_url, provider, &credential).await;
+        }
+        let summary: String = text.trim().chars().take(200).collect();
+        return Err(format!("上游返回 {status}: {summary}"));
+    }
+    let payload: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("上游响应不是合法 JSON: {error}"))?;
+
+    // Vertex 原生形态：{models:[{name:"models/gemini-3.8-flash", ...}]}
+    let mut ids: Vec<String> = payload
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("name")
+                        .and_then(Value::as_str)
+                        .map(strip_models_prefix)
+                        .filter(|id| !id.is_empty())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // 兼容 OpenAI 形态：{data:[{id}]}（自建网关常见）
+    if ids.is_empty() {
+        ids = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        item.get("id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+    Ok(ids)
+}
+
+/// `models/gemini-3.8-flash` → `gemini-3.8-flash`
+fn strip_models_prefix(name: &str) -> String {
+    name.trim()
+        .strip_prefix("models/")
+        .unwrap_or(name.trim())
+        .to_string()
+}
+
+/// 生成型探测时逐个尝试的候选模型名。
+///
+/// ── 为什么需要探测 ──────────────────────────────────────────
+/// Vertex 的清单端点（`GET .../models`）在注入型代理下常被 host+path 模板
+/// 挡掉（模板只放行 `.../models/*` 生成端点）。此时唯一能问「这个模型存在吗」
+/// 的办法就是**发一次最小生成请求**：存在 → 200，不存在 → 404 NOT_FOUND。
+///
+/// ── 候选表怎么维护 ──────────────────────────────────────────
+/// 只放「值得一试」的名字：Gemini 各代与常见代次后缀。每项代价约 2~5 tokens
+/// （`maxOutputTokens: 1` + 单字 prompt），整表跑完仍是可忽略的量级。
+/// 非 Google 的厂商名（`gpt-*` / `claude-*`）也保留：某些部署把第三方模型挂
+/// 在同一个 Vertex 项目下，探测能自动发现它们；不存在就只是多一次 404。
+const VERTEX_PROBE_CANDIDATES: &[&str] = &[
+    // Gemini 4 代
+    "gemini-4-argon",
+    "gemini-4",
+    "gemini-4-pro",
+    "gemini-4-flash",
+    "gemini-4-flash-preview",
+    "gemini-4-pro-preview",
+    // Gemini 3.x
+    "gemini-3.8-flash",
+    "gemini-3.8-pro",
+    "gemini-3.8-flash-preview",
+    "gemini-3.5-flash",
+    "gemini-3.5-pro",
+    "gemini-3-flash-preview",
+    "gemini-3-pro",
+    "gemini-3-pro-preview",
+    // Gemini 2.x
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    // 同一项目下可能挂载的第三方模型
+    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-5.6-luna",
+    "claude-opus-5.5",
+    "claude-fable-5.1",
+    "claude-opus-4-5",
+    "claude-sonnet-4-5",
+];
+
+/// 生成型探测：逐个候选发最小请求，收集 200 的那些。
+///
+/// 并发上限刻意压低（4）：这是在替用户的上游项目跑一串计费调用，
+/// 不该把并发打满去抢配额。任一候选返回 401/403 时**立即中止**并报错 ——
+/// 那是凭证问题，继续探测只会把同一份错误重复 N 遍。
+async fn probe_vertex_models(
+    base_url: &str,
+    provider: &Value,
+    credential: &crate::server::core::account_store::custom_accounts::CustomCredential,
+) -> Result<Vec<String>, String> {
+    let insecure = provider
+        .get("insecureTls")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let client = egress::client_for_with_tls(credential.proxy.as_ref(), insecure);
+    let root = base_url.trim().trim_end_matches('/');
+    let api_key = credential.api_key.trim().to_string();
+
+    let mut found: Vec<String> = Vec::new();
+    let mut auth_error: Option<String> = None;
+
+    // 分批串行（每批内并发）：实现简单，且 401 中止的语义清楚
+    for batch in VERTEX_PROBE_CANDIDATES.chunks(4) {
+        let mut tasks = Vec::new();
+        for model in batch {
+            let client = client.clone();
+            let root = root.to_string();
+            let api_key = api_key.clone();
+            let model = (*model).to_string();
+            tasks.push(async move {
+                let url = format!("{root}/{model}:generateContent");
+                let body = serde_json::json!({
+                    "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+                    "generationConfig": { "maxOutputTokens": 1 }
+                });
+                let mut builder = client
+                    .post(&url)
+                    .timeout(Duration::from_millis(FETCH_MODELS_TIMEOUT_MS))
+                    .header("Content-Type", "application/json");
+                if !api_key.is_empty() {
+                    builder = builder.header("x-goog-api-key", &api_key);
+                }
+                let response = builder.body(body.to_string()).send().await;
+                (model, response)
+            });
+        }
+        let results = futures::future::join_all(tasks).await;
+        for (model, response) in results {
+            match response {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if status == 200 {
+                        found.push(model);
+                    } else if status == 401 || status == 403 {
+                        let text = resp.text().await.unwrap_or_default();
+                        let summary: String = text.trim().chars().take(160).collect();
+                        auth_error = Some(format!("上游凭证被拒绝（HTTP {status}）: {summary}"));
+                    }
+                }
+                Err(error) => {
+                    // 单个候选的传输失败不致命（可能是并发限流）：跳过继续
+                    logging::log(
+                        "[CustomProvider]",
+                        &format!(
+                            "⚠️ 探测 {model} 失败: {}",
+                            egress::describe_error_detail(&error)
+                        ),
+                    );
+                }
+            }
+        }
+        if auth_error.is_some() {
+            break;
+        }
+    }
+
+    if let Some(message) = auth_error {
+        return Err(message);
+    }
+    if found.is_empty() {
+        return Err(
+            "模型清单端点不可用，且候选探测没有命中任何模型。\
+             请确认 Base URL 指向正确的项目/区域，或手工添加模型名。"
+                .to_string(),
+        );
+    }
+    Ok(found)
 }
 
 /// bedrock 的模型清单拉取（[`fetch_upstream_models`] 的独立分支）。
