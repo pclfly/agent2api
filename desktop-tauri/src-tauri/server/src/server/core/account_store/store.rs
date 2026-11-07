@@ -558,6 +558,12 @@ impl AccountStore {
             "edition": edition.id,
             "proxy": proxy,
             "proxyError": proxy_error_value,
+            // 前置跳的**原始配置**（两跳链路要的是它，不是解析后的单跳形态）：
+            // `resolve_front_proxy` 读 `.config`，缺键 = 没配前置跳。
+            "frontProxy": match record.get("frontProxy") {
+                Some(value) if !value.is_null() => json!({ "config": value }),
+                _ => Value::Null,
+            },
             "auth": {
                 "accessToken": access_token,
                 "refreshToken": refresh_token,
@@ -692,9 +698,16 @@ impl AccountStore {
     /// **按 IP** 判的（这个 IP 的免费额度用完），换一个出口往往就能过 ——
     /// 换到别的 IP 再试一次比直接罚账号（按模型冷却）更贴近上游的语义。
     ///
+    /// `origin` 是本次请求的目标上游：冷却按 `(账号, 出口, origin)` 记账，
+    /// 传 `None` 等于「不看冷却」（调用方拿不到 URL 时才会这样）。
+    ///
     /// 返回 `Ok(None)` = 这条账号不是轮询档（调用方不该换出口）；
     /// `Err(原因)` = 是轮询档但一条候选都取不出来（原因原样报给明细）。
-    pub fn next_rotate_proxy(&self, id: &str) -> Result<Option<ResolvedProxy>, String> {
+    pub fn next_rotate_proxy(
+        &self,
+        id: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<ResolvedProxy>, String> {
         let Some(record) = self.read_record(id) else {
             return Ok(None);
         };
@@ -702,7 +715,7 @@ impl AccountStore {
         if !crate::server::core::proxies::is_rotate_config(&config) {
             return Ok(None);
         }
-        crate::server::core::proxy_rotate::next(&config, record.id())
+        crate::server::core::proxy_rotate::next_for(&config, record.id(), origin)
             .map(Some)
             .map_err(|reason| reason)
     }

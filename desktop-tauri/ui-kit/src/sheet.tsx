@@ -111,8 +111,10 @@ function SheetContent({
           'transition-[opacity,transform] duration-200 [transition-timing-function:cubic-bezier(.32,.9,.3,1)]',
           centered
             ? [
-                'top-1/2 left-1/2 max-h-[calc(100vh-48px)] w-[min(560px,calc(100vw-48px))]',
-                '-translate-x-1/2 -translate-y-1/2 rounded-lg',
+                // 与 DialogContent / AlertDialogContent 同款：top/left 50% + 负位移居中，
+                // 不用 `inset-0 m-auto`（否则 max-h 一到就撑满整屏高、下面拖出空白）。
+                'top-1/2 left-1/2 max-h-[calc(100vh-48px)] w-[min(560px,calc(100vw-48px))] -translate-x-1/2 -translate-y-1/2',
+                'rounded-lg',
                 'data-open:animate-in data-open:fade-in-0 data-open:zoom-in-[.985]',
                 'data-closed:animate-out data-closed:fade-out-0 data-closed:fill-mode-forwards',
               ]

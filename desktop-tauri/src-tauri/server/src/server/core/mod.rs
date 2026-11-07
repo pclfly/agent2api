@@ -90,6 +90,7 @@ pub mod custom_providers;
 pub mod debug_traffic;
 pub mod degrade;
 pub mod egress;
+pub mod egress_ready;
 pub mod endpoints;
 pub mod growth_scheduler;
 pub mod import_ccswitch;
@@ -107,8 +108,10 @@ pub mod models;
 /// （`ProviderAdapter`），本模块提供它的远程实现 `RpcAdapter`。
 pub mod plugin_host;
 pub mod prompt;
+pub mod provider_route;
 pub mod protocol;
 pub mod providers;
+pub mod proxy_chain;
 pub mod proxy_pool;
 pub mod proxy_rotate;
 pub mod proxy_settings;
@@ -122,6 +125,8 @@ pub mod scheduled_tasks;
 // 布局的合法形状由前端 `ui/sidebar-layout.js` 拥有，后端只当不透明文档，
 // 见该模块头
 pub mod sidebar_layout;
+pub mod sub_kernel;
+pub mod subscriptions;
 // 运行环境探测（系统 / 架构 / 容器 / 服务形态 / 路径脱敏）：设置页「版本信息」
 // 的数据底座，见该模块头。纯读，不依赖 ServerState。
 pub mod system_info;

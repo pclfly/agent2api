@@ -147,6 +147,7 @@ pub mod role_compat;
 pub mod routing_api;
 pub mod routing_flow;
 pub mod routing_trace;
+pub mod subscriptions;
 pub mod routing_workspace;
 pub mod sanitize;
 pub mod scheduled_tasks;

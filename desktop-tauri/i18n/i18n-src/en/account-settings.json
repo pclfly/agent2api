@@ -3,6 +3,7 @@
   "{count} 个账号共用": "Shared by {count} accounts",
   "{count} 个账号共用提供商的连接配置。": "{count} accounts share this provider's connection settings.",
   "{count} 个账号共用连接配置": "Connection settings shared by {count} accounts",
+  "✅ 账号设置已保存，并启用了「{name}」": "✅ Account settings saved, and \"{name}\" was enabled",
   "「{name}」名下 {count} 个账号共用这些连接设置。修改协议或 Base URL 可能中断正在进行的请求。": "These connection settings are shared by {count} accounts under {name}. Changing the protocol or Base URL may interrupt requests in progress.",
   "「{name}」名下 {count} 个账号共用；修改协议或地址可能中断正在进行的请求。": "Shared by {count} accounts under {name}. Changing the protocol or address may interrupt requests in progress.",
   "仅当前账号": "This account only",

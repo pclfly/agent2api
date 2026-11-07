@@ -23,6 +23,10 @@ export function providerPromptRows(prompt: PromptState): ProviderPromptState[] {
       configured: true,
     } : {
       id,
+      // 补出来的行没有自己的范围（它本来就没配过这一家）—— `null` = 全部，
+      // 与「没配过覆盖」的语义一致：一旦用户给它配范围，那一行就变成
+      // `configured: true` 的真实覆盖
+      models: null,
       mode: prompt.mode,
       file: prompt.file,
       text: prompt.text,

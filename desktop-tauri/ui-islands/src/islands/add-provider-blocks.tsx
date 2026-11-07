@@ -181,10 +181,14 @@ function ManualSection({
     }
     await runAdd(setBusy, async () => {
       try {
-        const data = (await postAccount(payload)) as { account?: AccountRecord } | null
+        const data = (await postAccount(payload)) as {
+          account?: AccountRecord
+          /** 后端在新增时顺手启用了被引用的代理池条目（用户选了一条被禁用的） */
+          proxyNotice?: string
+        } | null
         clearFields(fieldIds)
         setHint('')
-        await afterAdd(addedLabelOf(data?.account), config.label)
+        await afterAdd(addedLabelOf(data?.account), config.label, data?.proxyNotice)
       } catch (error) {
         toast(t('添加失败：{reason}', { reason: describeError(error) }), 'err')
       }
@@ -231,7 +235,7 @@ function ManualSection({
       {config.loginProxy ? (
         <div className='flex min-w-0 flex-col gap-2'>
           <Label>{t('登录出网代理')}</Label>
-          <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix={`${prefix}-manual-proxy`} />
+          <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix={`${prefix}-manual-proxy`} allowRotate />
           <p className='detail'>
             {t('添加时要用它出网校验凭证（例如 Antigravity 要打一次 Google 的 token 端点）。无头服务器上没有系统代理，这里不选就走直连。')}
           </p>
@@ -267,9 +271,9 @@ function DesktopSection({
     await runAdd(setBusy, async () => {
       try {
         const data = (await postAccount({ provider: config.provider, importDesktop: true })) as
-          | { account?: AccountRecord }
+          | { account?: AccountRecord; proxyNotice?: string }
           | null
-        await afterAdd(data?.account?.name || '', config.label)
+        await afterAdd(data?.account?.name || '', config.label, data?.proxyNotice)
       } catch (error) {
         // 读不到客户端登录态时后端给 400 + 明确原因，原样透出即可
         toast(t('导入失败：{reason}', { reason: describeError(error) }), 'err')
@@ -329,8 +333,8 @@ function GuestSection({
           provider: config.provider,
           guest: true,
           ...(name ? { name } : {}),
-        })) as { account?: AccountRecord } | null
-        await afterAdd(data?.account?.name || '', config.label)
+        })) as { account?: AccountRecord; proxyNotice?: string } | null
+        await afterAdd(data?.account?.name || '', config.label, data?.proxyNotice)
       } catch (error) {
         toast(t('添加失败：{reason}', { reason: describeError(error) }), 'err')
       }
@@ -439,9 +443,9 @@ function FileImportSection({
           }
         }
         if (remark) payload.name = remark
-        const data = (await postAccount(payload)) as { account?: AccountRecord } | null
+        const data = (await postAccount(payload)) as { account?: AccountRecord; proxyNotice?: string } | null
         setHint('')
-        await afterAdd(addedLabelOf(data?.account), config.label)
+        await afterAdd(addedLabelOf(data?.account), config.label, data?.proxyNotice)
       } catch (error) {
         // 文件本身的问题（缺字段 / 密文解不开 / 凭证无效）后端都给 400 + 带文件名的
         // 原因，原样透出即可
@@ -615,7 +619,7 @@ function WebLoginSection({
             draft={proxyDraft}
             onChange={value => { setProxyDraft(value); setProxyError('') }}
             idPrefix={`${prefix}-login-proxy`}
-            allowRotate={false}
+            allowRotate
           />
           <p className='detail'>
             {t('授权页、换证与取账号信息都走这条线路。无头服务器上没有系统代理，这里不选就走直连（多数网络里到不了 Google）。')}
@@ -1009,9 +1013,9 @@ function WorkBuddyFileImportSection({
           ? accountFilePayload(record, workbuddyProviderId(landed), remark)
           : { ...record, provider: workbuddyProviderId(landed) }
         if (remark) payload.name = remark
-        const data = (await postAccount(payload)) as { account?: AccountRecord } | null
+        const data = (await postAccount(payload)) as { account?: AccountRecord; proxyNotice?: string } | null
         setHint('')
-        await afterAdd(addedLabelOf(data?.account), landed === 'intl' ? 'WorkBuddy AI' : 'WorkBuddy')
+        await afterAdd(addedLabelOf(data?.account), landed === 'intl' ? 'WorkBuddy AI' : 'WorkBuddy', data?.proxyNotice)
       } catch (error) {
         toast(t('导入失败：{reason}', { reason: describeError(error) }), 'err')
       }
@@ -1087,8 +1091,8 @@ function WorkBuddyDesktopImportSection({
         const data = (await postAccount({
           provider: workbuddyProviderId(edition),
           importDesktop: true,
-        })) as { account?: AccountRecord } | null
-        await afterAdd(addedLabelOf(data?.account), edition === 'intl' ? 'WorkBuddy AI' : 'WorkBuddy')
+        })) as { account?: AccountRecord; proxyNotice?: string } | null
+        await afterAdd(addedLabelOf(data?.account), edition === 'intl' ? 'WorkBuddy AI' : 'WorkBuddy', data?.proxyNotice)
       } catch (error) {
         // 读不到官方客户端登录态时后端给 400 + 明确原因，原样透出即可
         toast(t('导入失败：{reason}', { reason: describeError(error) }), 'err')

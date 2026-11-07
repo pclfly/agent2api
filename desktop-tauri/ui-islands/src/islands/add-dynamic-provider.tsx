@@ -337,7 +337,8 @@ export function DynamicProviderBlock({
     setProxyDraft(draftOfProxy(undefined))
     setError('')
     const nickname = textOf(result.session?.nickname)
-    await afterAdd(addedLabelOf(result.account) || nickname, label)
+    // 自动启用过的池条目说明交给 `afterAdd` 统一提示（它同时负责重读池缓存）
+    await afterAdd(addedLabelOf(result.account) || nickname, label, result.proxyNotice)
     if (result.warning) toast(t('账号已添加，但请留意：{warning}', { warning: result.warning }), 'warn')
   }
 
@@ -348,9 +349,6 @@ export function DynamicProviderBlock({
       if (method.reason) throw new Error(method.reason)
       const fields = readInputs(method, inputs)
       const proxy = readProxyDraft(proxyDraft)
-      if (proxy && 'source' in proxy && proxy.source === 'rotate') {
-        throw new Error(t('登录代理不支持轮询出网，请选择一条已保存的代理'))
-      }
       const remark = method.prompts.some(prompt => prompt.key === 'name') ? fields.name : name.trim()
       const payload: Record<string, unknown> = { provider, proxy, ...(remark ? { name: remark } : {}) }
       if (method.type === 'api') {
@@ -558,7 +556,7 @@ export function DynamicProviderBlock({
         </div> : null}
         <div inert={locked} className='flex min-w-0 flex-col gap-2'>
           <Label>{t('账号 / 登录出网代理')}</Label>
-          <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix={`${prefix}-proxy`} />
+          <ProxyForm draft={proxyDraft} onChange={setProxyDraft} idPrefix={`${prefix}-proxy`} allowRotate />
         </div>
         {method.type === 'api' ? <p>{t('新网关确认代理同次保存后不再重复提交；旧网关使用兼容保存并提示核查，失败不会撤销已添加的账号。')}</p> : null}
       </> : null}

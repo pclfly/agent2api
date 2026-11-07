@@ -111,9 +111,33 @@ pub const PROTOCOL_CHAT_COMPLETIONS: &str = "chat_completions";
 pub const PROTOCOL_RESPONSES: &str = "responses";
 /// 协议枚举：Anthropic Messages
 pub const PROTOCOL_ANTHROPIC: &str = "anthropic";
+/// 协议枚举：AWS Bedrock Converse
+///
+/// 与前三者的差异（见 `protocol::bedrock_outbound` 的模块头）：
+///   - 鉴权是 AWS SigV4（签名随请求体变化），不是固定凭证头；
+///   - 账号的 `apiKey` 承载**三元组** `AccessKeyId:SecretAccessKey[:region]`；
+///   - 模型名进 URL 路径（`/model/<id>/converse-stream`），不进请求体；
+///   - 响应是 AWS Event Stream 二进制分帧，不是 SSE 文本行。
+pub const PROTOCOL_BEDROCK: &str = "bedrock";
+
+/// 协议枚举：Vertex AI Gemini
+///
+/// 与另四者的差异（见 `protocol::vertex_outbound` 的模块头）：
+///   - **鉴权可以留空**：真实密钥由出网代理（如 Vault 的 MITM 代理）按
+///     host+path 模板注入 `x-goog-api-key`，客户端带什么都会被覆写；直连真实
+///     Vertex 时把 API Key 填进账号即可（按 api-key 形态发出）；
+///   - 模型名进 URL 路径（`<model>:streamGenerateContent?alt=sse`），不进请求体；
+///   - 响应是 SSE 文本行，帧内字段为 `candidates[].content.parts[]`。
+pub const PROTOCOL_VERTEX: &str = "vertex";
 
 /// 全部合法协议（校验用；顺序即错误文案与前端下拉的顺序）
-pub const PROTOCOLS: &[&str] = &[PROTOCOL_CHAT_COMPLETIONS, PROTOCOL_RESPONSES, PROTOCOL_ANTHROPIC];
+pub const PROTOCOLS: &[&str] = &[
+    PROTOCOL_CHAT_COMPLETIONS,
+    PROTOCOL_RESPONSES,
+    PROTOCOL_ANTHROPIC,
+    PROTOCOL_BEDROCK,
+    PROTOCOL_VERTEX,
+];
 
 /// 展示名长度上限（字符数；1~64 是契约）
 const MAX_NAME_CHARS: usize = 64;

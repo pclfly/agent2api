@@ -49,6 +49,7 @@ pub mod aggregate;
 pub mod cancellation;
 pub mod connections;
 pub mod continuation;
+pub mod credit_estimate;
 mod image_tasks;
 mod images;
 pub mod image_compress;
@@ -289,12 +290,70 @@ pub(super) struct RouteTarget {
     /// 又看不到「这条请求其实是直连出去的」。带到这里之后，转发层把它记进
     /// **本轮尝试明细**的 `notice`，请求日志一次悬停就能看到，运行日志不再写。
     pub proxy_notice: Option<String>,
+    /// **账号配了代理，但这一次解析不出来** —— 转发层必须拒绝，不得回退直连。
+    ///
+    /// ── 为什么这条与 `proxy_notice` 分开存 ──────────────────────
+    /// `proxy_notice` 是给用户看的提示，语义是「本次直连了，原因是 X」——
+    /// 它本身**允许**直连（账号没配代理、或配的是显式直连）。
+    /// 而这里记录的是**配了却不可用**：那种情况下直连等于把账号的真实出口 IP
+    /// 暴露给上游（订阅节点端口失效时尤其危险）。两者必须显式区分，
+    /// 否则「提示一下然后直连」会静默吃掉本该被拦下的流量。
+    ///
+    /// `Some(原因)` = 拒绝本次转发（502），原因进错误文案与尝试明细。
+    pub proxy_blocked: Option<String>,
     /// 本次选路的**决策快照**（候选怎么排的、谁被跳过、为什么选中它 ——
     /// `routing::plan_route` 的输出；请求详情页的「路由回放」读它）。
     ///
     /// `None` = 没走到账号选路（候选集合为空、用默认登录态直发）。
     /// 由转发层挂进 telemetry 落进请求日志；这里只是**捎带**，不参与转发。
     pub decision: Option<Value>,
+}
+
+/// 从账号的公开形态里解析出**前置跳**代理（`frontProxy`）。
+///
+/// ── 为什么读公开形态而不是凭证 ────────────────────────────────
+/// `frontProxy` 不属于凭证：它是出网路径的一部分，网关的公开投影
+/// （`account_store::store_view`）已经把它带出来了。转发层只需要**原始配置**
+/// （`frontProxy.config`）—— 投影里另有 `label` / `error` 等展示字段，
+/// 那些是给界面看的，`resolve_account_proxy` 不接受它们。
+///
+/// ── 三态 ─────────────────────────────────────────────────────
+/// * `Ok(None)`：没配前置跳（绝大多数账号）；
+/// * `Ok(Some(proxy))`：解析出可用的前置跳；
+/// * `Err(原因)`：**配了但用不了**。调用方必须把它当成硬错误 —— 静默降级成
+///   单跳会让请求从错误的地区出去，比直接失败难查得多。
+pub fn resolve_front_proxy(
+    account: Option<&Value>,
+) -> Result<Option<ResolvedProxy>, String> {
+    let Some(front) = account
+        .and_then(|account| account.get("frontProxy"))
+        .filter(|front| !front.is_null())
+    else {
+        return Ok(None);
+    };
+    // ── 两种投影形状都要认 ──────────────────────────────────────
+    // `describe_account_proxy` 给的是 `{source, label, error, config}`（原配置在
+    // `config` 里）；而账号列表的快照投影给的是 `ResolvedProxy::to_json()` 的
+    // 扁平形态 `{source, protocol, host, port, username, password, label}`。
+    // 只认前者会让「列表投影出来的前置跳」静默失效（实测踩过：两跳不生效、
+    // 也没有任何报错，因为 `config` 缺失被当成「没配前置跳」）。
+    //
+    // 判据：`config` 是对象就用它，否则把整个对象当配置 —— 两种形状里
+    // `source` / `protocol` / `host` / `port` 的键名是一致的，归一函数都认。
+    let config = front
+        .get("config")
+        .filter(|value| value.is_object())
+        .unwrap_or(front);
+    let normalized = crate::server::core::proxies::normalize_account_proxy(config)
+        .map_err(|error| format!("frontProxy: {error}"))?
+        .ok_or_else(|| "frontProxy 已配置但没有有效出口".to_string())?;
+    match crate::server::core::proxies::resolve_account_proxy(Some(&normalized)) {
+        Some(crate::server::core::proxies::ProxyResolution::Resolved(proxy)) => Ok(Some(proxy)),
+        Some(crate::server::core::proxies::ProxyResolution::Failed(error)) => {
+            Err(format!("frontProxy: {error}"))
+        }
+        None => Err("frontProxy 已配置但未解析出出口".to_string()),
+    }
 }
 
 impl UpstreamService {

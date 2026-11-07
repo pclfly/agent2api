@@ -88,6 +88,7 @@
   "活跃": "",
   "活跃天数": "Active days",
   "活跃热力图": "Activity heatmap",
+  "积分 {value}": "Credit {value}",
   "管理": "",
   "累计请求 {n} 条": "{n} requests in total",
   "结束日期": "End date",
@@ -96,6 +97,7 @@
   "统计概览": "Statistics overview",
   "缓存命中率": "Cache hit rate",
   "自定义区间": "Custom range",
+  "请求日志只展示仍保留的明细；清理明细不会减少日报中的历史用量。": "Request logs show only retained details; clearing them does not reduce historical usage in daily reports.",
   "读取报表失败：{error}": "Failed to load report: {error}",
   "账号分布": "",
   "账号用量": "",
@@ -114,6 +116,8 @@
   "还有 {n} 个待签": "",
   "还没有添加账号": "",
   "还没有请求记录": "",
-  "请求日志只展示仍保留的明细；清理明细不会减少日报中的历史用量。": "Request logs show only retained details; clearing them does not reduce historical usage in daily reports.",
-  "连续天数": ""
+  "连续天数": "",
+  "（{measured}/{successful} 条有读数）": " ({measured}/{successful} requests have readings)",
+  "（含预估值）": " (includes estimate)",
+  "积分消耗": "Credits used"
 }

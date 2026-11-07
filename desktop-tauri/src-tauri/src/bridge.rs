@@ -431,12 +431,18 @@ const BRIDGE_JS: &str = r#"
     // 标题栏那一族方法有同样的教训，见 zcode-claim 那段的说明。
     // 写操作返回最新代理列表；测试失败以 success:false 表达。
     getProxyPool: () => call('GET', '/api/proxies/pool'),
+    // 只列可用条目（账号侧代理下拉 / 轮询候选）：后端不同步 Clash、滤掉禁用项，
+    // 所以禁用的节点既不会出现在下拉里、也不会被选成轮询候选。
+    getUsableProxyPool: () => call('GET', '/api/proxies/pool/usable'),
     createProxyPoolItem: payload => call('POST', '/api/proxies/pool', payload || {}),
     updateProxyPoolItem: payload => call('POST', '/api/proxies/pool/update', payload || {}),
     setProxyPoolItemEnabled: payload => call('POST', '/api/proxies/pool/enable', payload || {}),
     removeProxyPoolItem: id => call('POST', '/api/proxies/pool/remove', { id: String(id || '') }),
     testProxyPoolItem: id => call('POST', '/api/proxies/pool/test', { id: String(id || '') }),
     syncClashToProxyPool: () => call('POST', '/api/proxies/pool/sync-clash', {}),
+    // 清除轮询候选冷却（管理动作）：只清出口冷却，不清账号限额、不重启内核。
+    // 只接受空 body —— 后端拒绝带筛选字段的请求，免得让人以为「只清了某个节点」。
+    clearProxyRotateCooldowns: () => call('POST', '/api/proxies/rotate/clear-cooldowns', {}),
     // ── 代理设置（「网络代理」页的设置弹窗：测试目标网址）──
     // 与 web_shim.rs 的同名方法成对存在（教训同上）。契约见 `api::proxies`
     // 的模块头 settings 两条：GET 带 `defaults`（弹窗的默认值读它），

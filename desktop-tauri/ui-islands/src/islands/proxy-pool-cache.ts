@@ -101,7 +101,14 @@ export async function proxyPoolOptions(options: { force?: boolean } = {}): Promi
   if (!poolInflight) {
     poolInflight = (async (): Promise<ProxyPoolData> => {
       try {
-        const data = await shared().workbuddyDesktop?.getProxyPool?.()
+        const bridge = shared().workbuddyDesktop
+        // 优先走「只列可用条目」的那条接口：禁用的节点不该出现在账号的代理
+        // 下拉里，也不该被选成轮询候选（见 `api::proxies::pool_usable`）。
+        // 旧壳没有这个桥方法时回落整份列表 —— 总比整个下拉读不出来强，
+        // 已禁用的条目会在标签里标「已禁用」。
+        const data = typeof bridge?.getUsableProxyPool === 'function'
+          ? await bridge.getUsableProxyPool()
+          : await bridge?.getProxyPool?.()
         if (!data || typeof data !== 'object' || !Array.isArray(data.items)) {
           throw new Error(t('代理池响应异常（{type}）', { type: typeof data }))
         }

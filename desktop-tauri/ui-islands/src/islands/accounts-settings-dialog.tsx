@@ -14,7 +14,7 @@ import {
 } from './accounts-shared'
 import {
   displayNameOf, providerFeatures, providerOf, supportsPlanChannel, supportsUsage,
-  isOpencodeZenProvider, zcodePlanOf,
+  supportsProxyRotate, zcodePlanOf,
 } from './accounts-domain'
 import { PlanChannelField } from './accounts-zcode-plan'
 import {
@@ -25,8 +25,8 @@ import {
   balanceSpecOf, readBalanceQueryChanges, type BalanceFieldKey,
 } from './balance-query'
 import { limiterDraftOf, LimiterSection, readLimiterChanges } from './accounts-dialog-limiter'
-import { allAccounts, findAccount, syncBalancesSnapshot } from './accounts-data'
-import { refreshSavedAccounts, updateAccountConfirmed } from './accounts-update'
+import { allAccounts, findAccount, proxyPoolSnapshot, refreshProxyPool, syncBalancesSnapshot } from './accounts-data'
+import { refreshSavedAccounts, updateAccountConfirmed, updateAccountWithChanges } from './accounts-update'
 import { draftOfProxy, ProxyForm, readProxyDraft, type ProxyDraft, type ProxyPayload } from './accounts-proxy-form'
 import {
   AccountSettingsIcon, BalanceTokenField, CustomCredentialFields, ProviderSection, SettingGroup,
@@ -150,14 +150,10 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
   // 自定义账号：凭证段（API Key / 无需鉴权）只对它渲染。判据用 provider 前缀 ——
   // 与后端 `custom_account_provider` 一致（提供商被删后残留的账号同样该能改凭证）
   const isCustomAccount = providerOf(target).startsWith('custom-')
-  // 「轮询」档的可见性：只有 OpenCode Zen 免费档（按 IP 限流）。判据用**已读到的
-  // 提供商记录**（上面那个 effect 拉的）而不是目录缓存 —— 这一段的上下文里就有它，
-  // 且与「提供商」段编辑的是同一份现值（改了 emulation / baseUrl 未保存时，
-  // 档位仍按盘上的值给，保存后才变 —— 与后端闸门读盘上记录同一口径）。
-  // 记录本来就是这个档时**恒显示**（哪怕判据此刻为假：目录还没读到 / 提供商被
-  // 改过）：否则用户看不到自己这条账号现在是什么状态；后端只挡「真的改成轮询」
-  // 的保存，原样发回来不会 400。
-  const allowRotate = isOpencodeZenProvider(provider, target.baseUrl) || proxyDraft.mode === 'rotate'
+  // 「轮询」档对所有账号开放（见 accounts-domain 的 supportsProxyRotate）。
+  // 这里保留独立一行而不是直接写字面量 `true`：与批量弹窗读同一个判据，
+  // 将来若要按链路位置收敛，只改这一处。
+  const allowRotate = supportsProxyRotate(target)
   // 余额方案那一段（「查询设置」里的查询凭证）：方案与「已配置」标记都由账号的
   // 公开形态回答 —— `scheme` 是这一家的方案 id，`has*` 是密字段的存在标记
   // （值永不回显，见后端 `store_view::balance_query_public`）
@@ -415,7 +411,7 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       // accounts-data 的 reorderQueue）。设置弹窗只改「账号自身」的属性，
       // 一次「改备注名」不该顺手把顺序也提交一遍
       const nextName = name.trim() || target.name
-      const saved = await updateAccountConfirmed(id, {
+      const { account: saved, changes: savedChanges } = await updateAccountWithChanges(id, {
         ...(nextName !== target.name ? { name: nextName } : {}),
         enabled,
         allowRouteSkip,
@@ -451,7 +447,19 @@ export function AccountSettingsDialog({ id, onClose, initialAccount, initialPane
       // 先关窗并反馈成功：改动已经落库，刷新只是让列表跟上，不该让用户对着「保存中…」
       // 再多等一次网络往返
       onClose()
-      toast(t('✅ 账号设置已保存'))
+      // 代理草稿指向一条被本页禁用的条目时，后端会顺手把它启用；池缓存不重读
+      // 的话「网络代理」页还停在「已禁用」，看起来像没保存成功。
+      const picked = proxyPoolSnapshot()?.find(item => item.id === proxyDraft.proxyId)
+      if (proxyDraft.mode === 'pool' && picked?.enabled === false) {
+        toast(t('✅ 账号设置已保存，并启用了「{name}」', { name: picked.name || picked.id }))
+        void refreshProxyPool()
+      } else {
+        toast(t('✅ 账号设置已保存'))
+      }
+      // 监听器对账的结论（见 `api::proxies::reconcile_listeners`）：缺口已上报、
+      // 或者内核没运行 —— 后者不提示的话用户只会在转发时看到「未分配端口」。
+      const listenerNote = savedChanges.find(change => /监听端口/.test(change))
+      if (listenerNote) toast(listenerNote, /未运行/.test(listenerNote) ? 'err' : 'ok')
       // 保存后必须主动刷新列表：以前只关窗不刷新，行上的代理 / 优先级仍是旧数据，
       // 要等 20 秒那一轮轮询才更新 —— 用户看到的就是「保存完十几秒才变」。
       // 单独兜一层错：刷新失败只影响本次界面同步（后续轮询会自愈），不能掉进下面的

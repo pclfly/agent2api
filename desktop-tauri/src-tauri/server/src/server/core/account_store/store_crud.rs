@@ -837,6 +837,37 @@ impl AccountStore {
             }
         }
 
+        // ── 前置跳（`frontProxy`）：链式出网的第一跳 ──────────────────
+        // 与 `proxy` 同构的同化与落盘：`null` = 清掉前置跳（回到单跳/直连），
+        // 对象 = 它的归一形态（`normalize_account_proxy`，两跳协议约束由
+        // `egress::validate_account_route` 在转发前再校验一次）。
+        //
+        // 为什么允许它单独写：两跳的「第二跳」与「前置跳」是两个独立配置项，
+        // 用户可以只改其中一个（换机场节点而不动 Vault 那一跳）。校验「前置跳
+        // 必须配第二跳」放在**转发前**（`resolve_front_proxy` + `validate`），
+        // 不放在写入侧 —— 否则「先清 proxy 再设 frontProxy」这种分两步的编辑
+        // 会被一条中间的非法状态卡住。
+        if let Some(value) = patch.get("frontProxy") {
+            let next = crate::server::core::proxies::normalize_account_proxy(value)
+                .map_err(|error| AccountStoreError::new(error.message, error.status_code))?
+                .unwrap_or(Value::Null);
+            let before = value_or_nullish(record.get("frontProxy"), Value::Null);
+            if next != before {
+                record.set("frontProxy", next.clone());
+                let label = if next.is_null() {
+                    "前置跳 → 无（单跳）".to_string()
+                } else {
+                    let described = describe_account_proxy(Some(&next));
+                    let label = described
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or("已设置");
+                    format!("前置跳 → {label}")
+                };
+                changes.push(label);
+            }
+        }
+
         if let Some(value) = patch.get("maxConcurrent") {
             // 单账号并发上限：0 = 不限，封顶 999（校验与批量入口同一份，见
             // `normalize_max_concurrent`）。选路消费它时的口径见

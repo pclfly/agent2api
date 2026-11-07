@@ -1,5 +1,5 @@
 import {
-  errorMessage, POOL_VALUE_PREFIX, shared, toast,
+  errorMessage, POOL_VALUE_PREFIX, poolItemSelectable, shared, toast,
   type AccountRecord,
   type UsageEntry,
 } from './accounts-shared'
@@ -14,7 +14,7 @@ import {
 import { proxyPoolSnapshot, refreshProxyPool } from './proxy-pool-cache'
 import { installListRefresh, refreshList } from './accounts-refresh'
 import { syncAccountSorting } from './accounts-sort'
-import { confirmBatchResult, refreshSavedAccounts, updateAccountConfirmed } from './accounts-update'
+import { confirmBatchResult, refreshSavedAccounts, updateAccountConfirmed, updateAccountWithChanges } from './accounts-update'
 import {
   applyBalances, pruneUsageCache, queryAllUsage, queryUsageFor, refreshUsageAfterCheckin,
   syncBalancesSnapshot, tokenUsageOf, usageEntryOf,
@@ -248,12 +248,12 @@ export async function clearLimits(id: string, model?: string): Promise<void> {
  * 出口统一走代理池之后，这里**不再**产生 `{source:'clash'}` —— 存量里那种
  * 记录仍照原样转发，用户在这个下拉里选一条池条目或切回直连就会改写它。
  *
- * ── 禁用条目为什么在这里再挡一次 ─────────────────────────────
- * 视图层已经把禁用条目置灰（`disabled`），但下拉的选项来自缓存，极端情况下
- * （缓存刚被别处刷新、弹层已经展开）仍可能点到一条已禁用的。后端
- * `normalize_account_proxy` 有意**不**校验池的当下状态（保存账号不依赖池的
- * 读库结果），所以这里不挡的话会「保存成功 → 解析失败 → 回退直连」，用户只
- * 看到一句「代理已禁用」。挡在这里，提示与视图上的置灰是同一个事实。
+ * ── 被本页禁用的条目为什么照常可选 ───────────────────────────
+ * 「已保存的代理」页上的禁用是「先别用它」，而账号这里**明确指定**某一条，
+ * 语义是「现在要用它」—— 后端在写代理时会把这条条目一并启用
+ * （`proxy_pool::enable_for_reference`）。所以这里只拦真正选不了的：
+ * 订阅里已移除的节点、以及 Clash Verge 里停用的监听器（那两类本页开了也不
+ * 生效）。判据与视图层的置灰同一份（`poolItemSelectable`）。
  */
 export async function applyProxyPick(id: string, value: string, fallback: string): Promise<void> {
   if (value === PROXY_CUSTOM_EDIT) {
@@ -267,19 +267,45 @@ export async function applyProxyPick(id: string, value: string, fallback: string
   if (value.startsWith(POOL_VALUE_PREFIX)) {
     const poolId = value.slice(POOL_VALUE_PREFIX.length)
     const item = (proxyPoolSnapshot() || []).find(entry => entry.id === poolId)
-    if (item && item.enabled === false) {
-      toast(t('「{name}」已在「网络代理」页禁用，请先启用它或换一条', {
+    // 视图层已置灰，但选项来自缓存：极端情况下（缓存刚被别处刷新、弹层已展开）
+    // 仍可能点到一条不可选的，这里按同一判据再挡一次
+    if (item && !poolItemSelectable(item)) {
+      toast(t('「{name}」不可选：{reason}', {
         name: item.name || poolId,
+        reason: item.gone === true
+          ? t('订阅里已移除这个节点')
+          : t('在 Clash Verge 里是停用的，请到那边打开它'),
       }), 'err')
       return
     }
   }
+  // 选之前先记下这条是否处于禁用：保存后后端会顺手启用它，而池缓存还停在
+  // 「已禁用」—— 不重读的话「网络代理」页会继续显示旧状态
+  const picked = value.startsWith(POOL_VALUE_PREFIX)
+    ? (proxyPoolSnapshot() || []).find(entry => entry.id === value.slice(POOL_VALUE_PREFIX.length))
+    : undefined
   try {
+    // 轮询档：行内快捷入口写「全部候选 + 智能故障切换」，与设置弹窗里
+    // 「全部代理节点（推荐）」保存出来的形状完全一致（后端归一也认这个）。
     const proxy = value === ''
       ? null
-      : { source: 'pool', proxyId: value.slice(POOL_VALUE_PREFIX.length) }
-    await updateAccountConfirmed(id, { proxy })
-    toast(`✅ ${t('代理已更新')}`)
+      : value === PROXY_ROTATE_ALL
+        ? { source: 'rotate', all: true, failureMode: 'smart' }
+        : { source: 'pool', proxyId: value.slice(POOL_VALUE_PREFIX.length) }
+    const { changes } = await updateAccountWithChanges(id, { proxy })
+    if (picked?.enabled === false) {
+      toast(t('✅ 代理已更新，并启用了「{name}」', { name: picked.name || picked.id }))
+      void refreshProxyPool()
+    } else {
+      toast(`✅ ${t('代理已更新')}`)
+    }
+    // 后端在写代理时会对一次监听器账（见 `api::proxies::reconcile_listeners`）。
+    // 它给出的两类说明都不能吞：一类是「发现缺口、已在补建」（稍等即可），
+    // 另一类是「有缺口但内核没运行」（必须去点启动内核，否则永远不好）。
+    // 不提示的话，用户看到的仍是那句「未分配端口」，并与刚看到的「保存成功」
+    // 对不上。
+    const listenerNote = changes.find(change => /监听端口/.test(change))
+    if (listenerNote) toast(listenerNote, /未运行/.test(listenerNote) ? 'err' : 'ok')
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
   } finally {
@@ -292,6 +318,19 @@ export async function applyProxyPick(id: string, value: string, fallback: string
 /** 代理下拉里两个「不是出口 uid」的特殊值：代表当前自定义配置的显示项、打开设置弹窗的动作项 */
 export const PROXY_CUSTOM_CURRENT = '__proxy_custom__'
 export const PROXY_CUSTOM_EDIT = '__proxy_custom_edit__'
+
+/**
+ * 「轮询全部候选（故障切换）」—— 行内下拉的快捷入口。
+ *
+ * 行内下拉只给**一个**轮询档：全部候选 + 智能故障切换。要挑具体参与哪几条、
+ * 或改成「所有上游错误都切换」，去账号设置弹窗的完整表单（那里有范围选择与
+ * 策略下拉）。这样行内那一格仍然只有「一条配置 = 一个值」的粒度，不必为它
+ * 造一个二级菜单。
+ *
+ * 为什么不写成 `{source:'rotate', all:true}` 的魔法字符串：值要在
+ * `<SelectItem value>` 里往返，必须是稳定且不会与池条目 id 撞的常量。
+ */
+export const PROXY_ROTATE_ALL = '__proxy_rotate_all__'
 
 /**
  * CodeArts 的「领福利」入口已整体迁到「签到中心」的活动福利卡（checkin-page.tsx

@@ -38,6 +38,8 @@ import { providerFeatures, type ProviderFeatures } from './accounts-features'
 import { t } from '../i18n'
 import { limiterHit } from './accounts-limiter-model'
 import { accountReloginText } from './accounts-authorization'
+// 轮询可见性的判据住在无依赖模块里（可被 npm test 直接覆盖，见那份文件头）
+import { supportsProxyRotate as rotateSupport } from './proxy-rotate-support'
 import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-shared/account-upstream-state'
 
 // 能力表与插件申报的读取在 accounts-features.ts（那边的模块头说明了查询顺序）。
@@ -109,13 +111,12 @@ export function customProviderOf(
 /**
  * 这条账号能不能用出网「轮询」档（弹窗与批量弹窗共用的唯一判据）。
  *
- * 一次读两处：账号自己的 baseUrl 覆盖项 + 目录里那家提供商记录。
- * 缓存里还没有这一家（首屏还没拉到目录）时判定为 false —— 「档位晚一轮出现」
- * 比「点开一个保存必然 400 的档」轻。
+ * 实现与理由见 `proxy-rotate-support.ts` —— **所有账号都可以**，不依赖提供商
+ * 目录、套餐或 IP 额度（后端 `core::proxy_rotate` 只认配置形状，与哪一家无关）。
+ * 这里保留这个导出只为让既有调用点不必改 import。
  */
 export function supportsProxyRotate(account: AccountRecord | null | undefined): boolean {
-  if (!account) return false
-  return isOpencodeZenProvider(customProviderOf(account), account.baseUrl)
+  return rotateSupport(account)
 }
 
 /**

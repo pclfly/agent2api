@@ -109,6 +109,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 # CatPaw 适配器的内联图片压缩（providers/catpaw/image_compress.rs）
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# 订阅导入：从二维码截图里解出订阅链接（api::subscriptions 的 decode-qr）。
+# rqrr 是纯 Rust 的 QR 解码器，与上面的 image 配合（截图 → luma8 → 解码）。
+rqrr = "0.11"
 base64 = "0.22"
 # Qoder 网页登录的 PKCE verifier / nonce
 getrandom = "0.2"

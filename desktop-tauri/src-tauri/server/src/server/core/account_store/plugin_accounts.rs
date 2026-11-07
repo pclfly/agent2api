@@ -573,6 +573,18 @@ impl AccountStore {
             record.get("rateLimits").cloned().unwrap_or_else(|| Value::Object(Map::new())),
         );
         public.insert("proxy".to_string(), describe_account_proxy(Some(&record.proxy())));
+        // ── 前置跳（`frontProxy`）：插件家也必须带出来 ────────────────
+        // 转发层的两跳是 `resolve_front_proxy(target.account)` —— 它读的正是
+        // **这份公开投影**（`RouteTarget.account`）。只在内置家的投影里补这个
+        // 键，会让插件账号的两跳只在「按账号测试」那条路上生效（那条是从
+        // 凭证/会话取），真实转发却静默走单跳：日志里只有第二跳的 CONNECT，
+        // 而账号页看起来配得好好的。实测踩到过。
+        // 形状与内置家一致（`describe_account_proxy` 的展示形态，含原始
+        // `config`），没配时写 null。
+        public.insert(
+            "frontProxy".to_string(),
+            describe_account_proxy(Some(&record.get("frontProxy").cloned().unwrap_or(Value::Null))),
+        );
         if record.get("nameCustom").map(js_truthy).unwrap_or(false) {
             let name = record.name();
             if !name.trim().is_empty() {

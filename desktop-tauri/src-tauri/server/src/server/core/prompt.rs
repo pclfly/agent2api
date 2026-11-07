@@ -236,6 +236,44 @@ impl GatewayBlocks {
     }
 }
 
+/// 解析「适用模型范围」（`KEY_PROMPT_MODELS` 的读侧归一）。
+///
+/// 三态是这一位的全部语义，缺一不可：
+///   - `None`（键缺失 / `null`）→ 全部模型（含以后新增的）；
+///   - `Some([])` → 全不选（这一家的这份覆盖永不生效）；
+///   - `Some([ids])` → 白名单（ASCII 不区分大小写去重）。
+///
+/// ── 为什么 `[]` 必须与「未给」分开 ──────────────────────────
+/// 界面上的「全不选」是用户的显式选择，回落成「全部」正好相反 —— 用户关掉
+/// 了某家的提示词，升级后却又被装上去了。写侧（`api::prompt`）也按同一口径
+/// 保留显式空数组。
+pub fn parse_model_scope(value: Option<&Value>) -> Result<Option<Vec<String>>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            if items.len() > 10000 {
+                return Err("模型范围最多包含 10000 项".to_string());
+            }
+            let mut out: Vec<String> = Vec::new();
+            for item in items {
+                let id = item
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty() && id.chars().count() <= 2048)
+                    .ok_or_else(|| {
+                        "模型范围必须是非空模型 ID 字符串数组（每项最多 2048 字符）"
+                            .to_string()
+                    })?;
+                if !out.iter().any(|known| known.eq_ignore_ascii_case(id)) {
+                    out.push(id.to_string());
+                }
+            }
+            Ok(Some(out))
+        }
+        _ => Err("模型范围必须是字符串数组或 null（null 表示全部模型）".to_string()),
+    }
+}
+
 /// 一次请求的提示词决定（全局默认 + 各家覆盖的**借用**视图）。
 ///
 /// 借用而不是克隆：本结构由 `upstream::forward` 从配置快照里取一次，随
@@ -270,6 +308,28 @@ impl<'a> PromptPlan<'a> {
         providers: &'a std::collections::BTreeMap<String, crate::server::config::ProviderPrompt>,
     ) -> Self {
         Self { default, providers }
+    }
+
+    /// 按**实际目标模型**取配置：未选中返回 `None`（而不是回落全局）。
+    ///
+    /// ── 为什么返回 `Option` 而不是总是给一份 ────────────────────
+    /// 「这家不为这个模型装提示词」与「这家按全局走」是两件事。用户给编码
+    /// 模型配了工程化指令、明确没选闲聊模型 —— 后者必须**一个字节都不动**
+    /// （既不替换也不追加），回落全局会把它悄悄改掉。
+    ///
+    /// 调用点：`payload::send_body`（发送体定稿处）与拒答门控。两处都用
+    /// **出站改名后的实际目标模型**判定（别名共用其目标的范围）。
+    pub fn for_model(&self, provider_id: &str, model: &str) -> Option<PromptChoice<'_>> {
+        if let Some(models) = self
+            .providers
+            .get(provider_id)
+            .and_then(|entry| entry.models.as_ref())
+        {
+            if !models.iter().any(|id| id.eq_ignore_ascii_case(model.trim())) {
+                return None;
+            }
+        }
+        Some(self.for_provider(provider_id))
     }
 
     /// 这一家实际要用的那一份（没单独配就走 `default`）。

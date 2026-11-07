@@ -29,6 +29,14 @@ export type ProxyPoolItem = ProxyUsage & {
   } | null
   resolved: { protocol?: string; host?: string; port?: number | null; label?: string } | null
   resolveError: string | null
+  /** 订阅里已移除该节点（同步保留身份、禁用并收回端口）；可手动删除 */
+  gone?: boolean
+  /** 订阅节点的归属订阅 id（手动 / Clash 条目为空串）—— 界面按它分批筛选 */
+  providerId?: string
+  /** 订阅节点在机场清单里的原始节点名 */
+  node?: string
+  /** 孤儿订阅节点：所属订阅已不存在（后端标注），可手动删除 */
+  orphan?: boolean
 }
 
 export type ProxyPoolPayload = {
@@ -37,6 +45,10 @@ export type ProxyPoolPayload = {
   clash?: ClashProxySnapshot
   changes?: number
   syncError?: string | null
+  /** 监听器对账：发现多少个账号引用的订阅节点还缺端口（已请求内核补建） */
+  listenersMissing?: number | null
+  /** 监听器对账：有缺口但补不了（内核没装 / 未启用订阅 / 被手动关闭） */
+  listenerBlocked?: boolean | null
 }
 
 export type ProxyTestResult = {
@@ -51,8 +63,33 @@ export type ProxyTestResult = {
 }
 
 export type ProxySettings = {
+  /** 订阅节点监听端口区间（生效值；非法存量已由后端回落默认） */
+  listenerPortBase?: number
+  listenerPortEnd?: number
   testUrl?: string
-  defaults?: { testUrl?: string }
+  /** 轮询出口的并发与排队预算（生效值） */
+  rotateMaxConcurrentPerIp?: number
+  rotateMaxQueueSize?: number
+  rotateQueueTimeoutSeconds?: number
+  defaults?: {
+    listenerPortBase?: number
+    listenerPortEnd?: number
+    testUrl?: string
+    rotateMaxConcurrentPerIp?: number
+    rotateMaxQueueSize?: number
+    rotateQueueTimeoutSeconds?: number
+  }
+}
+
+/** 设置弹窗一次提交完整表单（接口本身仍允许部分字段更新）。 */
+export type ProxySettingsPayload = Required<Omit<ProxySettings, 'defaults'>>
+
+/** 清除轮询候选冷却的结果；计数是记录数，不是节点数。 */
+export type ProxyRotateCooldownClearResult = {
+  /** 出口 × 目标维度的冷却记录数。 */
+  cleared: number
+  /** false 表示仅内存生效，未能持久化。 */
+  persisted: boolean
 }
 
 /* ─── 桥（只声明本页用到的成员；不 declare global，理由见 accounts-shared）─── */
@@ -65,6 +102,8 @@ export type ProxyPoolBridge = {
   removeProxyPoolItem?: (id: string) => Promise<ProxyPoolPayload | null | undefined>
   testProxyPoolItem?: (id: string) => Promise<ProxyTestResult | null | undefined>
   syncClashToProxyPool?: () => Promise<ProxyPoolPayload | null | undefined>
+  /** 清除全部轮询候选冷却（管理动作）；只清冷却，不动账号限额与内核 */
+  clearProxyRotateCooldowns?: () => Promise<ProxyRotateCooldownClearResult | null | undefined>
   /** 测**未保存**的表单内容（弹窗里的「测试出口」，payload 是 `{proxy}`） */
   testProxy?: (payload: { proxy: unknown }) => Promise<ProxyTestResult | null | undefined>
   /** 连通性测试目标网址 */
@@ -81,7 +120,14 @@ export type ProxySharedWindow = {
     readonly currentPage?: string
   }
   wbConfirm?: {
-    ask?: (options: { title?: string; html?: string; okText?: string; okClass?: string }) => Promise<boolean>
+    ask?: (options: {
+      title?: string
+      html?: string
+      text?: string
+      okText?: string
+      okClass?: string
+      cancelText?: string
+    }) => Promise<boolean>
   }
 }
 
@@ -119,6 +165,16 @@ export function itemName(item: ProxyPoolItem | null | undefined): string {
   return String(item?.name || item?.id || '')
 }
 
+/**
+ * 只读条目的统一判定（Clash 同步 / 订阅镜像都不给**编辑**入口）。
+ *
+ * 孤儿与已移除是删除入口的唯一例外（见 `proxy-pool-classify`）——
+ * 归属的订阅不认识它们了，删除是清理它们的唯一出路。
+ */
+export function isReadonlyPoolItem(item: ProxyPoolItem): boolean {
+  return item.source === 'clash' || item.source === 'subscription'
+}
+
 /* ─── store ─────────────────────────────────── */
 
 type PoolState = {
@@ -136,6 +192,8 @@ type PoolState = {
   batchProgress: { done: number; total: number } | null
   /** 勾选的条目 id（只作用于当前勾选，不随列表刷新自动增减 —— 消失的会被剔除） */
   selected: ReadonlySet<string>
+  /** 「清除轮询候选冷却」在途（那颗按钮的文案与去重闸） */
+  clearingCooldowns: boolean
 }
 
 let state: PoolState = {
@@ -148,6 +206,7 @@ let state: PoolState = {
   batchBusy: false,
   batchProgress: null,
   selected: new Set<string>(),
+  clearingCooldowns: false,
 }
 
 const listeners = new Set<() => void>()
@@ -223,6 +282,15 @@ export async function loadPanel(silent = false): Promise<void> {
     const data = await bridge.getProxyPool()
     if (!data || !Array.isArray(data.items)) throw new Error(t('代理列表响应异常'))
     accept(data)
+    // 进入本页时后端会顺手对一次监听器账（见 `api::proxies::reconcile_listeners`）：
+    // 有缺口就已在请求内核补建。静默轮询不提示，免得同一条 toast 反复弹。
+    if (!silent) {
+      if (data.listenerBlocked) {
+        toast(t('有账号引用的订阅节点还没有监听端口，但代理内核当前未运行 —— 点「启动内核」后端口才会分配'), 'err')
+      } else if (data.listenersMissing) {
+        toast(t('发现 {n} 个账号引用的订阅节点还没有监听端口，正在请求内核补建；稍等片刻后重新读取', { n: data.listenersMissing }), 'ok')
+      }
+    }
   } catch (error) {
     patch({ error: errorMessage(error) })
     if (!silent) toast(t('代理列表加载失败：{reason}', { reason: errorMessage(error) }), 'err')
@@ -251,6 +319,51 @@ export async function syncClash(): Promise<void> {
     toast(t('同步失败：{reason}', { reason: errorMessage(error) }), 'err')
   } finally {
     patch({ syncing: false })
+  }
+}
+
+/**
+ * 清除**全部**轮询候选冷却（管理动作）。
+ *
+ * ── 它清的是什么、不清什么 ──────────────────────────────────
+ * 只清出口冷却（`proxy_rotate::health` 那张表：一条出口刚失败过、这段时间
+ * 先别用它）。**不**碰账号限额（`rateLimits`）、**不**重启内核 —— 三件事
+ * 互不相干，混在一起会让排障时分不清到底清掉了什么。
+ *
+ * 与当前筛选 / 勾选**无关**：后端只接受空 body（带筛选字段会被 400 拒绝），
+ * 否则「只清了某个节点」的误读比多一次确认更贵。所以确认文案里也明说这一点。
+ */
+export async function clearRotateCooldowns(): Promise<void> {
+  const bridge = wb().workbuddyDesktop
+  if (typeof bridge?.clearProxyRotateCooldowns !== 'function') {
+    toast(t('当前环境不支持清除轮询候选冷却（桥接方法缺失）'), 'err')
+    return
+  }
+  if (state.clearingCooldowns || state.batchBusy || state.testing) return
+  const ok = await wb().wbConfirm?.ask?.({
+    title: t('清除轮询候选冷却'),
+    text: t('清除全部本地轮询候选冷却，不受当前筛选或勾选影响。不会清除账号限额或上游限流，不会启用已禁用节点，也不会停止正在进行的请求。后续失败仍可能重新进入冷却。确定继续？'),
+    okText: t('清除轮询候选冷却'),
+    cancelText: t('取消清除'),
+  })
+  if (!ok) return
+  patch({ clearingCooldowns: true })
+  try {
+    const data = await bridge.clearProxyRotateCooldowns()
+    if (!data || typeof data.cleared !== 'number') throw new Error(t('清除轮询候选冷却响应异常'))
+    if (!data.cleared) {
+      toast(t('没有需要清除的轮询候选冷却记录'), 'ok')
+    } else if (!data.persisted) {
+      // 仅内存生效：重启后冷却可能从库里恢复回来。这条**必须**说出来，
+      // 否则用户以为清干净了、重启后「明明清过还是失败」。
+      toast(t('仅在内存中清除 {cleared} 条冷却记录，未能持久化；重启后冷却可能恢复。', { cleared: data.cleared }), 'err')
+    } else {
+      toast(t('已清除 {cleared} 条轮询候选冷却记录', { cleared: data.cleared }), 'ok')
+    }
+  } catch (error) {
+    toast(t('清除轮询候选冷却失败：{reason}', { reason: errorMessage(error) }), 'err')
+  } finally {
+    patch({ clearingCooldowns: false })
   }
 }
 
@@ -473,9 +586,7 @@ export async function loadSettings(): Promise<ProxySettings | null> {
   return data
 }
 
-export async function saveSettings(payload: {
-  testUrl: string
-}): Promise<ProxySettings> {
+export async function saveSettings(payload: ProxySettingsPayload): Promise<ProxySettings> {
   const bridge = wb().workbuddyDesktop
   if (typeof bridge?.saveProxySettings !== 'function') {
     throw new Error(t('当前环境不支持代理设置（桥接方法缺失）'))

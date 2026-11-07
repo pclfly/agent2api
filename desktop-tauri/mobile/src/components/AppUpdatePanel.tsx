@@ -23,7 +23,7 @@ import { GithubAccessSettingsPanel } from './GithubAccessSettings'
 import { AppUpdateSettings } from './AppUpdateSettings'
 import { openExternal } from '../lib/community'
 import { t } from '../i18n'
-import { githubErrorMessage, assetMissingReason } from '../../../ui-shared/updates'
+import { githubErrorMessage, assetMissingReason, updateDownloadEnabled } from '../../../ui-shared/updates'
 import { Card, Button } from '@ui'
 import { Switch as UiSwitch } from '@ui'
 
@@ -70,9 +70,14 @@ export function AppUpdatePanel() {
   const [interval, setIntervalMs] = useState(0)
   /** 当前壳能不能自装安装包：只有 Android 能（见 lib/appUpdate） */
   const selfUpdate = canSelfUpdate()
+  /** 下载 / 安装入口是否开启（本地分发策略，桌面端同一处口径） */
+  const downloadEnabled = updateDownloadEnabled()
 
-  // 挂载时先看缓存里有没有上次下好的包（iOS 上恒为 false）
+  // 挂载时先看缓存里有没有上次下好的包（iOS 上恒为 false）。
+  // 下载入口关闭时不进「待安装」：那个状态的文案与唯一动作都是「点安装」，
+  // 而按钮已经被策略收掉 —— 显示一个指向不存在的按钮的状态，比不显示更糟。
   useEffect(() => {
+    if (!downloadEnabled) return
     let cancelled = false
     void hasDownloadedApk().then(result => {
       if (!cancelled && result.exists) setPhase('downloaded')
@@ -80,7 +85,7 @@ export function AppUpdatePanel() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [downloadEnabled])
 
   /**
    * 自动检查：间隔读电脑端配置，页面不可见时停表。
@@ -266,19 +271,23 @@ export function AppUpdatePanel() {
                         : t('当前版本 {version}', { version: APP_VERSION })}
             </div>
             <div className='m-t2' style={{ wordBreak: 'break-word' }}>
-              {phase === 'available' && !selfUpdate
-                ? t('请在 Release 页面下载后通过 TestFlight 或 App Store 安装')
-                : phase === 'available' && info?.asset
-                  ? t('{size} · 下载后可直接安装，无需跳转浏览器', { size: sizeText(info.asset.size) })
-                  : phase === 'downloaded'
-                    ? t('安装包已就绪，点「安装」即可完成更新')
-                    : phase === 'downloading' && percent !== null
-                      ? t('已完成 {percent}%', { percent })
-                    : phase === 'latest'
-                      ? t('当前版本 {version}', { version: APP_VERSION })
-                      : selfUpdate
-                        ? t('版本 {version} · 按 GitHub 访问设置下载安装包', { version: APP_VERSION })
-                        : t('版本 {version} · 更新包需从 Release 页面获取', { version: APP_VERSION })}
+              {/* 下载入口关闭时，描述里不能再承诺「下载后可直接安装」—— 那颗按钮
+                  已经不在了。只说版本与「有新版本」，与桌面面板同一口径 */}
+              {phase === 'available' && !downloadEnabled
+                ? t('新版本 {version} 已发布，可在 GitHub 发布页获取安装包', { version: info?.latestVersion || '' })
+                : phase === 'available' && !selfUpdate
+                  ? t('请在 Release 页面下载后通过 TestFlight 或 App Store 安装')
+                  : phase === 'available' && info?.asset
+                    ? t('{size} · 下载后可直接安装，无需跳转浏览器', { size: sizeText(info.asset.size) })
+                    : phase === 'downloaded'
+                      ? t('安装包已就绪，点「安装」即可完成更新')
+                      : phase === 'downloading' && percent !== null
+                        ? t('已完成 {percent}%', { percent })
+                      : phase === 'latest'
+                        ? t('当前版本 {version}', { version: APP_VERSION })
+                        : selfUpdate
+                          ? t('版本 {version} · 按 GitHub 访问设置下载安装包', { version: APP_VERSION })
+                          : t('版本 {version} · 更新包需从 Release 页面获取', { version: APP_VERSION })}
             </div>
 
             {/* 进度条：总长度未知（percent = null）时不画，只显示已下载量 */}
@@ -301,21 +310,26 @@ export function AppUpdatePanel() {
             ) : null}
           </div>
 
-          {/* 动作按钮：按状态给唯一的主动作，避免一屏好几个可点的东西 */}
+          {/* 动作按钮：按状态给唯一的主动作，避免一屏好几个可点的东西。
+              下载 / 安装入口被本地分发策略关掉时（见 ui-shared/updates.ts 的
+              UPDATE_SURFACE），应用内那两颗（「立即更新」/「安装」）都不出现，
+              「去下载」那条外链出口也一并收掉 —— 这一版只保留「查看」：版本号、
+              更新说明、以及手动「检查更新」。「取消」放行：它只可能在策略切换前
+              就发起的那一轮下载里出现，收尾动作不该被策略挡住 */}
           {phase === 'downloading' ? (
             <Button size='touch-sm' variant='outline' type='button' className='m-btn m-ghost m-sm' onClick={() => void stop()}>
               {t('取消')}
             </Button>
-          ) : phase === 'downloaded' ? (
+          ) : downloadEnabled && phase === 'downloaded' ? (
             <Button size='touch-sm' variant='default' type='button' className='m-btn m-sm' disabled={busy} onClick={() => void install()}>
               {t('安装')}
             </Button>
-          ) : phase === 'available' && !selfUpdate ? (
+          ) : downloadEnabled && phase === 'available' && !selfUpdate ? (
             // iOS：只能跳出去，由系统渠道安装
             <Button size='touch-sm' variant='default' type='button' className='m-btn m-sm' onClick={openReleasePage}>
               {t('去下载')}
             </Button>
-          ) : phase === 'available' ? (
+          ) : downloadEnabled && phase === 'available' ? (
             <Button size='touch-sm' variant='default' type='button' className='m-btn m-sm' disabled={busy} onClick={() => void download()}>
               {t('立即更新')}
             </Button>

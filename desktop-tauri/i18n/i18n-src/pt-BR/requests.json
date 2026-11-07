@@ -102,6 +102,7 @@
   "执行清理": "Executar limpeza",
   "报文超过单条上限，请求体 / 响应体已按上限截断": "O payload ultrapassou o limite por registro; o corpo da requisição / da resposta foi truncado no limite",
   "抹掉原文": "Remover payloads",
+  "按 Token 估算约 {credit} 积分（上游未上报，非实际扣费）": "",
   "按提供商筛选": "Filtrar por provedor",
   "按提供商筛选（只列日志里出现过的）": "Filtrar por provedor (lista apenas os que aparecem nos logs)",
   "按时间倒序，全量保留": "Ordem cronológica inversa; mantido integralmente",

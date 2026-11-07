@@ -270,6 +270,13 @@ pub struct RuntimeConfig {
     /// config 快照**（加解密都在 `core::update::token` 里），环境变量
     /// 兜底也不在这里管。与 update_proxy 同为低频字段，存原始字符串即可。
     github_token: Option<String>,
+    /// 内核存放目录（`kernelDir`：None = 默认 `{config_dir}/proxy-kernel`）。
+    ///
+    /// 只存用户显式设置的绝对路径；读侧（`sub_kernel::kernel_dir`）再兜一次
+    /// 底 —— 目录被删 / 盘符消失时回落到默认位置，而不是让内核整个不可用。
+    kernel_dir: Option<String>,
+    /// 内核下载线路（`kernelProxy`：None = 默认链）。
+    kernel_proxy: Option<Value>,
     /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
     raw: Map<String, Value>,
 }
@@ -661,6 +668,12 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         // GitHub 令牌信封：空串按未设置处理（手改库写出的空值不该被当成密文）
         github_token: string_field(&raw, KEY_GITHUB_TOKEN)
             .filter(|envelope| !envelope.is_empty()),
+        kernel_dir: string_field(&raw, KEY_KERNEL_DIR),
+        // 内核下载线路：与 update_proxy 同一处理（null / 缺省 = 默认链）
+        kernel_proxy: raw
+            .get(KEY_KERNEL_PROXY)
+            .filter(|value| !value.is_null())
+            .cloned(),
         raw,
     }
 }
@@ -818,6 +831,10 @@ fn providers_from(raw: &Map<String, Value>) -> std::collections::BTreeMap<String
                 text: choice.text,
                 source: choice.source,
                 file_error: choice.file_error,
+                // 损坏的范围不能扩大成全部（那等于把用户关掉的提示词又装上）：
+                // 解析失败按「全不选」处理，接口写侧会拒绝非法输入。
+                models: crate::server::core::prompt::parse_model_scope(entry.get(KEY_PROMPT_MODELS))
+                    .unwrap_or_else(|_| Some(Vec::new())),
             },
         );
     }
@@ -2118,6 +2135,75 @@ pub fn set_update_proxy(proxy: Option<Value>) -> bool {
     })
 }
 
+// ─── 代理内核（kernelDir / kernelProxy）───────────────────────
+//
+// v3.4.0 删掉订阅链路时把这两个字段也带走了。内核（mihomo sidecar）本身仍
+// 是一个可用能力：它把 ss/vmess/vless 等订阅节点转成本机 http 监听器，
+// 出网层照旧只认 http/socks5 —— 协议代码一行不用改。
+
+/// 只取内核存放目录的轻量读取（**不克隆整份 raw**）。
+///
+/// 未初始化 / 未设置时给 None（调用方回落到默认目录）。
+pub fn kernel_dir_raw() -> Option<String> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.kernel_dir.clone();
+        }
+    }
+    None
+}
+
+/// 写入内核存放目录（None = 恢复默认目录，连键一起删）。
+///
+/// 值由调用方先判（`api::subscriptions` 要求绝对路径）—— 与
+/// `set_update_proxy` 同一取向：写侧拦「明显写错」，读侧再兜一次底。
+pub fn set_kernel_dir(value: Option<String>) -> bool {
+    update(move |config| {
+        match value.clone() {
+            Some(value) => {
+                config.raw.insert(KEY_KERNEL_DIR.to_string(), Value::String(value.clone()));
+                config.kernel_dir = Some(value);
+            }
+            None => {
+                config.raw.remove(KEY_KERNEL_DIR);
+                config.kernel_dir = None;
+            }
+        }
+    })
+}
+
+/// 只取内核下载线路的轻量读取（**不克隆整份 raw**，与 `update_proxy` 同形）。
+///
+/// 未初始化时给 None（默认链：直连失败借 Clash 混合端口重试一次）。
+pub fn kernel_proxy() -> Option<Value> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.kernel_proxy.clone();
+        }
+    }
+    None
+}
+
+/// 写入内核下载线路（None = 默认链）。
+///
+/// 解析失败（选中的出口后来被删 / 被禁）**由下载侧直接报错**，不像软件更新
+/// 那样悄悄回落 —— 用户在这个弹窗里专门选了一条线路，静默改走直连会让
+/// 「下载失败：无法连接 GitHub」这条信息把人引向错误的方向。
+pub fn set_kernel_proxy(proxy: Option<Value>) -> bool {
+    update(move |config| {
+        match proxy.clone() {
+            Some(value) => {
+                config.raw.insert(KEY_KERNEL_PROXY.to_string(), value);
+                config.kernel_proxy = proxy.clone();
+            }
+            None => {
+                config.raw.remove(KEY_KERNEL_PROXY);
+                config.kernel_proxy = None;
+            }
+        }
+    })
+}
+
 // ─── GitHub 令牌信封（githubToken）────────────────────────
 
 /// 只取 GitHub 令牌密文信封的轻量读取（**不克隆整份 raw**）。
@@ -2234,6 +2320,22 @@ pub fn set_prompt_provider(provider_id: &str, patch: Option<ProviderPromptPatch>
             }
             if let Some(text) = patch.inline.filter(|text| !text.trim().is_empty()) {
                 one.insert(KEY_PROMPT_TEXT.to_string(), Value::String(text));
+            }
+            // 适用模型范围：**null 与非 null 都要落盘** —— `null`（全部）与
+            // 「键缺失」在读侧同义，但 `[]`（全不选）必须留住，否则用户
+            // 关掉这一家的提示词后重启就被装回来了
+            match &patch.models {
+                Some(models) => {
+                    one.insert(
+                        KEY_PROMPT_MODELS.to_string(),
+                        Value::Array(models.iter().map(|id| Value::String(id.clone())).collect()),
+                    );
+                }
+                None => {
+                    // None = 全部模型：显式写 null 而不是省略键 —— 省略会让
+                    // 「保存时没给范围」与「明确选了全部」在盘上不可分
+                    one.insert(KEY_PROMPT_MODELS.to_string(), Value::Null);
+                }
             }
             entry.insert(id.clone(), Value::Object(one));
         }

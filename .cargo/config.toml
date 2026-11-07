@@ -1,0 +1,9 @@
+# 所有本地 Rust 产物统一放在仓库根的 target/ 下。cargo 只从「当前目录向上」找
+# .cargo/config.toml，desktop-tauri/src-tauri/ 里那份从仓库根跑 cargo 时读不到，
+# 产物会按默认落进 src-tauri/target/，长出第二套数 GB 的缓存。这份根配置保证
+# 无论从仓库根还是子目录跑，都落同一个 target/（src-tauri 那份也指向同一处）。
+[build]
+target-dir = "target"
+# 关闭增量编译缓存：debug/incremental 动辄数 GB（此前曾攒到 4.7G），磁盘优先；
+# 确需提速时先征得同意，临时用 CARGO_INCREMENTAL=1 跑单次构建，不要长期开着。
+incremental = false

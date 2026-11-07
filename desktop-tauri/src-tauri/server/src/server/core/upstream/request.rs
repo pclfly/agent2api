@@ -73,6 +73,26 @@ pub struct TransportRequest {
     /// 账号未配代理时本家是否**跟随系统代理**出网（编排层按适配器的能力位填，
     /// 默认 false = 直连）。为 true 的家见 `ProviderAdapter::system_proxy_when_unset`。
     pub system_proxy_when_unset: bool,
+    /// 链式出网的前置代理（可选）：先经它出去，再由 `proxy` 做第二跳
+    /// （典型形态：Clash 选地区 → Vault 注入凭据）。为 None 时 `proxy` 单独生效。
+    ///
+    /// ── 为什么不在 `proxy` 里表达两跳 ────────────────────────────
+    /// `ResolvedProxy` 描述的是**一个**代理，而 HTTP 的 CONNECT 一次只能指定
+    /// 一跳。两跳需要真实建两级隧道，由 `core::proxy_chain` 在本地开中转端口
+    /// 来兑现（见该模块的模块头）。
+    pub front_proxy: Option<ResolvedProxy>,
+}
+
+impl TransportRequest {
+    /// 补上前置跳（构建期调用；`None` = 单跳或直连）。
+    ///
+    /// 自定义提供商的两条转发入口在**凭证解析之后**才会碰到账号记录，
+    /// 而结构体是逐字段构造的 —— 用这个把「默认没有前置跳」显式写出来，
+    /// 避免每个构造点都重复 `front_proxy: None` 而漏掉真正该接的那一处。
+    pub fn with_front_proxy(mut self, front: Option<ResolvedProxy>) -> Self {
+        self.front_proxy = front;
+        self
+    }
 }
 
 /// 归一化后的上游错误：`{code, message}`
@@ -159,11 +179,33 @@ pub async fn send_chat_request(
     plan: &TransportRequest,
 ) -> Result<reqwest::Response, UpstreamRequestError> {
     // 客户端三选一：账号级代理 → 跟随系统代理（本家能力位，见
-    // `TransportRequest::system_proxy_when_unset`）→ 直连
-    let client = match plan.proxy.as_ref() {
-        Some(proxy) => egress::client_for(Some(proxy)),
-        None if plan.system_proxy_when_unset => egress::client_for_system_proxy(),
-        None => egress::client_for(None),
+    // `TransportRequest::system_proxy_when_unset`）→ 直连。
+    //
+    // 账号代理若同时带前置跳（`front_proxy`），先在本机起一个两跳中转，把出口
+    // 指向它 —— reqwest 仍只看到「一个普通代理」，两跳由 `core::proxy_chain`
+    // 内部兑现（Clash 选地区 → Vault 注入凭据）。
+    let route_error = |message: String| UpstreamRequestError {
+        message,
+        reason: "本地出口构造失败".to_string(),
+        safe_to_retry: false,
+        network_failure: false,
+    };
+    if plan.front_proxy.is_some() {
+        // 两跳有配置闸门：前置跳必须配第二跳、两跳都只能走 HTTP CONNECT。
+        // 校验失败**不回退单跳** —— 那会从错误的地区发出去。
+        egress::validate_account_route(plan.proxy.as_ref(), plan.front_proxy.as_ref())
+            .map_err(route_error)?;
+    }
+    let client = if plan.front_proxy.is_some() {
+        egress::client_for_route(plan.proxy.as_ref(), plan.front_proxy.as_ref())
+            .map(|(client, _)| client)
+            .map_err(route_error)?
+    } else {
+        match plan.proxy.as_ref() {
+            Some(proxy) => egress::client_for(Some(proxy)),
+            None if plan.system_proxy_when_unset => egress::client_for_system_proxy(),
+            None => egress::client_for(None),
+        }
     };
     send_chat_with_client(plan, &client).await
 }

@@ -77,7 +77,9 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::custom_providers;
 use crate::server::core::model_rules;
-use crate::server::core::protocol::{anthropic_outbound, responses_outbound};
+use crate::server::core::protocol::{
+    anthropic_outbound, bedrock_outbound, responses_outbound, vertex_outbound,
+};
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::core::providers::custom::emulation;
 use crate::server::core::upstream::connections::ConnectionGuard;
@@ -129,6 +131,8 @@ pub(crate) async fn forward(
         custom_providers::PROTOCOL_CHAT_COMPLETIONS => None,
         custom_providers::PROTOCOL_RESPONSES => Some(OutboundKind::Responses),
         custom_providers::PROTOCOL_ANTHROPIC => Some(OutboundKind::Anthropic),
+        custom_providers::PROTOCOL_BEDROCK => Some(OutboundKind::Bedrock),
+        custom_providers::PROTOCOL_VERTEX => Some(OutboundKind::Vertex),
         other => {
             return Err(GatewayError::with_status(
                 400,
@@ -278,6 +282,8 @@ pub(crate) async fn forward(
         proxy,
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
+        // 前置跳由调用方在拿到账号记录后补（见 `TransportRequest::with_front_proxy`）
+        front_proxy: None,
     };
     let response = send_chat_request(&transport)
         .await
@@ -336,6 +342,21 @@ enum OutboundKind {
     Responses,
     /// Anthropic Messages（`POST {base}/v1/messages`）
     Anthropic,
+    /// AWS Bedrock Converse（`POST {base}/model/<modelId>/converse-stream`）
+    ///
+    /// 与上两者的结构性差异（见 `protocol::bedrock_outbound` 的模块头）：
+    /// 模型名进 URL 路径、鉴权是随请求体变化的 SigV4 签名（而非固定凭证头）、
+    /// 响应是 AWS Event Stream **二进制分帧**（而非 SSE 文本行）。因此它在
+    /// `forward_translated` 里的处理比另外两家多一步「签名」，且响应侧的
+    /// 状态机吃的是二进制帧而非 `data:` 行。
+    Bedrock,
+    /// Vertex AI Gemini（`POST {base}/<model>:streamGenerateContent?alt=sse`）
+    ///
+    /// 与 Bedrock 同族的两点（模型名进 URL 路径、响应需翻译），但与
+    /// responses / anthropic 更近的两点：响应是 **SSE 文本行**（不是二进制
+    /// 分帧），鉴权是**固定头或留空**（不是签名）。留空的情形是「密钥由出网
+    /// 代理注入」—— 见 `protocol::vertex_outbound` 的模块头。
+    Vertex,
 }
 
 impl OutboundKind {
@@ -344,6 +365,8 @@ impl OutboundKind {
         match self {
             Self::Responses => "responses",
             Self::Anthropic => "anthropic",
+            Self::Bedrock => "bedrock",
+            Self::Vertex => "vertex",
         }
     }
 }
@@ -367,6 +390,12 @@ struct ProviderQuirks {
     /// 两个桩工具 —— OpenCode Zen 的免费档只有这个形状才放行。**会改写请求体**，
     /// 所以只在记录显式声明时生效。
     emulate_opencode: bool,
+    /// 是否放宽 TLS 校验（提供商记录 `insecureTls: true`）。
+    ///
+    /// 只对 `vertex` 协议生效：上游经 **MITM 型**出网代理（它现签证书才能
+    /// 解密并注入凭证）时，签发者不在系统信任链里，严格校验必然失败。其余
+    /// 协议即使误设该键也不生效 —— 安全降级只在必要的那条路径上开放。
+    insecure_tls: bool,
 }
 
 impl ProviderQuirks {
@@ -404,6 +433,10 @@ impl ProviderQuirks {
                 .is_some_and(|text| {
                     text.eq_ignore_ascii_case(custom_providers::CLIENT_EMULATION_OPENCODE)
                 }),
+            insecure_tls: provider
+                .get("insecureTls")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }
     }
 
@@ -417,6 +450,30 @@ impl ProviderQuirks {
                 None => headers.push((key.clone(), value.clone())),
             }
         }
+    }
+
+    /// vertex 协议实际发往上游的 `x-goog-api-key` 值。
+    ///
+    /// 三种情形：
+    ///   1. 账号填了 Key → 原样发出（直连真实 Vertex 的常规用法）；
+    ///   2. 账号 Key 为空，但提供商 `headers` 里显式写了 `x-goog-api-key`
+    ///      （用户想自己控制注入值，或占位符化交给代理识别）→ 用那个值；
+    ///   3. 都为空 → 返回空串，`vertex_headers` 据此**不发任何凭证头**，
+    ///      交给出网代理（MITM）按 host+path 模板覆写。
+    ///
+    /// 注意情形 3 与「忘填 Key」在语义上是同一形状，但 vertex 协议本该允许
+    /// 无 Key，所以不判错。
+    fn vertex_api_key(&self, account_key: &str) -> String {
+        let trimmed = account_key.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        for (name, value) in &self.headers {
+            if name.eq_ignore_ascii_case("x-goog-api-key") {
+                return value.trim().to_string();
+            }
+        }
+        String::new()
     }
 
     /// 伪装头与匿名凭证（只在 `clientEmulation: "opencode"` 时动手）。
@@ -585,6 +642,83 @@ async fn forward_translated(
             quirks.apply_to(&mut headers);
             (url, headers, payload)
         }
+        OutboundKind::Bedrock => {
+            // ── Bedrock 与另两家的三处结构差异 ─────────────────────
+            // ① 模型名进 URL 路径（`/model/<id>/converse-stream`），不进请求体；
+            // ② 鉴权是 SigV4：签名覆盖 method/path/query/头/body 哈希，因此
+            //    **必须**在 payload 序列化定稿之后才能算；
+            // ③ region 从凭证第三段读（`AK:SK:region`），决定端点与签名 scope。
+            //
+            // baseUrl 的语义：用户填的应是 bedrock-runtime 的**根**。兼容两种
+            // 填法：带 `https://` 的完整地址，或留空让本模块按 region 拼标准端点。
+            let (access_key, secret_key, region) =
+                bedrock_outbound::split_credentials(api_key)
+                    .map_err(|message| GatewayError::with_status(400, message))?;
+            let base = base_url.trim_end_matches('/');
+            let endpoint = if base.is_empty() {
+                format!("https://bedrock-runtime.{region}.amazonaws.com")
+            } else {
+                // 自建代理 / 网关的基址原样用（签名仍按 AWS 规则算，代理若做
+                // 透传即可；不做透传的代理需要它自己重签）
+                base.to_string()
+            };
+            let payload = bedrock_outbound::bedrock_request_from_chat(&outbound_chat, &wire_model)
+                .map_err(|message| GatewayError::with_status(400, message))?;
+            let payload_text = serde_json::to_string(&payload).map_err(|error| {
+                GatewayError::with_status(500, format!("请求体序列化失败: {error}"))
+            })?;
+            // 模型名编成路径段（ARN 形态请求段编码、签名段双重编码）
+            let (request_segment, canonical_segment) =
+                bedrock_outbound::model_path_segments(&wire_model);
+            let host = endpoint
+                .split("://")
+                .nth(1)
+                .unwrap_or(&endpoint)
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let (amz_date, date_stamp) = bedrock_outbound::amz_timestamps();
+            let signed = bedrock_outbound::sign_request(
+                "POST",
+                &host,
+                &format!("/model/{canonical_segment}/converse-stream"),
+                "",
+                &payload_text,
+                // POST + JSON：签 content-type（与下面发出的头一致）
+                Some("application/json"),
+                &access_key,
+                &secret_key,
+                &region,
+                &amz_date,
+                &date_stamp,
+            );
+            let url = format!("{endpoint}/model/{request_segment}/converse-stream");
+            let headers = vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("X-Amz-Date".to_string(), signed.amz_date),
+                ("Authorization".to_string(), signed.authorization),
+            ];
+            // Bedrock 走 Converse 体（非 chat 体），已序列化好；用 Value 包回去
+            // 让下面的统一序列化口径保持一致（二次序列化是幂等的）
+            let reparsed: Value = serde_json::from_str(&payload_text)
+                .unwrap_or(Value::Object(serde_json::Map::new()));
+            (url, headers, reparsed)
+        }
+        OutboundKind::Vertex => {
+            // ── Vertex 与另三家的差异 ─────────────────────────────
+            // ① 模型名进 URL 路径（`<model>:streamGenerateContent?alt=sse`）；
+            // ② 鉴权可为空：Key 留空表示「由出网代理注入 x-goog-api-key」，
+            //    此时**一个凭证头都不发**（空 key 会被 Google 判成 API_KEY_INVALID）；
+            // ③ baseUrl 是「模型公共前缀」（到 `/publishers/google/models` 为止），
+            //    不是 API 根 —— 这也是它不能复用 chat 分支拼路径的原因。
+            let upstream_key = quirks.vertex_api_key(api_key);
+            let (url, _action) = vertex_outbound::vertex_endpoint(base_url, &wire_model, true);
+            let headers = vertex_outbound::vertex_headers(&upstream_key, &quirks.headers);
+            let payload = vertex_outbound::vertex_request_from_chat(&outbound_chat, &wire_model)
+                .map_err(|message| GatewayError::with_status(400, message))?;
+            (url, headers, payload)
+        }
     };
     let payload = serde_json::to_string(&payload)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
@@ -605,6 +739,8 @@ async fn forward_translated(
         proxy,
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
+        // 前置跳由调用方在拿到账号记录后补（见 `TransportRequest::with_front_proxy`）
+        front_proxy: None,
     };
     let response = send_chat_request(&transport)
         .await
@@ -689,6 +825,12 @@ struct ProtocolTranslateStream {
 enum TranslateMachine {
     Responses(responses_outbound::ChatFromResponsesStream),
     Anthropic(anthropic_outbound::ChatFromAnthropicStream),
+    /// Bedrock 的事件流是**二进制分帧**（AWS Event Stream），不是 SSE 文本行 ——
+    /// 状态机的接口同形（`push` / `finish`），但内部按长度字段切帧而非按行。
+    Bedrock(bedrock_outbound::ChatFromBedrockStream),
+    /// Vertex 的响应是 SSE 文本行（`alt=sse`），按行切帧即可 ——
+    /// 与 responses / anthropic 同族，只是帧内字段路径不同。
+    Vertex(vertex_outbound::ChatFromVertexStream),
 }
 
 impl TranslateMachine {
@@ -696,6 +838,8 @@ impl TranslateMachine {
         match self {
             Self::Responses(machine) => machine.push(chunk),
             Self::Anthropic(machine) => machine.push(chunk),
+            Self::Bedrock(machine) => machine.push(chunk),
+            Self::Vertex(machine) => machine.push(chunk),
         }
     }
 
@@ -703,6 +847,8 @@ impl TranslateMachine {
         match self {
             Self::Responses(machine) => machine.finish(),
             Self::Anthropic(machine) => machine.finish(),
+            Self::Bedrock(machine) => machine.finish(),
+            Self::Vertex(machine) => machine.finish(),
         }
     }
 }
@@ -736,6 +882,12 @@ impl ProtocolTranslateStream {
                 ),
                 OutboundKind::Anthropic => TranslateMachine::Anthropic(
                     anthropic_outbound::ChatFromAnthropicStream::new(model),
+                ),
+                OutboundKind::Bedrock => TranslateMachine::Bedrock(
+                    bedrock_outbound::ChatFromBedrockStream::new(model),
+                ),
+                OutboundKind::Vertex => TranslateMachine::Vertex(
+                    vertex_outbound::ChatFromVertexStream::new(model),
                 ),
             },
             pending: std::collections::VecDeque::new(),

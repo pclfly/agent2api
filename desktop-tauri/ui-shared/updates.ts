@@ -17,6 +17,45 @@ export type UpdateSettingsMode = 'follow' | 'custom'
 type Translator = (key: string, params?: Record<string, string | number>) => string
 
 /**
+ * 更新入口的本地策略开关（桌面端与手机端共用一处口径）。
+ *
+ * ── 为什么要有它 ────────────────────────────────────────────
+ * 这一版按本地定制关闭了两类**主动打扰**的更新入口：
+ *   · `autoPrompt`：定时检查 / 首屏读到缓存时自动弹「检测到更新」对话框；
+ *   · `download`：「下载并安装 / 立即更新 / 安装并重启」这类会从上游取包并
+ *     交给系统安装器的动作。
+ *
+ * 保留的是**只读**那半边：侧栏「设置」上的「新」角标、面板里的「检查更新」按钮、
+ * 版本号与更新日志的展示、以及「到 GitHub 发布页」这条外链出口。也就是说用户
+ * 仍然看得到「有新版本」，只是决定权完全在他手里 —— 不由程序替他起下载。
+ *
+ * ── 为什么不做成设置项 ──────────────────────────────────────
+ * 它是构建期策略，不是用户偏好：做成设置项就还要在配置层、同步、多端之间各维护
+ * 一份，而它服务的只是这一版的分发口径。真要在发布时改回去，把这里两个值翻成
+ * `true`、重建前端产物即可（`npm --prefix desktop-tauri/ui-islands run build`、
+ * `npm --prefix desktop-tauri/mobile run build`）。
+ *
+ * 两个读取函数都显式标 `: boolean`：字面量类型 `false` 会让调用点的 `if` 被
+ * 收窄成恒假分支，读起来像死代码，宁可退化成普通布尔。
+ */
+export const UPDATE_SURFACE = {
+  /** 是否自动弹「检测到更新」对话框 */
+  autoPrompt: false,
+  /** 是否提供「下载并安装」一类的下载 / 安装入口 */
+  download: false,
+} as const
+
+/** 自动弹窗是否开启（`update-modal` / 强制更新门读它） */
+export function updateAutoPromptEnabled(): boolean {
+  return UPDATE_SURFACE.autoPrompt
+}
+
+/** 下载 / 安装入口是否开启（桌面面板与手机端面板读它） */
+export function updateDownloadEnabled(): boolean {
+  return UPDATE_SURFACE.download
+}
+
+/**
  * 「有新版本，但没有可下载的包」时后端给的诊断（check 响应的 `assetProbe`）。
  *
  * ── 为什么需要它 ────────────────────────────────────────────

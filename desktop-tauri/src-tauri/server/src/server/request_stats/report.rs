@@ -214,6 +214,15 @@ pub(super) fn range_totals(
                 acc.successful,
                 acc.tokens,
             );
+            // 积分并进同一个账号组：组已由上一行建好（否则 push_account_credit
+            // 找不到目标而静默丢弃）。覆盖率按「这一组有多少条带读数」累计。
+            push_account_credit(
+                &mut totals.account_totals,
+                &acc.account_id,
+                acc.credit,
+                acc.credit_requests,
+                acc.credit_estimated,
+            );
         }
     }
 
@@ -407,10 +416,44 @@ pub(super) fn push_account_accum(
         None => list.push(AccountAccum {
             account_id: account_id.to_string(),
             account_name: account_name.to_string(),
+            // 新建的组从「没有读数」起步：credit / credit_estimated 由
+            // `push_account_credit` 在拿到读数时才填（None ≠ 0，见结构体说明）
+            credit: None,
+            credit_requests: 0,
+            credit_estimated: false,
             requests,
             successful,
             tokens,
         }),
+    }
+}
+
+/// 把一个账号组的积分读数并进合计。
+///
+/// ── 为什么单独一个函数、而不是并进 `push_account_accum` ────────
+/// 两个来源的调用点在**不同位置**：账号组本身来自日报的 `account_stats`，
+/// 而积分读数来自明细行逐条累计。分开之后「这一组存在」与「这一组有多少条
+/// 带读数」各自独立演进，不会因为积分缺失就让整组消失。
+///
+/// ── 为什么只加 `Some` ───────────────────────────────────────
+/// `credit` 为 `None` 表示「这条没有读数」，不是「这一次花了 0」。累加时
+/// 直接跳过、覆盖率计数也不动 —— 否则「40 条请求里只有 12 条有读数」会被
+/// 记成「40 条都有读数、合计偏小」，那是另一种假读数。
+pub(super) fn push_account_credit(
+    list: &mut [AccountAccum],
+    account_id: &str,
+    credit: Option<f64>,
+    measured: i64,
+    estimated: bool,
+) {
+    // 非有限值（手改库、上游溢出）按「没上报」处理，不是 0
+    let Some(credit) = credit.filter(|value| value.is_finite()) else {
+        return;
+    };
+    if let Some(item) = list.iter_mut().find(|item| item.account_id == account_id) {
+        item.credit = Some(item.credit.unwrap_or(0.0) + credit);
+        item.credit_requests += measured.max(0);
+        item.credit_estimated |= estimated;
     }
 }
 
@@ -567,6 +610,11 @@ pub(super) fn build_accounts(totals: &[AccountAccum]) -> Vec<Value> {
                 "success": item.successful,
                 "failures": (item.requests - item.successful).max(0),
                 "totalTokens": item.tokens,
+                // 积分三件套：合计 / 覆盖率 / 是否含估算。
+                // `credit` 为 null 时前端显示「—」而不是 0（见 AccountAccum 的说明）
+                "credit": item.credit,
+                "creditRequests": item.credit_requests,
+                "creditEstimated": item.credit_estimated,
             })
         })
         .collect()

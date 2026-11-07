@@ -14,7 +14,7 @@ import {
 } from '@ui'
 import {
   downloadAsset, handleExternalClick, isSelfUpdate, markdownHtml, missingAssetReasonFor,
-  openExternal, safeExternal, shared, type UpdateInfo,
+  openExternal, safeExternal, shared, updateAutoPromptEnabled, type UpdateInfo,
 } from './update-shared'
 import { t } from '../i18n'
 import { HtmlContent } from '@ui'
@@ -82,6 +82,12 @@ export function showUpdateModal(
   info: UpdateInfo | null | undefined,
   onGoUpdate: (info: UpdateInfo) => Promise<void>,
 ): void {
+  // 本地分发策略关掉了自动弹窗（见 ui-shared/updates.ts 的 UPDATE_SURFACE）：
+  // 定时检查与首屏读缓存仍会走到这里，直接安静地退场。这里用**提前返回**而不是
+  // 在调用点删掉调用 —— 调用点是三条独立路径（check / syncFromCache / 定时轮询），
+  // 在出口收一次口比在三处各留一个洞更难漏。顺带把可能已经挂着的弹窗收掉，
+  // 免得策略在运行期被翻成关时旧弹窗还赖在屏幕上。
+  if (!updateAutoPromptEnabled()) { unmountUpdateModal(); return }
   if (info?.forceUpdate?.required) return
   if (info?.channelChanged) { unmountUpdateModal(); return }
   if (!info || info.hasUpdate !== true) return

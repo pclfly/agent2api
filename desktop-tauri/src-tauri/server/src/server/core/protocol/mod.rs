@@ -49,6 +49,7 @@
 //! 不做网络、不碰文件、不认识 axum（纯函数 + 状态机，便于单独推演）。
 
 pub mod anthropic;
+pub mod bedrock_outbound;
 pub mod anthropic_outbound;
 pub mod antigravity_signature_cache;
 pub mod antigravity_stream;
@@ -60,6 +61,7 @@ pub mod native_tool;
 pub mod responses;
 pub mod responses_outbound;
 pub mod tool_plan;
+pub mod vertex_outbound;
 
 use std::borrow::Cow;
 

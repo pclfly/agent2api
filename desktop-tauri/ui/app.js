@@ -961,10 +961,20 @@ function syncUpdateBadge() {
   // 只放一个「新」字而不是数字：这里没有「未读条数」的含义，
   // 写成数字容易被误会成还有多少个版本可以更新
   badge.textContent = wbI18n.t('新');
-  badge.title = wbI18n.t('发现新版本 {latest}（当前 {current}），点开「设置 - 软件更新」可查看更新日志并下载', {
-    latest,
-    current: info.currentVersion || wbI18n.t('未知'),
-  });
+  // 悬停说明要不要提「下载」，跟着更新面板的下载入口走：这一版把下载 / 安装
+  // 收掉了（见 ui-shared/updates.ts 的 UPDATE_SURFACE），角标还写着「并下载」
+  // 就是一句兑现不了的承诺。判据读面板那张表（wbUpdatePanel.downloadEnabled），
+  // 不在 app.js 里另写一份常量 —— 两处各写一份必然漂移。
+  const canDownload = window.wbUpdatePanel?.downloadEnabled?.() !== false;
+  badge.title = canDownload
+    ? wbI18n.t('发现新版本 {latest}（当前 {current}），点开「设置 - 软件更新」可查看更新日志并下载', {
+      latest,
+      current: info.currentVersion || wbI18n.t('未知'),
+    })
+    : wbI18n.t('发现新版本 {latest}（当前 {current}），点开「设置 - 软件更新」可查看更新日志', {
+      latest,
+      current: info.currentVersion || wbI18n.t('未知'),
+    });
   badge.style.display = '';
 }
 

@@ -495,6 +495,22 @@ impl AccountStore {
                     "hasCredentials".to_string(),
                     Value::Bool(record.has_credentials()),
                 );
+                // ── 前置跳恒在（**所有形状**都从这里补齐）────────────────
+                // 两跳的转发路径读的是 `resolve_front_proxy(RouteTarget.account)`
+                // —— 也就是**本函数的返回值**。`frontProxy` 原先只在两处形状里
+                // 写过（自定义账号 / 插件账号），于是：
+                //   · 从旧库桥接进来的插件账号（**没有 `pluginSecret`**，走内置
+                //     兜底形状）在真实转发时被当成「没配前置跳」，静默走单跳；
+                //   · 而「按账号测试」那条路从会话/凭证取，两跳照常生效 ——
+                //     测试绿、转发却只出一跳，是最难查的那种不一致。
+                // 统一注入后，「配没配前置跳」只由记录决定，与谁拼的形状无关。
+                // 顺序放在形状拼装之后：任何形状自带的同名键都不该压过记录。
+                fields.insert(
+                    "frontProxy".to_string(),
+                    describe_account_proxy(Some(
+                        &record.get("frontProxy").cloned().unwrap_or(Value::Null),
+                    )),
+                );
                 // 「需要重新登录」标记（issue #215）：上游注销了会话、refresh token
                 // 一并作废时由刷新链路落。界面据此把「刷新失败」显示成「需要重新
                 // 登录」—— 两者对用户的下一步动作完全不同（前者再点一次，后者必须
@@ -782,6 +798,14 @@ impl AccountStore {
         public.insert("addedAt".to_string(), Value::from(record.added_at()));
         public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
         public.insert("proxy".to_string(), describe_account_proxy(Some(&record.proxy())));
+        // 前置跳（`frontProxy`）：给了才能让两跳链路生效 ——
+        // `upstream::resolve_front_proxy` 读的就是这个键上的 `.config`。
+        // 形状沿用 `describe_account_proxy` 的展示形态（含 `config` 原始配置），
+        // 没配时写 null（与 proxy 同一口径：键恒在，null = 没有）。
+        public.insert(
+            "frontProxy".to_string(),
+            describe_account_proxy(Some(&record.get("frontProxy").cloned().unwrap_or(Value::Null))),
+        );
         // 「可用」= 凭证完整（与各家同一语义，见 `accounts-shared` 的 available 说明）。
         // 自定义账号这一项以前恒 true，于是「没填 Key 也没勾无需鉴权」的账号照样出现在
         // 「模型来源」下拉里（界面按 `available !== false` 过滤，见 models-fetch-modal）

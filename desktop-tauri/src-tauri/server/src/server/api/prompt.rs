@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 
 use crate::server::config::{
     self, PromptSettings, ProviderPromptPatch, KEY_PROMPT_FILE, KEY_PROMPT_GATEWAY,
-    KEY_PROMPT_GATEWAY_TEXT, KEY_PROMPT_MODE, KEY_PROMPT_PROVIDERS, KEY_PROMPT_TEXT,
+    KEY_PROMPT_GATEWAY_TEXT, KEY_PROMPT_MODE, KEY_PROMPT_MODELS, KEY_PROMPT_PROVIDERS, KEY_PROMPT_TEXT,
 };
 use crate::server::core::degrade;
 use crate::server::core::prompt::{GatewayBlocks, PromptMode};
@@ -250,12 +250,25 @@ pub async fn put_prompt(State(state): State<ServerState>, body: Bytes) -> Respon
                         }
                     }
                 }
+                // 未给范围保持旧值；null = 全部，[] 明确表示全不选
+                // （`[]` 与「未给」是两件事，写侧必须原样保留）
+                let entry_models = if entry.contains_key(KEY_PROMPT_MODELS) {
+                    match crate::server::core::prompt::parse_model_scope(entry.get(KEY_PROMPT_MODELS)) {
+                        Ok(models) => models,
+                        Err(message) => {
+                            return errors::management_error(400, format!("{id}: {message}"))
+                        }
+                    }
+                } else {
+                    previous.and_then(|item| item.models.clone())
+                };
                 provider_patches.push((
                     id.to_string(),
                     Some(ProviderPromptPatch {
                         mode: entry_mode,
                         file: entry_file,
                         inline: entry_inline,
+                        models: entry_models,
                     }),
                 ));
             }
@@ -550,6 +563,10 @@ fn providers_json(settings: &PromptSettings) -> Value {
                 "promptSource": entry.source.as_str(),
                 "promptLines": entry.text.lines().count(),
                 "promptFileError": entry.file_error,
+                // 适用模型范围回显：`null` = 全部、`[]` = 全不选、其余为白名单。
+                // 缺这个键会让前端把「全不选」读成「全部」，用户关掉的提示词
+                // 下次保存又被装回去。
+                KEY_PROMPT_MODELS: entry.models.clone(),
             }),
         );
     }
@@ -598,9 +615,24 @@ async fn provider_options(state: &ServerState) -> Value {
     let mut items = Vec::with_capacity(providers::PROVIDERS.len());
     for meta in providers::PROVIDERS.iter() {
         let info = plugin_prompt_info(state, meta.id).await;
+        // 模型目录：范围弹窗的勾选项来源。取**适配器当前清单**（插件家走缓存、
+        // 内置家走各自目录），拿不到时给空表 —— 空表不等于「没有模型」，
+        // 已选但目录里缺失的 id 由前端并进勾选列表，不会因为目录空了就丢选项。
+        let models: Vec<String> = crate::server::core::providers::adapter::adapter_by_id(meta.id)
+            .map(|adapter| {
+                adapter
+                    .list_models()
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         items.push(json!({
             "id": meta.id,
             "label": meta.label,
+            "models": models,
             "gatewayNote": info.as_ref().and_then(|info| info.get("gatewayNote")).cloned()
                 .unwrap_or(Value::Null),
             "gatewayChars": info.as_ref().and_then(|info| info.get("gatewayChars")).cloned()

@@ -234,28 +234,59 @@ pub(super) async fn send_body<'a>(
     // `degraded` = 本请求是否已进入降级（请求开始时状态机已生效，或本次撞了
     // 内容拦截后由转发层置位）：降级期用最小中性提示词（`custom` 模式除外，
     // 见 `PromptChoice::text_for`）。
-    let prompt = ctx.prompt.for_provider(provider_id);
-    let processed = if ctx.preserve_system_prompt { None } else { prompt.apply(role_base.as_ref(), degraded) };
-    let after_prompt = match processed {
-        Some(next) => {
+    // ── 取哪一份：先按**实际目标模型**筛，再取这一家的那一份 ──────
+    // 范围判定必须用「出站改名后的实际目标模型」：别名共用其目标的���围，
+    // 否则给 `gpt-4` 配的范围在客户端用别名 `fast` 调时就不生效了。
+    // 自定义家在自己的转发器里改名，这里只解析同一目标来判定范围，
+    // **不提前写回 body**，以免丢掉别名上的思考等级绑定。
+    let requested = ctx
+        .body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let prompt_model = if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
+        crate::server::core::custom_providers::wire_model_for(provider_id, &requested).0
+    } else {
+        crate::server::core::providers::catalog::wire_target_for_provider(
+            &requested,
+            provider_id,
+            account,
+        )
+        .model
+    };
+    // 未选中该模型时 `for_model` 给 None —— 既不替换也不追加，也**不回落
+    // 全局**（回落会悄悄改掉用户明确关掉的那一家）
+    let prompt = ctx.prompt.for_model(provider_id, &prompt_model);
+    let processed = if ctx.preserve_system_prompt {
+        None
+    } else {
+        prompt.and_then(|choice| choice.apply(role_base.as_ref(), degraded))
+    };
+    let after_prompt = match (prompt, processed) {
+        (Some(choice), Some(next)) => {
             logging::verbose(
                 "[Upstream]",
                 &format!(
-                    "系统提示词层：{}（{}）provider={} messages {} → {}",
-                    prompt.mode.label(),
-                    if degraded && prompt.mode.degradable() {
+                    "系统提示词层：{}（{}）provider={} model={} messages {} → {}",
+                    choice.mode.label(),
+                    if degraded && choice.mode.degradable() {
                         "降级期：中性提示词"
                     } else {
-                        prompt.source.label()
+                        choice.source.label()
                     },
                     provider_id,
+                    if prompt_model.is_empty() { "-" } else { &prompt_model },
                     message_count(ctx.body),
                     message_count(&next),
                 ),
             );
             Cow::Owned(next)
         }
-        None => role_base,
+        // 范围未命中 / passthrough 且未降级：一个字节都不动
+        // （默认路径，零拷贝沿用客户端原始体）
+        _ => role_base,
     };
     // ── ② 指纹脱敏层（核心规则见 `core::sanitize`）─────────────────────
     let body = if ctx.sanitize.applies_to(provider_id) {

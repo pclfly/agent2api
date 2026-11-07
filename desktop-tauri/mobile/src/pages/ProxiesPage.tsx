@@ -13,8 +13,6 @@ import { formatRelative } from '../lib/format'
 import { usePolling } from '../lib/usePolling'
 import { t } from '../i18n'
 import { proxyServiceLabels } from '../../../ui-shared/proxy-usage'
-import { shouldShowProxyRetirement } from '../../../ui-shared/proxy-retirement'
-import { ProxyRetirementDialog } from '../../../ui-shared/proxy-retirement-dialog'
 import { ProxyEditorSheet, ProxyTestSettingsSheet } from './proxy-editor-sheet'
 import { serverIdentity } from '../lib/servers'
 
@@ -29,7 +27,6 @@ export function ProxiesPage() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [deleting, setDeleting] = useState<PoolItem | null>(null)
   const identity = serverIdentity()
-  const [noticeOpen, setNoticeOpen] = useState(() => shouldShowProxyRetirement(identity))
 
   const load = async () => {
     try {
@@ -170,7 +167,6 @@ export function ProxiesPage() {
     </div>)}
     {editor ? <ProxyEditorSheet item={editor.item} onClose={() => setEditor(null)} onSaved={setData} /> : null}
     {settingsOpen ? <ProxyTestSettingsSheet onClose={() => setSettingsOpen(false)} /> : null}
-    <ProxyRetirementDialog open={noticeOpen} onClose={() => setNoticeOpen(false)} t={t} scope={identity} />
     <Dialog open={Boolean(deleting)} onOpenChange={open => { if (!open && !busy) setDeleting(null) }}>
       <DialogContent className='max-w-[440px]'><DialogHeader><DialogTitle>{t('删除代理')}</DialogTitle></DialogHeader>
         <DialogBody>

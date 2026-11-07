@@ -443,5 +443,7 @@
   "：": ":",
   "：这里的模型不会出现在其他家，别名也只在这一家内生效。改名称 / 协议 / Base URL 在账号页该家账号的「设置」→ 提供商一栏；整家不要了，鼠标移到左栏这家上点 × 删除（连同名下账号）。": ": os modelos daqui não aparecem em outros provedores e os aliases só valem dentro deste. Para alterar nome / protocolo / Base URL, use “Configurações” → campo do provedor nas contas desta família, na página de contas; se não quiser mais o provedor inteiro, passe o mouse sobre ele na barra lateral esquerda e clique em × para excluir (junto com as contas dele).",
   "；其中 {keys} 由 models.dev 补齐": "; {keys} preenchido(s) pelo models.dev",
-  "；首个失败：{error}": "; primeira falha: {error}"
+  "；首个失败：{error}": "; primeira falha: {error}",
+  "可配思考档位：{levels}{defaultText}": "Níveis de raciocínio configuráveis: {levels}{defaultText}",
+  "（默认 {level}）": " (padrão: {level})"
 }

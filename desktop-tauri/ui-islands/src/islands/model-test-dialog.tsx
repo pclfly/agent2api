@@ -49,7 +49,7 @@ import {
   DEFAULT_PROVIDER_ID, byPriorityOrder, displayNameOf, isRateLimited, positionMap, providerFeatures,
 } from './accounts-domain'
 import {
-  POOL_VALUE_PREFIX, poolItemLabel, type AccountRecord, type PoolItem,
+  POOL_VALUE_PREFIX, poolItemLabel, poolItemSelectable, type AccountRecord, type PoolItem,
 } from './accounts-shared'
 import * as customSource from './models-custom-source'
 import type { ManageModel } from './models-custom-source'
@@ -448,12 +448,12 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
   const proxyItems: Array<{ value: string; label: string; disabled?: boolean }> = [
     { value: '', label: t('跟随账号配置') },
     { value: PROXY_DIRECT, label: t('直连（不使用代理）') },
-    // 已禁用的池条目置灰：测试会走它解析（失败即回退直连），选它测出来的
-    // 结论不是用户想要的那个 —— 与账号页代理列同一口径
+    // 被本页禁用的条目也可选（后端在账号写代理时会自动启用），只有 Clash 侧
+    // 停用的与订阅里已移除的置灰 —— 与账号页代理列同一口径（`poolItemSelectable`）
     ...(pool ?? []).map(item => ({
       value: `${POOL_VALUE_PREFIX}${item.id}`,
       label: poolItemLabel(item),
-      disabled: item.enabled === false,
+      disabled: !poolItemSelectable(item),
     })),
   ]
   if (pool === null) {

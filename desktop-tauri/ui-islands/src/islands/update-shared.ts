@@ -19,8 +19,15 @@
 
 import type * as React from 'react'
 import type { AssetProbe, UpdateChannels, ForceUpdatePolicy } from '../../../ui-shared/updates'
-import { assetMissingReason, githubErrorMessage } from '../../../ui-shared/updates'
+import {
+  assetMissingReason, githubErrorMessage,
+  updateAutoPromptEnabled, updateDownloadEnabled,
+} from '../../../ui-shared/updates'
 export type { UpdateChannels, AssetProbe } from '../../../ui-shared/updates'
+/** 本地分发策略的两个读口（定义与理由见 ui-shared/updates.ts 的 UPDATE_SURFACE）。
+ *  转出一层是为了让岛内各处只 import `./update-shared` 一处出口，别再各自
+ *  深链到 ui-shared —— 那样策略一改就得追好几处。 */
+export { updateAutoPromptEnabled, updateDownloadEnabled } from '../../../ui-shared/updates'
 // 代理池的共享类型与值前缀与账号页共用一份 —— 两处下拉的值域必须一致
 // （`pool:<id>`），各写一份迟早会漂移。accounts-shared 是纯类型 + 常量的
 // 自包含模块（不 import 任何业务模块），这里引用它不产生循环。

@@ -67,6 +67,7 @@ import {
   INITIAL_SANITIZE, sanitizeStateFrom, type SanitizePatch, type SanitizeState,
 } from './settings-sanitize-model'
 import { t } from '../i18n'
+import { readPromptModelScope, type PromptModelScope } from './settings-prompt-models'
 import { retentionSavedMessage, retentionShrinkHead, type RetentionField } from './settings-retention-model'
 
 /* ─── 快照类型 ─────────────────────────────── */
@@ -236,6 +237,13 @@ export type PromptState = {
 /** 单一提供商的提示词覆盖（字段与全局那份同构，同一套渲染逻辑） */
 export type ProviderPromptState = {
   id: string
+  /**
+   * 适用模型范围：`null` = 全部（含以后新增）、`[]` = 全不选、其余为白名单。
+   *
+   * 与「模式」是**两个维度**：范围只决定这份覆盖要不要生效，不改变加工链
+   * （透传 / 替换 / 追加）。未选中的模型**不回落全局**、也不触发降级。
+   */
+  models: PromptModelScope
   mode: string
   file: string
   /** **生效正文**（同上；`passthrough` 下是空串） */
@@ -261,6 +269,14 @@ export type ProviderPromptState = {
 export type ProviderPromptOption = {
   id: string
   label: string
+  /**
+   * 这一家当前可选的模型清单（本地目录缓存，可能为空 = 还没拉到）。
+   *
+   * 范围弹窗用它渲染勾选项；已选但目录里没有的 id **仍然可见**
+   * （`promptModelOptions` 会把它们并进来）—— 目录刷新丢掉某个模型时，
+   * 用户的显式选择不该跟着消失。
+   */
+  models: string[]
   gatewayNote: string
   gatewayChars: number
   gatewayBlocks: GatewayBlocks | null
@@ -2258,6 +2274,7 @@ function providerPrompts(raw: unknown, gateway: Record<string, boolean>): Provid
       const entry = value as Record<string, unknown>
       return {
         id,
+        models: readPromptModelScope(entry.promptModels),
         mode: String(entry.promptMode || 'passthrough'),
         file: String(entry.promptFile || ''),
         text: String(entry.promptText || ''),
@@ -2281,6 +2298,11 @@ function providerOptions(raw: unknown): ProviderPromptOption[] {
       const entry = item as Record<string, unknown>
       return {
         id: String(entry.id),
+        // 目录只收字符串项（后端给的是模型 id 数组；认不出的形状按空表处理，
+        // 空目录时范围弹窗仍能显示「已选但目录缺失」的那些 id）
+        models: Array.isArray(entry.models)
+          ? entry.models.filter((value): value is string => typeof value === 'string')
+          : [],
         label: String(entry.label || entry.id),
         gatewayNote: String(entry.gatewayNote || ''),
         gatewayChars: Number(entry.gatewayChars) || 0,
@@ -2435,7 +2457,13 @@ function knownProviderId(id: unknown): string {
 async function saveProviderPrompt(
   label: string,
   id: string,
-  patch: { promptMode?: string; promptFile?: string; promptText?: string } | null,
+  patch: {
+    promptMode?: string
+    promptFile?: string
+    promptText?: string
+    /** 适用模型范围（`null` = 全部、`[]` = 全不选、其余白名单） */
+    promptModels?: PromptModelScope
+  } | null,
 ): Promise<boolean> {
   return savePromptField(label, { promptProviders: { [id]: patch } })
 }
@@ -2453,9 +2481,11 @@ async function saveProviderPrompt(
 function providerPatch(
   prompt: PromptState,
   item: ProviderPromptState,
-): { promptMode: string; promptFile: string; promptText: string } {
+): { promptMode: string; promptFile: string; promptText: string; promptModels: PromptModelScope } {
   const followGlobal = !item.configured
   return {
+    // 范围随每次保存一起落定：不带它会让「改模式」把用户设好的范围清成 null
+    promptModels: item.models,
     promptMode: item.mode,
     promptFile: item.file,
     promptText: item.source === 'inline' || item.mode === 'passthrough' ? item.text
@@ -2473,6 +2503,8 @@ export async function addProviderPrompt(rawId: string): Promise<void> {
     id,
     providerPatch(prompt, {
       id,
+      // 新加的覆盖沿用全局的范围（全局没有范围概念 → null = 全部）
+      models: null,
       mode: prompt.mode,
       file: prompt.file,
       text: prompt.text,
@@ -2482,6 +2514,26 @@ export async function addProviderPrompt(rawId: string): Promise<void> {
       gateway: prompt.gateway[id] ?? true,
       configured: false,
     }),
+  )
+}
+
+/**
+ * 保存**某一家**的适用模型范围。
+ *
+ * 返回 `false` = 这一家不在可配置清单里（调用方据此不关弹窗）。
+ * 范围是整体替换语义：`null` / `[]` / 白名单都会被原样写盘 —— 后端把
+ * 「`null`（全部）」与「`[]`（全不选）」分得清清楚楚，前端不得合并。
+ */
+export async function saveProviderPromptModels(
+  item: ProviderPromptState,
+  models: PromptModelScope,
+): Promise<boolean> {
+  const id = knownProviderId(item.id)
+  if (!id) return false
+  return saveProviderPrompt(
+    t('已保存'),
+    id,
+    { ...providerPatch(snapshot.prompt, item), promptModels: models },
   )
 }
 

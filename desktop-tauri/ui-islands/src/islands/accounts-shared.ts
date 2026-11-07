@@ -1,5 +1,6 @@
 import { t } from '../i18n'
 import { type ProxyUsage } from '../../../ui-shared/proxy-usage'
+import { poolItemSelectable as selectablePoolItem } from './proxy-pool-select'
 import type { BalanceQueryPublic } from './balance-query'
 import type { LimiterGroup, LimiterSnapshot } from './accounts-limiter-types'
 import type { AccountSorting, AccountSortRule as GroupSortRule } from '../../../ui-shared/account-sorting'
@@ -29,8 +30,8 @@ export type ProxyConfig = {
   /** 解析失败的原因：转发时回退直连，界面上整格标红 */
   error?: string
   /**
-   * 轮询档（`source === 'rotate'`，只对 OpenCode Zen 开放）的展示读数：
-   * 候选条数与其中可用的条数（后端 `proxy_rotate::summary`）。
+   * 轮询档（`source === 'rotate'`）的展示读数：候选条数与其中可用的条数
+   * （后端 `proxy_rotate::summary`）。
    */
   rotate?: { all?: boolean; total?: number; usable?: number } | null
   config?: {
@@ -42,6 +43,13 @@ export type ProxyConfig = {
     all?: boolean
     /** `source === 'rotate' && all !== true`：要轮询的池条目 id */
     proxyIds?: string[]
+    /**
+     * `source === 'rotate'` 的切换策略：
+     *   · `smart`（缺省）—— 只在「与出口有关」的失败上换（网络失败、403 地区
+     *     封锁、按 IP 计的 429）；
+     *   · `all_errors` —— 任何上游错误都换。
+     */
+    failureMode?: 'smart' | 'all_errors'
     protocol?: string
     host?: string
     port?: number
@@ -115,12 +123,20 @@ export type BatchAccountsResult = {
   failed?: Array<{ id?: string; error?: string }>
   skipped?: Array<{ id?: string; name?: string; reason?: string }>
   list?: AccountsSnapshot
+  /** 批量改代理时后端自动启用的池条目说明（只有真的启用了才有） */
+  autoEnabledProxy?: string | null
+  /** 监听器对账：发现多少个账号引用的订阅节点还缺端口（已请求内核补建） */
+  listenersMissing?: number | null
+  /** 监听器对账：有缺口，但内核没装 / 没启用订阅 / 被手动关闭 —— 补不了 */
+  listenerBlocked?: boolean | null
 }
 
 export type AccountUpdateResult = {
   account?: AccountRecord
   changes?: string[]
   list?: AccountsSnapshot
+  /** 新增账号时自动启用过的池条目说明（后端 `proxyNotice`） */
+  proxyNotice?: string | null
 }
 
 /** 与后端 MAX_CONCURRENT_LIMIT 一致。 */
@@ -362,6 +378,10 @@ export type AccountsBridge = {
   } | null | undefined>
   getProxies(): Promise<{ clash?: import('../../../ui-shared/clash-proxy').ClashProxySnapshot } | null | undefined>
   getProxyPool(): Promise<{ items?: PoolItem[] } | null | undefined>
+  /** 只列**可用**条目（账号侧代理下拉 / 轮询候选）：后端滤掉已禁用的节点，
+   *  且**不同步** Clash —— 画一个下拉不该触发一次镜像写入。旧壳没有这个方法，
+   *  调用方回落 `getProxyPool`。 */
+  getUsableProxyPool?(): Promise<{ items?: PoolItem[] } | null | undefined>
   /** 测一条池条目（账号表单里选中池引用时的「测试出口」）：
    *  结果会记进那条代理的「上次测试」，与代理页那颗按钮同一个动作 */
   testProxyPoolItem(id: string): Promise<{
@@ -414,6 +434,28 @@ export type PoolItem = ProxyUsage & {
   port?: number | null
   resolved?: { protocol?: string; host?: string; port?: number | null; label?: string } | null
   resolveError?: string | null
+  /** 来源侧是否启用（Clash 镜像值 / 订阅与手动条目恒为 true） */
+  sourceEnabled?: boolean
+  /** 本页额外禁用（只出现在 Clash 条目上；`enabled` 已经把它算进去了） */
+  localDisabled?: boolean
+  /** 订阅里已移除该节点：条目留着只为不悬空账号引用，启用也拿不到端口 */
+  gone?: boolean
+  /** 订阅节点的归属订阅 id（手动 / Clash 条目为空串）—— 界面按它分批筛选 */
+  providerId?: string
+  /** 订阅节点在机场清单里的原始节点名 */
+  node?: string
+  /** 孤儿订阅节点：所属订阅已不存在（后端标注），这类条目可手动删除 */
+  orphan?: boolean
+}
+
+/**
+ * 这条池条目**能不能被账号选中**（判据与注释见 `proxy-pool-select.ts`）。
+ *
+ * 留在这里是为了一处导出入口：视图层从 `accounts-shared` 取到全部代理展示
+ * 工具，再单独多一条 `./proxy-pool-select` 的 import 只会让几处容易漏改。
+ */
+export function poolItemSelectable(item: PoolItem): boolean {
+  return selectablePoolItem(item)
 }
 
 /** 代理统一展示实时解析出的协议地址，供列表与下拉核对。 */
@@ -428,7 +470,14 @@ export function poolItemAddress(item: PoolItem): string {
 
 export function poolItemLabel(item: PoolItem): string {
   const name = item.name || item.id
-  const parts = [item.source === 'clash' ? 'Clash Verge' : '', item.resolveError ? t('解析失败') : poolItemAddress(item), item.enabled === false ? t('已禁用') : ''].filter(Boolean)
+  const parts = [
+    item.source === 'clash' ? 'Clash Verge' : '',
+    item.resolveError ? t('解析失败') : poolItemAddress(item),
+    // 两种「不可选」分开措辞：一个在 Clash 里改，一个是节点真的没了
+    item.gone === true ? t('订阅里已移除') : '',
+    item.source === 'clash' && item.sourceEnabled === false ? t('已在 Clash 中禁用') : '',
+    item.enabled === false && poolItemSelectable(item) ? t('已禁用（选中后自动启用）') : '',
+  ].filter(Boolean)
   return parts.length ? t('{name}（{parts}）', { name, parts: parts.join(' · ') }) : name
 }
 

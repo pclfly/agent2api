@@ -24,7 +24,7 @@ use super::record::{DailyEntry, RequestEntry};
 use super::report::{
     build_accounts, build_models, build_providers, build_top_model, cache_rates, cache_trend_24h,
     daily_trend, heatmap, model_stat_key, normalize_range, push_account_accum, push_model_accum,
-    push_provider_accum, range_bounds, range_totals, streak, SummaryRow,
+    push_account_credit, push_provider_accum, range_bounds, range_totals, streak, SummaryRow,
 };
 use super::{daily, sql};
 use super::legacy;
@@ -252,5 +252,15 @@ pub(super) fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
         1,
         i64::from(success),
         item.total_tokens,
+    );
+    // 积分也累进日报：报表读的是 `request_daily.account_stats`（不是明细表），
+    // 不在这里累计的话「消耗」列在报表里永远是空的 —— 即使明细行已经写对了。
+    // `measured` 用「这条有没有读数」（0/1）：覆盖率统计的是**条数**，不是值。
+    push_account_credit(
+        &mut day.account_stats,
+        &item.account_id,
+        item.credit,
+        i64::from(item.credit.is_some()),
+        item.credit_source == "estimate",
     );
 }

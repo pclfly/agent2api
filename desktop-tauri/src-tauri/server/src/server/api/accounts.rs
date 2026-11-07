@@ -107,18 +107,38 @@ async fn add_plugin_account(
         None => None,
     };
     // normalize 与落账号共用同一归一配置；pool/Clash 解析失败不能静默直连。
+    //
+    // ── 指定即启用 ──────────────────────────────────────────────
+    // 用户在这里选了一条**已被禁用**的池条目，等于说「现在要用它」：先把条目
+    // 启用再解析，否则下面必然报「代理已禁用」，而用户刚在同一个弹窗里选了它。
+    // 启用发生在账号落库之前 —— 这条路径要拿到可用的 `WireProxy` 交给插件做
+    // 真实凭证校验，解析不了就没法继续（不像 PATCH 那条可以只落配置）。
+    // 后续账号落库失败时条目会留在启用状态：那不算错，用户的意图已经表达。
+    let proxy_note = super::proxies::enable_referenced_proxy(proxy_config.as_ref());
     let selected_proxy = match proxy_config.as_ref() {
         None => None,
         Some(config) if config.get("source").and_then(Value::as_str) == Some("direct") => None,
         Some(config) => {
-            if crate::server::core::proxies::is_rotate_config(config) {
-                return management_error(400, "添加标准账号不支持轮询代理，请选择直连或一条代理");
-            }
+            // 轮询档直接走静态第一条可用出口做添加期凭证校验 —— 与
+            // `resolve_account_proxy` 的 rotate 分支（取第一条可用）同口径，
+            // 后续转发仍按逐次轮询走（`resolve_account_proxy_rotating`）。
+            // 账号落库的 `proxy_config` 始终存 rotate 原样，只是校验请求用了
+            // 当前第一条出口。轮询档一条候选都不可用时解析必失败，报错与单条
+            // 引用档一致（不会静默直连）。
+            // 注：`proxy_rotate::first_usable` 经 `resolve_account_proxy` 已
+            // 挂在 rotate 分支上，这里只需别把 rotate 直接当成「不支持」。
             let Some(resolution) = resolve_account_proxy(Some(config)) else {
                 return management_error(400, "账号代理未能解析，未回退直连");
             };
             if resolution.error().is_some() {
-                return management_error(400, "账号代理无法解析，请检查所选代理是否存在且已启用；未回退直连");
+                let reason = resolution.error().unwrap_or_default();
+                return management_error(
+                    400,
+                    match proxy_note {
+                        Some(note) => format!("{note}；账号代理仍不可用，未回退直连：{reason}"),
+                        None => format!("账号代理无法解析，请检查所选代理是否存在且已启用；未回退直连（{reason}）"),
+                    },
+                );
             }
             match ResolvedProxy::from_json(&resolution.to_json()) {
                 Ok(Some(proxy)) => Some(proxy),
@@ -208,12 +228,28 @@ async fn add_plugin_account(
         account_source,
         proxy_config.as_ref(),
     ) {
-        Ok((record, proxy_saved)) => ok_json(json!({
-            "account": record,
-            "created": true,
-            "proxySaved": proxy_saved,
-            "list": state.store().list_visible_accounts(),
-        })),
+        Ok((record, proxy_saved)) => {
+            // 新账号刚引用了订阅节点：内核上一轮启动时还不知道它，很可能没有
+            // 监听端口（「未分配端口」就是这么来的）。
+            let mut data = json!({
+                "account": record,
+                "created": true,
+                "proxySaved": proxy_saved,
+                // 自动启用过的条目：给界面一句可读的说明（与 PATCH 那条的 `changes`
+                // 说明同口径），让用户知道「刚选的禁用节点被打开了」
+                "proxyNotice": proxy_note,
+                "list": state.store().list_visible_accounts(),
+            });
+            let reconcile = if proxy_config.as_ref().is_some_and(|config| {
+                config.get("source").and_then(Value::as_str) != Some("direct")
+            }) {
+                super::proxies::reconcile_listeners(state.store())
+            } else {
+                super::proxies::ListenerReconcile::Settled
+            };
+            super::proxies::annotate_listener_reconcile(&mut data, reconcile);
+            ok_json(data)
+        }
         Err(message) => {
             logging::log("[Accounts]", &format!("❌ {message}"));
             management_error(500, &message)
@@ -320,8 +356,18 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
         ("POST", "pool/remove") => super::proxies::pool_remove(&state, &body).await,
         ("POST", "pool/test") => super::proxies::pool_test(&state, &body).await,
         ("POST", "pool/sync-clash") => super::proxies::pool_sync_clash(&state).await,
+        // 只列可用条目（账号侧代理下拉 / 轮询候选）：不同步 Clash、滤掉禁用项。
+        // 单列一条路径而不是给 `pool` 加查询参数 —— 两者的副作用不同（一条会写
+        // 镜像、一条不会），用参数区分会让调用方以为只是换了个视图。
+        ("GET", "pool/usable") => super::proxies::pool_usable(&state).await,
         ("GET", "settings") => super::proxies::settings_get().await,
         ("POST", "settings") => super::proxies::settings_save(&body).await,
+        // 出口冷却（轮询档的「哪条出口现在别用」）：读摘要 + 全清。
+        // 全清是**管理动作**，只需要空 body（见 `clear_rotate_cooldowns`）。
+        ("GET", "rotate/cooldowns") => super::proxies::rotate_cooldowns(&state).await,
+        ("POST", "rotate/clear-cooldowns") => {
+            super::proxies::clear_rotate_cooldowns(&state, &body).await
+        }
         // 已注册路径上的其它方法：Node 的 tryHandleProxies 落到它自己的 404 信封
         _ => management_error(
             404,
@@ -1423,10 +1469,37 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             Err(error) => return store_error(error),
         }
     }
+    // 代理被改到这个新值时，顺手启用它引用的那条池条目（见
+    // `super::proxies::enable_referenced_proxy` 的说明）。
+    // 判据用**写入结果里的变更项**（`apply_patch` 只在值真的变化时才记一条
+    // 「代理 → …」）：一次「原样提交」不该把用户后来手动禁用的条目又拉起来。
+    // 变更列表里的代理说明不算在前面 `balance_changes` 里，所以扫全量。
+    let proxy_patch = patch
+        .get("proxy")
+        .and_then(|value| crate::server::core::proxies::normalize_account_proxy(value).ok().flatten());
     match state.store().update_account(&id, &patch) {
         Ok((account, mut changes)) => {
             changes.extend(balance_changes);
-            // 改代理成功后对账：新引用的补监听器、旧引用失去的回收端口
+            let proxy_changed = changes.iter().any(|item| item.starts_with("代理 → "));
+            if proxy_changed {
+                if let Some(note) = super::proxies::enable_referenced_proxy(proxy_patch.as_ref()) {
+                    changes.push(note);
+                }
+                // 对账在启用之后：账号刚选了这条节点，它可能本来就启用着、但从未
+                // 分配过监听端口（内核上一轮启动时还没人引用它）。那种情况启用那
+                // 一步什么都不会返回，却正是用户接下来撞上「未分配端口」的原因。
+                match super::proxies::reconcile_listeners(state.store()) {
+                    super::proxies::ListenerReconcile::Settled => {}
+                    super::proxies::ListenerReconcile::Requested(missing) => changes.push(format!(
+                        "发现 {missing} 个引用的订阅节点还没有监听端口，已请求内核补建"
+                    )),
+                    // 有缺口但内核关着：如实说出来，别让那句「未分配端口」孤零零挂着
+                    super::proxies::ListenerReconcile::Blocked => changes.push(
+                        "引用的订阅节点还没有监听端口，但代理内核当前未运行 —— 去「网络代理 → 订阅」点「启动内核」后端口才会分配"
+                            .to_string(),
+                    ),
+                }
+            }
             ok_json(json!({
                 "account": account,
                 "changes": changes,

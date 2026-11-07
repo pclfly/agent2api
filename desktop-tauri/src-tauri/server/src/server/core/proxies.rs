@@ -116,10 +116,32 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
             Some(Value::Bool(flag)) => *flag,
             Some(_) => return Err(ProxyConfigError::new("轮询的 all 必须是布尔值")),
         };
+        // ── 失败模式（`failureMode`）：什么时候换下一条出口 ──────────
+        // `smart`（默认）：只在**与出口有关**的失败上换（传输层 / 429+IP 限流
+        //   / 403+地区封锁，判据见 `proxy_rotate::is_egress_failure`）；
+        // `all_errors`：任何失败都换 —— 给「上游回什么都可能是这条出口的锅」
+        //   这类场景（自建前置、企业网关）用。
+        //
+        // 缺键 = `smart`：这是安全的那一侧 —— 把业务错误（模型不存在）也
+        // 当成出口问题会让整个池子被误冷却。
+        let failure_mode = match object.get("failureMode").and_then(Value::as_str) {
+            None => "smart",
+            Some("smart") => "smart",
+            Some("all_errors") => "all_errors",
+            Some(other) => {
+                return Err(ProxyConfigError::new(format!(
+                    "轮询的 failureMode 必须是 smart 或 all_errors（收到 {other}）"
+                )))
+            }
+        };
         if all {
             // 「全部」恒不带 proxyIds：留着它会让「以后池里新增的条目要不要进轮询」
             // 变成一个没人回答的问题（两处状态取谁为准）。归一即收口成唯一形态
-            return Ok(Some(json!({ "source": ROTATE_SOURCE, "all": true })));
+            return Ok(Some(json!({
+                "source": ROTATE_SOURCE,
+                "all": true,
+                "failureMode": failure_mode,
+            })));
         }
         let mut ids: Vec<String> = Vec::new();
         if let Some(items) = object.get("proxyIds") {
@@ -146,6 +168,7 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
             "source": ROTATE_SOURCE,
             "all": false,
             "proxyIds": ids,
+            "failureMode": failure_mode,
         })));
     }
 

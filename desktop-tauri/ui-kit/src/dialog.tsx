@@ -110,6 +110,10 @@ function DialogContent({
       <DialogPrimitive.Popup
         data-slot='dialog-content'
         className={cn(
+          // 居中用「top/left 50% + 负位移」而不是 `inset-0 m-auto`：后者会让
+          // 弹窗在四个方向都被拉伸，`max-h` 一到就撑满整个视口高度，
+          // 内容少的弹窗下面拖出一大片空白（订阅管理里最明显）。
+          // 现在高度由内容决定，超过 max-h 才滚动。
           'fixed top-1/2 left-1/2 z-30 flex max-h-[calc(100vh-48px)] w-[min(620px,calc(100vw-48px))] -translate-x-1/2 -translate-y-1/2 flex-col',
           'overflow-hidden rounded-lg border border-border bg-surface shadow-3 outline-none',
           'transition-[opacity,transform] duration-200 [transition-timing-function:cubic-bezier(.2,.9,.3,1)]',

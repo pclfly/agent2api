@@ -85,6 +85,22 @@ export function accountPatchConfirmed(account: AccountRecord, patch: Record<stri
 }
 
 export async function updateAccountConfirmed(id: string, patch: Record<string, unknown>): Promise<AccountRecord> {
+  const { account } = await updateAccountWithChanges(id, patch)
+  return account
+}
+
+/**
+ * 同 [`updateAccountConfirmed`]，但把后端的 `changes` 一并带出来。
+ *
+ * 变更项里除了「代理 → …」之外还可能有**代理之外**的副作用说明，比如
+ * 「发现 N 个引用的订阅节点还没有监听端口，已请求内核补建」——那些话不写进
+ * 账号记录，只能从响应里带出来，否则用户只看到「保存成功」却不知道为什么
+ * 代理仍然不可用。
+ */
+export async function updateAccountWithChanges(
+  id: string,
+  patch: Record<string, unknown>,
+): Promise<{ account: AccountRecord; changes: string[] }> {
   const bridge = shared().workbuddyDesktop
   if (!bridge?.updateAccount) throw new Error(t('账号更新接口不可用，请重新打开页面'))
   const data = await bridge.updateAccount(id, patch)
@@ -94,7 +110,7 @@ export async function updateAccountConfirmed(id: string, patch: Record<string, u
     || !accountPatchConfirmed(account, patch)) {
     throw new Error(t('账号更新结果未确认，请刷新后核对设置'))
   }
-  return account
+  return { account, changes: Array.isArray(data?.changes) ? data.changes.map(String) : [] }
 }
 
 function batchPatch(payload: BatchAccountsPayload): Record<string, unknown> {

@@ -88,6 +88,7 @@
   "活跃": "",
   "活跃天数": "Dias ativos",
   "活跃热力图": "Mapa de calor de atividade",
+  "积分 {value}": "Crédito {value}",
   "管理": "",
   "累计请求 {n} 条": "{n} requisições no total",
   "结束日期": "Data final",
@@ -96,6 +97,7 @@
   "统计概览": "Visão geral",
   "缓存命中率": "Taxa de acerto de cache",
   "自定义区间": "Período personalizado",
+  "请求日志只展示仍保留的明细；清理明细不会减少日报中的历史用量。": "Os logs exibem apenas detalhes preservados; apagá-los não reduz o uso histórico nos relatórios diários.",
   "读取报表失败：{error}": "Falha ao ler o relatório: {error}",
   "账号分布": "",
   "账号用量": "",
@@ -114,6 +116,8 @@
   "还有 {n} 个待签": "",
   "还没有添加账号": "",
   "还没有请求记录": "",
-  "请求日志只展示仍保留的明细；清理明细不会减少日报中的历史用量。": "Os logs exibem apenas detalhes preservados; apagá-los não reduz o uso histórico nos relatórios diários.",
-  "连续天数": ""
+  "连续天数": "",
+  "（{measured}/{successful} 条有读数）": " ({measured}/{successful} requisições com leitura)",
+  "（含预估值）": " (inclui estimativa)",
+  "积分消耗": "Créditos consumidos"
 }

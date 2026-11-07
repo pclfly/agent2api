@@ -385,6 +385,30 @@ impl ServerState {
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
         core::proxy_pool::install(db.clone());
         core::proxy_settings::install(db.clone());
+        // 出口冷却表（轮询档的「哪条出口现在别用」）：必须在 `proxy_pool` 之后
+        // —— 它复用同一个库句柄；也必须在任何转发之前，否则重启后的第一批
+        // 请求会去撞那些还没恢复的出口。读不回来只影响「重启不丢」这一点，
+        // 冷却本身仍在内存里生效（见 `proxy_rotate::health` 的模块头）。
+        core::proxy_rotate::health::restore();
+        // 订阅存储（「订阅管理」维护的订阅链接）：同一个 `Db`（与 proxyPool
+        // 同一形态）。位置只要求早于任何一次 `/api/subscriptions*` 请求。
+        core::subscriptions::install(db.clone());
+        // 订阅内核（mihomo sidecar）的命令 worker：单条队列串行消费内核操作
+        // （下载 / 重建配置 / 重启 / 停止），见 `core::sub_kernel` 的模块头。
+        core::sub_kernel::spawn_worker();
+        // ── 出口就绪检查（启动期的第一优先级）─────────────────────
+        // 账号绑定的订阅节点端口是内核**上一轮**分配的，这一刻不保证有人在听。
+        // 三种情况都会让账号失去出口：内核崩了 / 被手动停过 / 机器重启后没拉起。
+        // 而代理解析失败的兜底是**回退直连** —— 那等于把账号真实 IP 暴露给上游。
+        //
+        // 所以启动时先探一遍端口：没在听就拉起内核并等它就绪（最长 25 秒）。
+        // 这段时间 `/v1` 返回 503（面板照常可用，用户能进来看状态、改订阅）。
+        //
+        // **未安装内核时不自动下载**：二进制 20-40MB，下载必须有用户的手势
+        // （界面上的「下载内核」按钮），启动时静默拉网不合适 —— 那种情形
+        // 就绪检查会直接进 Degraded 并在日志里说明原因。
+        // 就绪检查必须等账号库接线之后才能跑（它要读「哪些池条目被账号引用」），
+        // 见下面 `install_store` 之后的 spawn —— 提前跑会因读不到账号而误判就绪。
         // 云同步（设置页「数据 → 云同步」）：设置与状态落在 kv 的保留键
         // `cloudSync`，装库句柄即可。自动同步的工作线程在下面 spawn ——
         // 必须先装句柄再起线程，否则第一轮读设置会拿到默认值。
@@ -477,6 +501,38 @@ impl ServerState {
         // trait 方法，签名里只有一个插件不用的 &AccountStore）。装一个进程级
         // 句柄，见 `account_store::plugin_accounts::shared`。
         core::account_store::plugin_accounts::install_shared(store.clone());
+        // 订阅内核要读账号的 proxy 引用（决定给哪些节点开监听器），把账号库
+        // 的轻量句柄给它。位置：账号库已就绪（上一行），内核 worker 已起。
+        core::sub_kernel::install_store(Some(store.clone()));
+        // ── 出口就绪检查（必须在这里之后）───────────────────────────
+        // 它要读 `referenced_pool_ids()` 才知道「哪些账号绑了订阅节点」。
+        // 早于 `install_store` 跑会读不到账号 → 误判「无需内核」→ 直接放行，
+        // 于是端口失效的账号在第一波请求里回退直连（实测踩过）。
+        crate::spawn_task(async move {
+            core::egress_ready::ensure_ready().await;
+        });
+        if core::subscriptions::should_autostart() {
+            logging::console_line("[Subscription]", "检测到已安装的代理内核与启用的订阅，就绪检查将自动拉起");
+        }
+        // ── 启动时把内核拉起来（已安装 + 有启用订阅，但没在跑）──────────
+        //
+        // 与上面那次 `ensure_ready` 的分工：那条只在**有账号引用订阅节点**时
+        // 才动作（`need > 0`），没账号引用时它会直接放行 —— 于是「装了内核、
+        // 有订阅、但还没人引用节点」的机器启动后内核一直是停的，用户进「网络
+        // 代理」页看到「内核已安装，未运行」，得自己点一下启动。
+        //
+        // 这里的判据只有两条，都必要：
+        //   · `installed()`：没下载过内核就没什么可拉的（别去触发下载）；
+        //   · 非 `is_manually_halted()`：用户按过「关闭内核」就不许悄悄拉起
+        //     —— 手动关闭是个显式闩，重启程序不该把它推翻。
+        //
+        // 投 `request_restart` 而不是别的：它重建配置（provider + 监听器），
+        // 正是冷启动要的那一步。内核本来就在跑时它是幂等的重启。
+        if core::subscriptions::should_autostart() && !core::sub_kernel::is_manually_halted() {
+            let providers = core::subscriptions::enabled_provider_inputs();
+            core::sub_kernel::request_restart(providers);
+            logging::console_line("[Subscription]", "代理内核已安装但未运行，正在自动启动");
+        }
         let auth = AuthService::new(store.clone());
         let login = LoginService::new(store.clone());
         let billing = BillingService::new(auth.clone());

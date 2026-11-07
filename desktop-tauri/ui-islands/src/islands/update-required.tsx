@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Alert, Button, Dialog, DialogContent, DialogHeader, DialogTitle, DialogBody, DialogFooter } from '@ui'
 import { callJson } from './assistant-state'
-import { shared, type UpdateInfo } from './update-shared'
+import { shared, updateDownloadEnabled, type UpdateInfo } from './update-shared'
 import { t } from '../i18n'
 
 type PolicyResult = Pick<UpdateInfo, 'forceUpdate' | 'currentVersion' | 'repository'>
@@ -29,6 +29,12 @@ function RequiredUpdate() {
   const required = policy?.forceUpdate
   const active = required?.required === true
   const [updating, setUpdating] = useState(false)
+  // 下载入口被本地策略关掉时，这道门不该出现：它唯一的正路是「立即更新」→
+  // openAndDownload，而那条路现在被 update-panel 的 downloadOrCancel 拦住了。
+  // 留着这层全屏、无关闭按钮的遮挡，等于把用户锁在一个点不动的对话框前 ——
+  // 比「知道有新版本但自己决定何时升」更糟。策略是「不主动替用户起下载」，
+  // 不是「把人挡在门外」，所以这里整道门让路（强制策略仍留在后端与面板文案里）。
+  if (!updateDownloadEnabled()) return null
   if (!active || (updating && onUpdatePage)) return null
   return <Dialog open onOpenChange={() => {}}>
     <DialogContent showCloseButton={false}>

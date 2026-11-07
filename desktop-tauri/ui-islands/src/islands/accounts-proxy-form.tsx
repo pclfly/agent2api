@@ -8,11 +8,13 @@ import {
 } from '@ui'
 import { t } from '../i18n'
 import {
-  errorMessage, esc, poolItemLabel, shared, toast,
+  errorMessage, esc, poolItemLabel, poolItemSelectable, shared, toast,
   type AccountRecord, type PoolItem,
 } from './accounts-shared'
 import { proxyPoolOptions } from './accounts-data'
 import { DIALOG_SEG_CLASS } from './dialog-segmented'
+// 轮询档的形状读写（与后端归一逐字段对齐；纯函数，可被 npm test 覆盖）
+import { rotateDraftOf, rotatePayloadOf } from './proxy-rotate-config'
 import type { ClashProxySnapshot } from '../../../ui-shared/clash-proxy'
 
 /** 每条候选都会真实出网，一轮最多测 8 条。 */
@@ -21,7 +23,7 @@ const ROTATE_TEST_LIMIT = 8
 export type ProxyPayload =
   | null
   | { source: 'pool'; proxyId: string }
-  | { source: 'rotate'; all: boolean; proxyIds?: string[] }
+  | { source: 'rotate'; all: boolean; proxyIds?: string[]; failureMode?: 'smart' | 'all_errors' }
   | { source: 'clash'; listenerUid: string }
   | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string }
 
@@ -34,6 +36,13 @@ export type ProxyDraft = {
   rotateAll: boolean
   /** 轮询档：指定要轮询的池条目 id（rotateAll 为 true 时不用） */
   rotateIds: string[]
+  /**
+   * 轮询档：什么失败才换出口。
+   *   · `smart`（缺省）—— 只换与出口有关的（网络失败、403 地区封锁、按 IP 计的
+   *     429）；业务错误（模型不存在、参数不对）换出口照样失败，不换；
+   *   · `all_errors` —— 任何上游错误都换。
+   */
+  failureMode: 'smart' | 'all_errors'
   protocol: 'http' | 'socks5'
   host: string
   port: string
@@ -52,9 +61,8 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
         : source === 'clash' ? 'clash' : source === 'custom' ? 'custom' : source === 'subscription' ? 'retired' : 'none',
     listenerUid: source === 'clash' ? String(config?.listenerUid || '') : '',
     proxyId: source === 'pool' ? String(config?.proxyId || '') : '',
-    // `all` 缺键按「全部」读（后端同一个口径：那是这一档的默认语义）
-    rotateAll: rotate ? config?.all !== false : true,
-    rotateIds: rotate && Array.isArray(config?.proxyIds) ? config.proxyIds.map(String) : [],
+    // 轮询三件套（全部 / 指定 id / 切换策略）的读写都在 proxy-rotate-config
+    ...rotateDraftOf(rotate ? config : null),
     protocol: config?.protocol === 'socks5' ? 'socks5' : 'http',
     host: config?.host || '',
     port: config?.port === undefined || config?.port === null ? '' : String(config.port),
@@ -76,10 +84,10 @@ export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
     return { source: 'pool', proxyId: draft.proxyId }
   }
   if (draft.mode === 'rotate') {
-    // 「全部」不写 proxyIds：池里以后新增的出口自动进轮询（后端归一也是这个形状）
-    if (draft.rotateAll) return { source: 'rotate', all: true }
-    if (!draft.rotateIds.length) throw new Error(t('轮询至少要选择一条代理（或改选「全部」）'))
-    return { source: 'rotate', all: false, proxyIds: [...draft.rotateIds] }
+    // 形状与后端归一逐字段对齐（见 proxy-rotate-config 的模块头）
+    const payload = rotatePayloadOf(draft)
+    if (!payload) throw new Error(t('轮询至少要选择一条代理（或改选「全部」）'))
+    return payload
   }
   const host = draft.host.trim()
   const port = Number(draft.port)
@@ -108,7 +116,7 @@ export function ProxyForm({
   draft: ProxyDraft
   onChange: (next: ProxyDraft) => void
   idPrefix: string
-  /** 是否给出「轮询」档（只有 OpenCode Zen 账号为真，见函数说明） */
+  /** 是否给出「轮询」档（默认不给：调用方要显式开启，见各调用点的说明） */
   allowRotate?: boolean
 }) {
   const [testing, setTesting] = React.useState(false)
@@ -152,6 +160,10 @@ export function ProxyForm({
   /**
    * 轮询档当前会用到哪些条目（与后端 `proxy_rotate::candidate_ids` 同口径：
    * 「全部」= 池里启用的条目，顺序即池序；指定档 = 表单里选的那些）。
+   *
+   * 池清单本身来自 `/api/proxies/pool/usable`（后端已滤掉禁用项），这里的
+   * `enabled !== false` 只是对旧壳回落路径的兜底 —— 老壳没有那条接口时拿到
+   * 的是整份列表，禁用项会出现在里面。
    */
   function rotateCandidateIds(): string[] {
     if (draft.rotateAll) {
@@ -269,11 +281,12 @@ export function ProxyForm({
         options={[
           { value: 'none', label: t('无代理（直连）') },
           { value: 'pool', label: t('已保存的代理') },
-          // 轮询档只对 OpenCode Zen 出现（见 allowRotate 的说明）
+          // 轮询档的可见性由调用方决定（账号设置 / 批量弹窗都为真；
+          // 「登录出网代理」那种一次性链路不给）
           ...(allowRotate ? [{
             value: 'rotate' as const,
             label: t('轮询（换 IP）'),
-            title: t('逐请求轮换出口（换 IP）：OpenCode Zen 免费档按 IP 限流，单个 IP 的额度用完会对它一律 429'),
+            title: t('逐请求轮换出口（换 IP）：上游按 IP 限流时，换一条出口往往就能过；切到哪条受故障策略与出口冷却约束'),
           }] : []),
           // Clash Verge 档已下线：只有现存配置还停在它上面时才补出这一项，
           // 让用户能看见当前值、并有机会改成别的（补出来就没法切走了）
@@ -299,10 +312,14 @@ export function ProxyForm({
               </SelectTrigger>
               <SelectContent>
                 {(pool ?? []).map(item => (
-                  // 已禁用的条目置灰不可选：选它保存后解析必然失败（转发回退直连），
-                  // 用户只会看到「代理已禁用」。要启用请去「网络代理」页。
-                  // 当前值恰好是禁用项时仍正常显示（触发器读的是同一份 label）
-                  <SelectItem key={item.id} value={item.id} disabled={item.enabled === false}>
+                  // 本页禁用的条目**根本不在列表里**：这份选项来自
+                  // `/api/proxies/pool/usable`（后端滤掉禁用项，见
+                  // `api::proxies::pool_usable`）—— 禁用的出口不该被选成
+                  // 「给这个账号用的那条」。仍可能出现的不可选项只有两类：
+                  // Clash Verge 里停用的监听器、以及订阅里已移除的节点 ——
+                  // 那两类本页开了也不生效，置灰但列出来并写明原因（凭空消失
+                  // 会让用户以为池里没这条）。
+                  <SelectItem key={item.id} value={item.id} disabled={!poolItemSelectable(item)}>
                     {poolItemLabel(item)}
                   </SelectItem>
                 ))}
@@ -316,7 +333,7 @@ export function ProxyForm({
               : pool === null
                 ? t('正在读取代理列表…')
                 : pool.length
-                  ? t('地址与端口由「网络代理」页管理：那边改一次、测一次，所有引用它的账号一起生效')
+                  ? t('地址与端口由「网络代理」页管理：那边改一次、测一次，所有引用它的账号一起生效；已禁用的节点不出现在这里')
                   : t('「网络代理」页还没有出口 —— 去那里添加手动地址或同步 Clash Verge 的端点')}
           </div>
         </div>
@@ -324,6 +341,30 @@ export function ProxyForm({
 
       {draft.mode === 'rotate' ? (
         <div className='mt-3'>
+          {/* 切换策略排在最前：它决定「什么失败才算该换」，读这一档的人
+              第一个问题就是这个。默认 smart —— 业务错误换出口照样失败，
+              给它记冷却只会把好出口白白冻住。 */}
+          <Field orientation='horizontal' className='field-row mb-2.5'>
+            <FieldLabel htmlFor={`${idPrefix}-failure-mode`}>{t('切换策略')}</FieldLabel>
+            <Select value={draft.failureMode}
+              onValueChange={value => set({ failureMode: value === 'all_errors' ? 'all_errors' : 'smart' })}>
+              <SelectTrigger id={`${idPrefix}-failure-mode`} className='min-w-[220px]'
+                aria-describedby={`${idPrefix}-failure-mode-help`}>
+                <SelectValue>
+                  {draft.failureMode === 'all_errors' ? t('所有上游错误都切换') : t('智能切换（推荐）')}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value='smart'>{t('智能切换（推荐）')}</SelectItem>
+                <SelectItem value='all_errors'>{t('所有上游错误都切换')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <p id={`${idPrefix}-failure-mode-help`} className='detail mb-2.5'>
+            {draft.failureMode === 'all_errors'
+              ? t('激进模式：任何 HTTP 4xx／5xx 上游错误都算一次切换候选，仍受尝试预算与出口冷却约束，不保证遍历全部节点；已经成功响应过的流不会被重放。')
+              : t('智能模式：确定性的参数或鉴权错误不遍历节点；网络失败与 HTTP 500 有限尝试，HTTP 502–504 可切换，HTTP 403 切换节点；普通 HTTP 429（含 rate_limit）换出口，明确余额或日／月配额耗尽的 429 仍按账号处理；Retry-After 冷却原出口，可立即尝试其他出口；仍受尝试预算与出口冷却约束。')}
+          </p>
           {/* 「全部」是默认档：勾上 = 池里每个启用的出口轮流使用（新加的出口
               自动进轮询，不必回来改这条账号）。取消勾选才出现多选。
               这一行刻意**不走 .field-row**：账号设置弹窗里它的直接 label 子元素
@@ -341,18 +382,26 @@ export function ProxyForm({
               {t('「网络代理」页里每个启用的出口轮流使用；之后新加的出口自动加入')}
             </span>
           </div>
+          {/* 与后端 `proxy_rotate::candidate_ids` 同口径的实时读数：改完范围
+              马上能看到「实际会参与的有几条」，不必切出去看代理页 */}
+          <p className='detail mt-1.5'>
+            {pool === null
+              ? t('正在读取代理列表…')
+              : t('已启用候选 {n} 个', { n: rotateCandidateIds().length })}
+          </p>
           {!draft.rotateAll ? (
             <Field orientation='horizontal' className='field-row mt-2.5'>
               <FieldLabel htmlFor={`${idPrefix}-rotate-exits`}>{t('轮询的代理')}</FieldLabel>
               <MultiSelect id={`${idPrefix}-rotate-exits`}
                 value={draft.rotateIds}
                 onValueChange={values => set({ rotateIds: values.map(String) })}
-                // 禁用项置灰：后端轮询取用时会跳过它们（`candidate_ids` 只留启用项），
-                // 列出来能选等于让用户白挑一条永不生效的出口
+                // 候选来自 `/api/proxies/pool/usable`：禁用项已被后端滤掉，
+                // 不会出现在轮询候选里。仍可能出现的不可选项只有「Clash 侧停用」
+                // 与「订阅里已移除」两类 —— 那两类本页开了也不生效，置灰但列出。
                 options={(pool ?? []).map(item => ({
                   value: item.id,
                   label: poolItemLabel(item),
-                  disabled: item.enabled === false,
+                  disabled: !poolItemSelectable(item),
                 }))}
                 placeholder={t('选择要轮询的代理（可多选）')}
                 aria-label={t('轮询的代理')} />

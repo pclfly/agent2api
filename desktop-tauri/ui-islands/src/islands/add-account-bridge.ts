@@ -13,6 +13,7 @@
 
 import { isSuspendedProvider } from '../../../ui-shared/provider-availability'
 import { t } from '../i18n'
+import { refreshProxyPool } from './proxy-pool-cache'
 
 /* ─── window 上的共享桥（窄类型 + 转型读取）────────────── */
 
@@ -65,6 +66,8 @@ export type LoginResult = {
   account?: AccountRecord
   session?: Record<string, unknown>
   proxySaved?: boolean
+  /** 新增账号时自动启用过的池条目说明（后端 `proxyNotice`） */
+  proxyNotice?: string
   warning?: string
   instructions?: string
 }
@@ -354,6 +357,9 @@ export function normalizeLoginResult(value: unknown): LoginResult {
   return {
     ok: true, canceled: false, account, warning: text('warning'), instructions: text('instructions'),
     ...(typeof proxySaved === 'boolean' ? { proxySaved } : {}),
+    // 后端在新增账号时顺手启用过池条目（用户选了一条被禁用的）：把这句话带出去，
+    // 否则界面上只看到「账号已添加」，代理池那边却被静默改了状态。
+    ...(text('proxyNotice') ? { proxyNotice: text('proxyNotice') } : {}),
     // 会话只保留公开标识字段，不搬整个响应。
     session: summary ? Object.fromEntries(['accountUid', 'accountId', 'nickname', 'edition', 'provider']
       .filter(key => typeof summary[key] === 'string').map(key => [key, summary[key]])) : undefined,
@@ -420,10 +426,16 @@ export function closeAddModals(): void {
 }
 
 /** 添加成功后统一收尾：关窗、刷新列表、提示 */
-export async function afterAdd(name: string, label: string): Promise<void> {
+export async function afterAdd(name: string, label: string, notice?: string): Promise<void> {
   closeAddModals()
   await shared().wbApp?.refresh?.()
   toast(t('✅ {label}账号已添加{name}', { label, name: name ? `：${name}` : '' }))
+  // 新增时顺手启用了被引用的池条目（用户选了一条被禁用的）：池缓存还停在
+  // 「已禁用」，不重读的话「网络代理」页会继续显示旧状态
+  if (notice) {
+    toast(notice)
+    void refreshProxyPool()
+  }
 }
 
 /* ─── 表单草稿（非受控输入的「关掉再打开还在」）──────────────

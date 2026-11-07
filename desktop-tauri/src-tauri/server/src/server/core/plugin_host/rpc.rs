@@ -1940,12 +1940,60 @@ fn proxy_of(account: &Value) -> Value {
     if proxy.is_null() {
         return Value::Null;
     }
+    // 两跳（`frontProxy` + `proxy`）：协议里的 `WireProxy` 只能表达**一跳**，
+    // 插件也没有建隧道的通道。所以由宿主先在本机起中转，把中转端点当普通
+    // 单跳代理下发给插件 —— 插件侧一个字节都不用改，出口语义与内置家一致。
+    //
+    // 建链失败一律返回 Null（= 跟随默认出口）而不是让插件直连：与下面
+    // 「代理数据坏了」同一口径，可用性优先，真实原因在账号页的出口测试里看。
+    if let Some(wire) = chained_proxy(account, proxy) {
+        return wire;
+    }
     match serde_json::from_value::<proto::WireProxy>(proxy.clone()) {
         Ok(wire) => serde_json::to_value(wire).unwrap_or(Value::Null),
         // 代理数据坏了：按「跟随默认出口」处理（与网关 `ResolvedProxy::from_json`
         // 的第三态口径一致 —— 可用性优先，出口测试才如实报错）。
         Err(_) => Value::Null,
     }
+}
+
+/// 前置跳存在时，建两跳中转并返回「中转端点」的线上形态。
+///
+/// 返回 `None` = 没有前置跳（调用方走单跳原路），或前置跳解析/建链失败
+/// （同样回到 `None`，由调用方的单跳分支处理 —— 但此时 `proxy` 本身可能
+/// 仍可用，不能因为前置跳坏了就整条链路不通）。
+///
+/// ── `proxy` 的两种形状都要认（第二跳）───────────────────────────
+/// `proxy_of` 拿到的 `account.proxy` 是 `describe_account_proxy` 的**展示
+/// 形态**（`{source, label, error, config:{host,port,…}}`），原始配置在
+/// `.config` 里；`ResolvedProxy::from_json` 读的是**扁平形态**（顶层
+/// `host`/`port`）。只喂展示形态会得到 `Err("代理配置缺少主机地址")`，
+/// 于是这里静默回落 `None` → 单跳：账号页配好了两跳，日志里却只有第二跳的
+/// CONNECT（实测踩到）。所以这里与 `resolve_front_proxy` 同一条纪律 ——
+/// `config` 是对象就用它，否则用整个对象。
+fn chained_proxy(account: &Value, proxy: &Value) -> Option<Value> {
+    let front = account.get("frontProxy").filter(|value| !value.is_null())?;
+    let config = front.get("config").filter(|value| !value.is_null())?;
+    let back_config = proxy
+        .get("config")
+        .filter(|value| value.is_object())
+        .unwrap_or(proxy);
+    let back = ResolvedProxy::from_json(back_config).ok()??;
+    let normalized = crate::server::core::proxies::normalize_account_proxy(config).ok()??;
+    let front = match crate::server::core::proxies::resolve_account_proxy(Some(&normalized)) {
+        Some(crate::server::core::proxies::ProxyResolution::Resolved(proxy)) => proxy,
+        _ => return None,
+    };
+    let (_, local) = crate::server::core::egress::client_for_route(Some(&back), Some(&front)).ok()?;
+    let local = local?;
+    serde_json::to_value(proto::WireProxy {
+        protocol: local.protocol,
+        host: local.host,
+        port: local.port,
+        username: local.username,
+        password: local.password,
+    })
+    .ok()
 }
 
 /// 把客户端入站头转成协议里的 `BTreeMap<String, String>`。

@@ -35,6 +35,10 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
         .trim()
         .to_string();
 
+    // 批量改代理后要不要去启用它引用的池条目，得看**写入结果**而不是请求内容：
+    // 这条批量只携带 proxy，所以「有一条账号记下了变更」就等价于「代理真的变了」
+    // （全部被准入校验拦下时一条变更都不会有，那种情况不该去动池）。
+    let mut proxy_target: Option<Value> = None;
     let result = match action.as_str() {
         "remove" => state.store().batch_remove(&ids),
         "enable" | "disable" => {
@@ -46,6 +50,8 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
             let Some(target) = payload.get("proxy") else {
                 return management_error(400, "批量修改代理时缺少 proxy 字段");
             };
+            proxy_target = crate::server::core::proxies::normalize_account_proxy(target)
+                .unwrap_or(None);
             state.store().batch_update(&ids, &json!({ "proxy": target }))
         }
         "concurrency" => {
@@ -97,6 +103,37 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
             if let Some(object) = value.as_object() {
                 for (key, item) in object {
                     merged.insert(key.clone(), item.clone());
+                }
+            }
+            // 批量改代理成功后才动池条目：写失败时不该把节点悄悄打开。
+            // 写进 `autoEnabledProxy`，与单账号那条的 `changes` 说明同口径。
+            if let Some(target) = proxy_target {
+                let touched = value
+                    .get("ok")
+                    .and_then(Value::as_array)
+                    .map(|items| items.iter().any(|item| {
+                        item.get("changes")
+                            .and_then(Value::as_array)
+                            .is_some_and(|changes| !changes.is_empty())
+                    }))
+                    .unwrap_or(false);
+                if touched {
+                    if let Some(note) = super::proxies::enable_referenced_proxy(Some(&target)) {
+                        crate::server::logging::log(
+                            "[Accounts]",
+                            &format!("批量改代理：{note}"),
+                        );
+                        merged.insert("autoEnabledProxy".to_string(), Value::String(note));
+                    }
+                    // 这些账号刚引用的订阅节点可能从没分配过监听端口（内核上一轮
+                    // 启动时还没人引用它）—— 那种情况启用那一步没有可做的，
+                    // 但转发仍会报「未分配端口」，所以每次改代理都对一次账。
+                    let mut body = Value::Object(merged);
+                    super::proxies::annotate_listener_reconcile(
+                        &mut body,
+                        super::proxies::reconcile_listeners(state.store()),
+                    );
+                    return ok_json(body);
                 }
             }
             ok_json(Value::Object(merged))

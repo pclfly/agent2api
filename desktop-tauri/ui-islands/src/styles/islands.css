@@ -6,6 +6,7 @@
 @import '../../../ui-kit/styles/request-status.css';
 @import '../../../ui-shared/provider-docs.css';
 @import '../../../ui/css/page-checkin-schedule.css';
+@import './proxies-sub.css';
 
 @source '../../../ui-kit/src';
 @source '../../../ui-shared';

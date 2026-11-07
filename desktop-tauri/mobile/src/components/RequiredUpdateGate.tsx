@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Alert, Button, Dialog, DialogContent, DialogHeader, DialogTitle, DialogBody, DialogFooter } from '@ui'
 import { apiCall } from '../api/client'
 import type { ForceUpdatePolicy } from '../../../ui-shared/updates'
+import { updateDownloadEnabled } from '../../../ui-shared/updates'
 import { store, useStore } from '../state/store'
 import { APP_VERSION } from '../lib/appUpdate'
 import { t } from '../i18n'
@@ -22,6 +23,11 @@ export function RequiredUpdateGate() {
     const timer = setInterval(load, 60_000)
     return () => { disposed = true; clearInterval(timer) }
   }, [state.serverRevision, state.packaged, state.server])
+  // 下载入口被本地分发策略关掉时不拦人：这道门的唯一出口是「立即更新」→ 设置页，
+  // 而那一页的下载按钮已经收掉（见 AppUpdatePanel）。留着它等于用一层无关闭按钮的
+  // 全屏遮挡把人锁在门外，比「知道有新版本、自己决定何时升」更糟。策略是不替用户
+  // 起下载，不是把人挡在门外 —— 与桌面端 update-required.tsx 同一口径。
+  if (!updateDownloadEnabled()) return null
   if (!policy?.required || (updating && state.route.screen === 'settings')) return null
   return <Dialog open onOpenChange={() => {}}>
     <DialogContent showCloseButton={false}>

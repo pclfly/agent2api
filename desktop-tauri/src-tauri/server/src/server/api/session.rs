@@ -375,6 +375,11 @@ fn checked_login_proxy(
     if crate::server::core::proxies::is_rotate_config(&config) {
         return Err(GatewayError::bad_request("登录代理不支持轮询出网，请选择一条已保存的代理"));
     }
+    // 登录也要出网，同样遵循「指定即启用」：用户在这个表单里选了一条被本页
+    // 禁用的条目，等于说「现在要用它」—— 不先启用的话下面必然报「已禁用」，
+    // 而登录这条链路没法只落配置稍后重试（一次登录就是一次真实请求）。
+    // 与账号写代理同一条入口（`api::proxies::enable_referenced_proxy`）。
+    super::proxies::enable_referenced_proxy(Some(&config));
     let Some(resolution) = resolve_account_proxy(Some(&config)) else {
         return Err(GatewayError::bad_request("所选登录代理未能解析，已拒绝回退默认出口"));
     };

@@ -338,7 +338,7 @@ pub fn is_reserved(key: &str) -> bool {
 /// 请求日志新增「积分」列读它。与 token 四列刻意不同：这一列**可空 REAL** ——
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -897,6 +897,31 @@ const V23_SCHEMA: &str = "
 ALTER TABLE requests ADD COLUMN credit REAL;
 ";
 
+/// 版本 24：requests 补「积分来源」一列（`reported` / `estimate`）。
+///
+/// ── 与 v23 的差别：这一列**不能**直接 ALTER ─────────────────
+/// 本地分支在 v17 时代就手工加过同名列（当时的本地 schema 也走到 17），
+/// 存量库打开时这一列往往已经存在。裸 `ALTER TABLE ... ADD COLUMN` 会报
+/// `duplicate column name`，而迁移器是**版本号单调推进**的 —— 报错就等于
+/// 进程起不来（v23 的 `credit` 列踩过同一个坑，见 B0 桥接记录）。
+///
+/// 所以这里先查 `pragma_table_info`，列已在就只补默认值，不重复建列。
+fn apply_v24(conn: &Connection) -> rusqlite::Result<()> {
+    // 直接查 pragma_table_info：本文件没有 `has_column` 辅助函数（旧版有），
+    // 而这里只需要「这一列在不在」一个答案。
+    let existing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name = 'credit_source'",
+        [],
+        |row| row.get(0),
+    )?;
+    if existing == 0 {
+        conn.execute_batch(
+            "ALTER TABLE requests ADD COLUMN credit_source TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    Ok(())
+}
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// **库版本高于本程序时返回 `Err` 拒绝打开**（v14 起有意反转的一条既有决定，
@@ -1072,6 +1097,8 @@ fn apply_version(
         22 => reset_model_refresh_cooldown(conn),
         // v23：requests 补「积分消耗」一列（请求日志的积分列，见 V23_SCHEMA）
         23 => conn.execute_batch(V23_SCHEMA),
+        // v24：积分来源列（**带列存在判断**：本地历史库可能已经手工加过）
+        24 => apply_v24(conn),
         _ => Ok(()),
     }
 }

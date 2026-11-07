@@ -7,7 +7,7 @@ import { bindingReasoningLevel, modelReasoning } from './models-reasoning'
 import { testBlockReason, type ModelTestTarget } from './model-test-dialog'
 import {
   BOOLEAN_KEYS, CAPABILITY_LABELS, capabilitiesOf, capabilityState, capabilityTip, capSourceOf,
-  exactTokens, formatTokens, normalizeOverrides, type CapabilityKey,
+  exactTokens, formatTokens, normalizeOverrides, reasoningLevelsOf, type CapabilityKey,
 } from './model-capability'
 import {
   bindingKeyOf, bindingsOf, enabledBindingConflicts, esc, formatTime, getSnapshot, levelOf, models,
@@ -315,7 +315,7 @@ export function ModelCell({ columns, model, selection, togglePick, setTestTarget
           const source = capSourceOf(model, key)
           return (
             <span key={key} className={cn('cap-dot', state, source === 'modelsdev' && 'filled', overridden && 'marked')}
-              title={capabilityTip(key, value, overridden, source)}>
+              title={capabilityTip(key, value, overridden, source, key === 'supportsReasoning' ? reasoningLevelsOf(model) : null)}>
               {CAP_ICON[key]}
               {overridden ? <i className='cap-mark' /> : null}
             </span>

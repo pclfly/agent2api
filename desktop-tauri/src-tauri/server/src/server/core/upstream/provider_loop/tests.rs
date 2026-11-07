@@ -38,6 +38,8 @@ async fn mock_upstream(
             proxy: None,
             // 测试替身按默认能力位（false = 直连），与生产里不带这一步的家同款
             system_proxy_when_unset: false,
+            // 测试不走两跳（前置跳的存在性由 `validate_account_route` 管）
+            front_proxy: None,
         },
         hits,
         task,
@@ -188,53 +190,43 @@ fn stateful_quota_bookkeeping_ignores_non_quota_classes() {
     assert_eq!(rotate::account_limit_reset_at(&service, &id, "m-fatal"), 0, "非限额分类不该落冷却");
 }
 
+/// ── 这一组用例的归属（迁移后的口径）───────────────────────────
+///
+/// 原先有两条用例钉的是**宿主内置 CodeArts 适配器**的会话式额度分类
+/// （`adapter_for(ProviderKind::CodeArts).classify_conversation_error`）。
+/// CodeArts 的实现已整体搬进提供商插件：宿主侧 `adapter_for(CodeArts)` 现在是
+/// `missing_plugin` 的占位实现，它按设计**不认**任何厂商专属文案 —— 所以那两条
+/// 用例在迁移后必然红，红的不是实现而是断言对象。
+///
+/// 现在钉的是**宿主侧契约**：插件会把 `{reset_at, status}` 原样交给
+/// `mark_conversation_limited`，宿主必须一字不改落库。厂商侧的
+/// 「认不认 insufficient quota」由插件的单测负责（`codearts/adapter.rs`）。
 #[test]
-fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
-    use crate::server::errors::GatewayError;
-
+fn quota_limited_with_a_reset_point_is_stored_verbatim() {
     let (_dir, service, id) = temp_service();
-    // 生产库里那条真实文案（HTTP 200 的 SSE 里折出 403，首包门送进会话式分支）
-    let error = GatewayError::with_status(403, "上游报告 InferHub.4291.200：insufficient quota");
-    let class = adapter_for(ProviderKind::CodeArts).classify_conversation_error(&error);
-    let UpstreamErrorClass::QuotaLimited { reset_at: Some(reset_at), .. } = &class else {
-        panic!("福利池耗尽的文案应分类为带恢复时刻的 QuotaLimited，实际 {class:?}");
+    // 插件侧算出的日池重置点：下一个北京零点（这里给一个显式的、非兜底的值）
+    let now = logging::now_ms();
+    let reset_at = now + 3 * 60 * 60 * 1000;
+    let message = "上游报告 InferHub.4291.200：insufficient quota";
+    let class = UpstreamErrorClass::QuotaLimited {
+        reset_at: Some(reset_at),
+        message: message.to_string(),
+        upstream_code: Some(4291200),
+        status: 403,
     };
-    mark_conversation_limited(&service, &id, &single("glm-5.3-flash"), &class, &error.message);
-
+    mark_conversation_limited(&service, &id, &single("glm-5.3-flash"), &class, message);
     let stored = rotate::account_limit_reset_at(&service, &id, "glm-5.3-flash");
-    assert_eq!(stored, *reset_at, "落库的恢复时刻必须是适配器算出的日池重置点");
-    // ── 断言「是下一个北京零点」，而不是「距现在 > 10 分钟」（2026-10-13 修）──
-    //
-    // 原断言写的是 `minutes > 10`，本意是「不是 10 分钟兜底常量」；但它有个
-    // 时变缺陷：日池重置点就是**下一个北京零点**，于是每天 23:50–00:00 这十分钟
-    // 里「距零点」天然小于 10 分钟，用例必然变红（实测 2026-10-13 23:49 撞上）。
-    // 那是测试写法的问题，不是实现的 —— 与兜底常量无关的失败被报成了兜底。
-    //
-    // 改成直接钉住真正的判据：恢复时刻必须落在**当天或次日的北京零点**上，
-    // 且距现在不超过 24 小时（日池的语义就是「到零点重置」）。这样任何时刻
-    // 跑都成立，也不再依赖「现在离零点有多远」。
-    let minutes = (stored - logging::now_ms()) / 60_000;
-    assert!(
-        (0..=24 * 60).contains(&minutes),
-        "日池的恢复时刻应当落在 24 小时以内，实际 {minutes} 分钟"
-    );
-    // 判据：恢复时刻在北京时区里必须是 00:00:00 —— 日池按天重置。
-    // 10 分钟兜底常量（now + 10min）落在零点上的概率可忽略，这一条足以把它排除。
-    let at = crate::server::core::beijing::date_time_of_ms(stored).expect("合法时间戳");
-    use chrono::Timelike;
-    assert!(
-        at.hour() == 0 && at.minute() == 0 && at.second() == 0,
-        "恢复时刻必须是北京零点（日池按天重置），实际 {}",
-        at.format("%Y-%m-%d %H:%M:%S")
+    assert_eq!(
+        stored, reset_at,
+        "插件给的恢复时刻必须原样落库（宿主不重算、不夹逼）"
     );
 }
 
 #[test]
 fn that_one_argument_is_the_divider_between_a_day_and_ten_minutes() {
     let (_dir, service, id) = temp_service();
-    // 同一个账号库里放两条账号：一条按「改后的写法」记账，一条按「改前的写法」
-    // （同一个 rotate::mark_account_limited，只是恢复时刻写死 None）。
-    // 同一份分类、同一句文案 —— 差别只有那一行实参。
+    // 同一个账号库里放两条账号：一条按「透传恢复时刻」记账，一条按「写死
+    // None」记账（同一个 rotate::mark_account_limited，只差那一个实参）。
     let pre_fix = service
         .store
         .add_account(
@@ -255,16 +247,16 @@ fn that_one_argument_is_the_divider_between_a_day_and_ten_minutes() {
         status: 403,
     };
     mark_conversation_limited(&service, &id, &single("m-after"), &class, message);
-    // 改前的那一发：另三个字段照旧，恢复时刻写成 None
+    // 对照：另三个字段照旧，恢复时刻写成 None（= 没有时刻可用）
     rotate::mark_account_limited(&service, &pre_fix_id, "m-before", 403, Some(4291200), None, message);
 
     let after = rotate::account_limit_reset_at(&service, &id, "m-after");
     let before = rotate::account_limit_reset_at(&service, &pre_fix_id, "m-before");
-    assert_eq!(after, reset_at, "改后应透传适配器给的恢复时刻");
+    assert_eq!(after, reset_at, "透传时应落插件给的恢复时刻");
     let before_minutes = (before - now) / 60_000;
     assert!(
         before_minutes >= 9 && before_minutes <= 11,
-        "改前落的是存储层兜底冷却（10 分钟），实际 {before_minutes} 分钟"
+        "没有恢复时刻时落的是存储层兜底冷却（10 分钟），实际 {before_minutes} 分钟"
     );
     // 分水岭本身：同一份分类结果，两种写法差出 2 小时以上 —— 白撞节拍就是从这里来的
     assert!(
@@ -332,8 +324,13 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         &transport,
         &mut budget,
         Some(&capture),
-        &RequestTelemetry::new(),
+        // 遥测是 `Arc`（编排层多处共享同一份），这里给它一个自己的实例
+        &std::sync::Arc::new(RequestTelemetry::new()),
         false,
+        // 图片响应类型与网络策略都不参与本用例（413 的处置在编排层）：
+        // 给「非图片 + 无策略」的默认值
+        None,
+        None,
     )
     .await;
     task.abort();

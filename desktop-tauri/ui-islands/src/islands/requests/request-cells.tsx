@@ -16,6 +16,9 @@ export type RequestEntry = {
   /** 上游按请求上报的积分消耗（后端 `credit`）；null / 缺键 = 这一家没上报，
    *  与 0（确实零消耗）是两件事 —— 前者显示「—」 */
   credit?: number | null
+  /** 这条 `credit` 的来源：`reported` = 上游实报，`estimate` = 按 Token 折算的
+   *  预估值（后端 `creditSource`）。空串 / 缺键 = 旧行或没有读数。 */
+  creditSource?: string
   attempts?: number; attemptDetails?: unknown[]; sensitiveHits?: unknown[]
   /** 模型测试发起的请求（后端 `is_test`；此前落盘的老行没有这个键） */
   isTest?: boolean
@@ -412,10 +415,15 @@ export function RequestCell({ entry, column, namesHidden }: { entry: RequestEntr
           <span key={key} className={`${className} is-empty`} title={t('上游没有返回积分消耗')}>—</span>
         )
       }
+      // 预估值不能与实报显示成一个样子：前者是按 Token 折算的，后者是上游
+      // 真扣的。加 `≈` 前缀并在悬停里说明 —— 与报表页 `creditReading()` 同口径。
+      const estimated = entry.creditSource === 'estimate'
       return (
         <span key={key} className={className}
-          title={t('本次请求消耗 {credit} 积分', { credit: numberText(value) })}>
-          {numberText(value)}
+          title={estimated
+            ? t('按 Token 估算约 {credit} 积分（上游未上报，非实际扣费）', { credit: numberText(value) })
+            : t('本次请求消耗 {credit} 积分', { credit: numberText(value) })}>
+          {estimated ? '≈' : ''}{numberText(value)}
         </span>
       )
     }

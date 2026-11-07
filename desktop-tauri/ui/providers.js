@@ -178,14 +178,25 @@
   }
 
   /**
-   * 协议下拉的三个选项：值与后端 custom_providers::PROTOCOLS 逐字一致，
+   * 协议下拉的选项：值与后端 custom_providers::PROTOCOLS 逐字一致，
    * 文案即添加表单与编辑弹窗共用的展示名。放在本文件（目录层）而不是让两个
    * 表单各写一份：新增一种协议时值与文案只有一处要改。
+   *
+   * ── bedrock / vertex 与前三家的差异（填表时要提示）────────────
+   * 它们的 `baseUrl` 语义不是「API 根」：
+   *   - bedrock：填 bedrock-runtime 的**根**（如
+   *     `https://bedrock-runtime.us-east-1.amazonaws.com`），模型名进 URL 路径；
+   *     账号的「API Key」要填 `AccessKeyId:SecretAccessKey[:region]` 三元组。
+   *   - vertex：填**模型公共前缀**（到 `.../publishers/google/models` 为止，
+   *     或 `https://generativelanguage.googleapis.com/v1beta/models`）；
+   *     Key 可以留空（由出网代理注入 `x-goog-api-key`）。
    */
   const PROTOCOL_OPTIONS = [
     { value: 'chat_completions', label: 'OpenAI - Chat Completions' },
     { value: 'responses', label: 'OpenAI - Responses' },
     { value: 'anthropic', label: 'Anthropic - Messages' },
+    { value: 'bedrock', label: 'AWS Bedrock - Converse' },
+    { value: 'vertex', label: 'Google Vertex - Gemini' },
   ];
 
   /** 按 id 取展示名：空值给空串、查不到就原样回显 id（调用方自行决定占位符） */

@@ -41,7 +41,7 @@ import {
   TooltipTrigger,
   cn,
   TableRow, TableCell, TableHeader, TableHead as UiTableHead } from '@ui'
-import { formatTime, numberText, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type LimiterRule, type TokenReading, type UsageEntry } from './accounts-shared'
+import { formatTime, numberText, poolItemLabel, poolItemSelectable, POOL_VALUE_PREFIX, shared, type AccountRecord, type LimiterRule, type TokenReading, type UsageEntry } from './accounts-shared'
 import {
   accountTags, activeLimits, balanceBlockedOf,
   displayNameOf, expiryMillis, formatIntervalSeconds, formatResetText,
@@ -61,7 +61,7 @@ import { upstreamCooldownOf, upstreamSuspendedReasonOf } from '../../../ui-share
 import { LimiterStatus } from './accounts-limiter-status'
 import { limiterHit } from './accounts-limiter-model'
 import {
-  PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick,
+  PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, PROXY_ROTATE_ALL, applyProxyPick,
   connectionsOf, getStore, groupSortRules, maskName, openBatchDialog, openGroupDialog, openSettingsDialog,
   poolError, proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setGroupEnabled,
   tokenUsageOf, toggleGroupCollapsed, toggleNamesHidden, usageEntryOf, usageFailureOf, usageFailureStatusOf, usageUpdatedAtOf,
@@ -1592,11 +1592,16 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
   const broken = proxy?.error
   const pool = proxyPoolSnapshot()
   const poolItems = Array.isArray(pool) ? pool : []
+  /** 已经是「全部候选」的轮询档（行内那一项要打勾并显示成选项文案） */
+  const rotateAll = source === 'rotate' && proxy?.config?.all !== false
+  const rotateAllLabel = t('轮询（故障切换）')
 
-  // 当前值映射回下拉的值域：池条目用 `pool:<id>`、其余（Clash 直引 / custom /
-  // 轮询 / 坏形状）落到补位项 —— 绝不能回落成「直连」：那会把「配置坏了」显示成「没配」
+  // 当前值映射回下拉的值域：池条目用 `pool:<id>`、全量轮询用专门常量、
+  // 其余（Clash 直引 / custom / 指定范围的轮询 / 坏形状）落到补位项 ——
+  // 绝不能回落成「直连」：那会把「配置坏了」显示成「没配」
   let current = ''
   if (source === 'pool' && proxy?.config?.proxyId) current = `${POOL_VALUE_PREFIX}${proxy.config.proxyId}`
+  else if (rotateAll) current = PROXY_ROTATE_ALL
   else if (proxy) current = PROXY_CUSTOM_CURRENT
 
   const items: Array<{ value: string; label: string; disabled?: boolean }> = [{ value: '', label: t('直连') }]
@@ -1605,13 +1610,14 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
     // 地址是后端解析出来的实时值（见 poolItemLabel）。同一格里多条目同名时
     // 地址是唯一能分辨它们的读数，不能只写名字。
     //
-    // 禁用项**置灰不可选**：选它只会「保存成功 → 解析失败 → 回退直连」，
-    // 用户看到的是「代理已禁用」这种事后解释。要改就去「网络代理」页启用它。
-    // （当前值恰好是禁用项时照常显示 —— 触发器读的是这一项的 label，含「已禁用」）
+    // 被本页禁用的条目**不置灰**：选中它保存时后端会一并启用它（见
+    // `proxy_pool::enable_for_reference`），文案里已标注「选中后自动启用」。
+    // 只有 Clash Verge 里停用的监听器、以及订阅里已移除的节点不可选 ——
+    // 它们的开关不在本页，选中也只会得到一条「不可用」。
     items.push({
       value: `${POOL_VALUE_PREFIX}${item.id}`,
       label: poolItemLabel(item),
-      disabled: item.enabled === false,
+      disabled: !poolItemSelectable(item),
     })
   }
   if (pool === null) {
@@ -1629,25 +1635,39 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
   }
   if (current === PROXY_CUSTOM_CURRENT) {
     // 补位项：不带动任何写操作（PROXY_CUSTOM_CURRENT 在 applyProxyPick 里被忽略），
-    // 只是把当前值原样显示出来。轮询档不加前缀 —— 后端给的 label 本身就是
-    // 「轮询全部代理（N 个出口）」这种完整一句话（见 describe_account_proxy）
+    // 只是把当前值原样显示出来。指定范围的轮询也走这里 —— 后端给的 label 本身
+    // 就是「轮询全部代理（N 个出口）」这种完整一句话（见 describe_account_proxy）
     const prefix = source === 'clash' ? t('Clash 出口：') : source === 'custom' ? t('自定义：') : ''
     items.push({ value: PROXY_CUSTOM_CURRENT, label: `${prefix}${label}${broken ? t('（不可用）') : ''}` })
   } else if (source === 'pool' && !poolItems.some(item => `${POOL_VALUE_PREFIX}${item.id}` === current)) {
     // 池引用但条目已不在池里（被删 / Clash 侧删了出口）：补位显示当前值
     items.push({ value: current, label: `${label}${broken ? t('（不可用）') : ''}` })
   }
+  // 轮询快捷档（照官方：行内只给「全部候选 + 智能故障切换」这一档）。
+  // 要挑具体参与哪几条、或改成「所有上游错误都切换」，去设置弹窗的完整表单。
+  // 池里一条出口都没有时置灰：那种状态下轮询必然报「没有可用出口」，
+  // 让它可选只会把用户送去一次注定失败的操作。
+  items.push({
+    value: PROXY_ROTATE_ALL,
+    label: `${rotateAllLabel}${rotateAll && broken ? t('（不可用）') : ''}`,
+    disabled: pool !== null && !poolItems.length,
+  })
   items.push({ value: PROXY_CUSTOM_EDIT, label: t('自定义代理…') })
 
   const title = broken
     ? t('代理不可用：{error}（转发时会回退直连）；选「自定义代理…」去修改', { error: broken })
     : source === 'rotate'
-      ? t('当前：{label}（每条请求换一个出口）；「自定义代理…」打开完整设置', { label })
+      ? t('当前：{label}；{strategy}；要改范围或切换策略，选「自定义代理…」', {
+        label,
+        strategy: proxy?.config?.failureMode === 'all_errors'
+          ? t('所有上游错误都切换')
+          : t('智能切换（推荐）：网络失败与 403、普通 429 换出口；余额或配额耗尽的 429 仍按账号处理'),
+      })
       : source === 'clash'
         ? t('当前：{label}（Clash Verge 直接引用）；可在「网络代理」页同步端点后改选', { label })
         : source === 'custom'
           ? t('当前：{label}（未经过代理池 —— 可在「网络代理」页添加相同地址后来这里改选）', { label })
-          : t('当前：{label}；选项来自「网络代理」页；「自定义代理…」打开完整设置', {
+          : t('当前：{label}；选项来自「网络代理」页（选中已禁用的节点会自动启用它）；「自定义代理…」打开完整设置', {
           label: proxy ? label : t('直连'),
         })
   const selected = items.find(item => item.value === current)

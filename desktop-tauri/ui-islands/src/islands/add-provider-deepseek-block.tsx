@@ -203,7 +203,7 @@ export function DeepseekAccountBlock({ active, footerHost, onClose }: {
         <span>{t('出网代理')}</span><span className='compact-login-proxy-summary'>{proxyLabel(proxy)}</span><ChevronIcon />
       </CollapsibleTrigger>
       <CollapsibleContent><div className='compact-login-proxy-body' inert={locked}>
-        <ProxyForm draft={proxy} onChange={setProxy} idPrefix={`${id}-proxy`} />
+        <ProxyForm draft={proxy} onChange={setProxy} idPrefix={`${id}-proxy`} allowRotate />
       </div></CollapsibleContent>
     </Collapsible>
     {view.hint && !view.waiting ? <p id={`${id}-hint`} className='compact-login-hint'>{view.hint}</p> : null}

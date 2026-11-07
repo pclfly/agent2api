@@ -20,6 +20,19 @@ prototype/
 # ZCode 的忽略配置文件本身（本机工具配置，不入库）
 .zcodeignore
 
+# ── 本机启动/构建脚本（headless 部署用）───────────────────────
+# build-server.bat / start-plugin-server.bat / run-server.bat /
+# start-plugin-server.ps1 是本机部署用的
+# 薄封装：路径、端口、数据目录都按这台机器写死，进仓库对别人没意义，反而
+# 容易把本机绝对路径带进历史。确实要共享时用 git add -f 单独放行。
+/build-server.bat
+/run-server.bat
+/start-plugin-server.bat
+/start-plugin-server.ps1
+# 改脚本前留的时间戳备份
+*.bak-[0-9]*
+/rollback-local-scripts.sh
+
 # 第三方参考项目（仅本地分析用）
 Acankao/
 desktop-tauri/web

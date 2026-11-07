@@ -94,6 +94,16 @@ pub struct RequestEntry {
     /// 与「上报了 0」是两件事 —— 前端对前者显示「—」，对后者显示「0」。
     #[serde(rename = "credit", default)]
     pub credit: Option<f64>,
+    /// 这条 `credit` 的**来源**：`"reported"` = 上游实报，`"estimate"` = 按
+    /// Token 折算的预估值，空串 = 没有读数。
+    ///
+    /// ── 为什么必须与 credit 分开存 ──────────────────────────────
+    /// 预估值不能与实报混为一谈：前者是「猜的」，后者是「上游扣的」。
+    /// 报表与请求日志据此显示 `≈` 前缀与「包含预估」提示，用户一眼能分清
+    /// 「这次真的花了 0.25」和「按倍率大致折算是 0.25」。合成一列会让整张
+    /// 积分报表失去可信度（见 `core::upstream::credit_estimate` 的模块头）。
+    #[serde(rename = "creditSource", default)]
+    pub credit_source: String,
     /// 实际承载本次请求的 provider id（架构文档 §3.6）。
     ///
     /// ── 为什么是 `String` + 空串而不是 `Option<String>` ─────────
@@ -427,6 +437,9 @@ pub struct NewRequestEntry {
     /// 上游按请求上报的积分消耗（可空：`None` = 没上报，不是 0；见
     /// `RequestEntry::credit`）
     pub credit: Option<f64>,
+    /// `credit` 的来源（`"reported"` / `"estimate"` / 空串；见
+    /// `RequestEntry::credit_source`）
+    pub credit_source: String,
     /// 实际承载本次请求的 provider id（Agent2API 改造 W2b-T3 新增填入，
     /// W4 接上持久化：见 `normalize` 末尾的透传）。
     ///
@@ -476,6 +489,7 @@ impl NewRequestEntry {
             total_tokens: 0,
             cache_read_tokens: 0,
             credit: None,
+            credit_source: String::new(),
             provider: None,
             client_model: String::new(),
             upstream_model: String::new(),
@@ -552,6 +566,13 @@ impl NewRequestEntry {
             total_tokens: token(self.total_tokens),
             cache_read_tokens: token(self.cache_read_tokens),
             credit,
+            // 来源标记同样跟「失败清零」走：credit 被清成 None 时来源必须一起清，
+            // 否则会留下「有来源、没读数」的行，前端按来源显示 ≈ 却读不到数
+            credit_source: if credit.is_none() {
+                String::new()
+            } else {
+                self.credit_source.trim().to_string()
+            },
             provider,
             // 双名透传（trim 的理由与 provider 相同：空白不该造出一个
             // 「看起来不同的名字」）；空串语义 = 没有点名 / 没有发出去
@@ -820,6 +841,25 @@ pub struct AccountAccum {
     pub account_id: String,
     #[serde(rename = "accountName", default)]
     pub account_name: String,
+    /// 这一组**已采集到的**积分合计。
+    ///
+    /// `None` 与 `Some(0.0)` 是两件事：前者是「一条读数都没有」（旧数据、
+    /// 上游不报且不做估算的家），后者是「读了，合计确实是 0」（限免档）。
+    /// 合成 0 会让报表把「没采集」显示成「免费」。
+    #[serde(default)]
+    pub credit: Option<f64>,
+    /// 参与积分合计的**请求条数**（覆盖率）。
+    ///
+    /// 与 `requests` 的差别就是「这一组里有多少条带读数」—— 报表据此显示
+    /// 「12/40 条有读数」，避免把部分覆盖的合计当成全量结论。
+    #[serde(rename = "creditRequests", default)]
+    pub credit_requests: i64,
+    /// 这一组的积分合计里**是否混入了预估值**（`credit_source = "estimate"`）。
+    ///
+    /// 前端据此给整组打 `≈`：实报与预估混在一起时，界面必须说明「其中有估算」，
+    /// 否则用户会把折算值当成真实扣费。
+    #[serde(rename = "creditEstimated", default)]
+    pub credit_estimated: bool,
     #[serde(default)]
     pub requests: i64,
     #[serde(default)]

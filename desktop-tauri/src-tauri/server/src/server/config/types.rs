@@ -68,6 +68,15 @@ pub const KEY_DEBUG_DIR: &str = "debugDir";
 /// 归一与解析都复用账号代理那两份实现（`normalize_account_proxy` /
 /// `resolve_account_proxy`），这里只存取。
 pub const KEY_UPDATE_PROXY: &str = "updateProxy";
+/// 内核存放目录（绝对路径；None = 默认 `{config_dir}/proxy-kernel`）。
+///
+/// 与 `updateProxy` 同类：用户在下载弹窗里改到别的盘，避免内核落在系统盘。
+pub const KEY_KERNEL_DIR: &str = "kernelDir";
+/// 内核下载线路（与软件更新各走各的线路，互不覆盖）。
+///
+/// 为什么与 `updateProxy` 分开：更新包来自本项目 Release，内核来自 mihomo
+/// 官方 Release —— 两者在用户网络里可达性可以完全不同（一个被墙、一个能通）。
+pub const KEY_KERNEL_PROXY: &str = "kernelProxy";
 
 /// 「关注 beta 版更新」开关（config.json 键，缺省关）。
 ///
@@ -252,6 +261,13 @@ pub const KEY_PROMPT_TEXT: &str = "promptText";
 /// 不是过严就是过松。全局键保留为**默认值**（不写这个键时行为与改造前逐字相同），
 /// 逐家的差异写在这里。
 pub const KEY_PROMPT_PROVIDERS: &str = "promptProviders";
+/// 逐家提示词的**适用模型范围**（`promptModels`）：`null` = 全部模型，
+/// `[]` = 全不选，其余为上游模型 ID 白名单。
+///
+/// 存在 `promptProviders` 每一条目里（不是顶层键），常量只定义键名。
+/// 三态语义见 `core::prompt::parse_model_scope` 的说明 —— `[]` 与「未给」
+/// 必须分开，否则用户关掉的提示词升级后又被装回去。
+pub const KEY_PROMPT_MODELS: &str = "promptModels";
 
 /// **网关自带提示词**的逐家开关（config.json 键）：`{"<providerId>": false}`。
 ///
@@ -317,6 +333,14 @@ pub struct ProviderPromptPatch {
     pub file: Option<String>,
     /// 界面里编辑的正文（`None` / 空白 = 没有这一份，回落文件 / 内置默认）
     pub inline: Option<String>,
+    /// 适用模型范围：`None` = 全部模型（含以后新增）；`Some([])` = 全不选；
+    /// 其余为上游模型 ID 白名单（ASCII 不区分大小写）。
+    ///
+    /// ── 为什么这一位属于「覆盖」而不是「模式」────────────────────
+    /// 同一家可能有多份提示词需求：编码模型要工程化指令，闲聊模型不要。
+    /// 范围只是**筛选**这一份覆盖要不要生效，不改变加工链（透传 / 替换 /
+    /// 追加）的语义 —— 未选中的模型**不回落全局**也不触发降级。
+    pub models: Option<Vec<String>>,
 }
 
 /// 系统提示词设置（设置页「通用 → 系统提示词」）。
@@ -394,6 +418,9 @@ pub struct ProviderPrompt {
     pub source: crate::server::core::prompt::PromptSource,
     /// 指定了文件但读不到时的原因（`None` = 没这回事）
     pub file_error: Option<String>,
+    /// 适用模型范围（`None` = 全部；`Some([])` = 全不选；其余为白名单）。
+    /// 未选中的模型不回落全局提示词，见 `ProviderPromptPatch::models`。
+    pub models: Option<Vec<String>>,
 }
 
 /// 三档保留天数的默认值（缺失时用它们）。

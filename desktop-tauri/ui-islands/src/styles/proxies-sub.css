@@ -1,0 +1,96 @@
+/* 「网络代理 → 订阅」区块与内核状态条 */
+
+.sub-kernel-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: var(--surface-2, transparent);
+}
+
+.sub-kernel-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+/* 三态用色相区分，同时靠下方文案兜底（不只靠颜色传达信息） */
+.sub-kernel-dot-ok { background: var(--ok, #22c55e); }
+.sub-kernel-dot-warn { background: var(--warn, #f59e0b); }
+.sub-kernel-dot-muted { background: var(--subtle, #94a3b8); }
+
+.sub-kernel-label { font-size: 13px; font-weight: 600; }
+
+.sub-kernel-meta {
+  font-size: 12px;
+  color: var(--subtle);
+  white-space: nowrap;
+}
+
+.sub-kernel-error {
+  font-size: 12px;
+  color: var(--danger, #ef4444);
+  max-width: 42ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sub-kernel-actions { margin-left: auto; }
+
+.sub-list { display: grid; gap: 6px; }
+
+.sub-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+}
+
+/* 禁用行整体降透明度：开关本身仍是可点的（要能重新启用） */
+.sub-row[data-disabled='true'] { opacity: 0.55; }
+
+.sub-row-name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sub-row-kind { flex: 0 0 auto; }
+
+.sub-row-count {
+  font-size: 12px;
+  color: var(--subtle);
+  white-space: nowrap;
+}
+
+.sub-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 窄屏：动作换到第二行，名字占满整行 */
+@media (max-width: 767px) {
+  .sub-row {
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      'name count'
+      'actions actions';
+    row-gap: 8px;
+  }
+  .sub-row-name { grid-area: name; }
+  .sub-row-kind { display: none; }
+  .sub-row-count { grid-area: count; }
+  .sub-row-actions { grid-area: actions; flex-wrap: wrap; }
+  .sub-kernel-meta { white-space: normal; }
+}

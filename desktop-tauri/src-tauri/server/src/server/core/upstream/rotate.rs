@@ -192,6 +192,8 @@ fn select_target_account_sync(
             proxy: None,
             priority: None,
             proxy_notice: None,
+            // 没走到账号 = 没有账号代理配置，直连是正确语义
+            proxy_blocked: None,
             decision: None,
         });
     }
@@ -421,6 +423,7 @@ fn select_target_account_sync(
         proxy: None,
         priority: None,
         proxy_notice: None,
+        proxy_blocked: None,
         decision: Some(decision),
     })
 }
@@ -517,18 +520,34 @@ pub(super) fn with_proxy_notice(
     account_id: String,
     decision: Option<Value>,
 ) -> RouteTarget {
+    // 先留一份：下面 `notice` 会把 `proxy_error` move 走，而
+    // 「配了代理但不可用」的判定还要用它
+    let error_for_block = proxy_error.clone();
+    // 文案不再写「本次直连」：配了代理却不可用时**现在是拒绝转发**
+    // （见 `proxy_blocked`），说成直连会让日志与事实相反。
     let mut notice = proxy_error.map(|error| {
         format!(
-            "账号「{}」代理不可用，本次直连: {error}",
+            "账号「{}」代理不可用: {error}",
             account_display(&account)
         )
     });
+    // 「配了代理但解析不出来」必须拒绝，不能回退直连 —— 见 `proxy_blocked`
+    // 的字段说明。判据是 `proxy_error`（账号存储已经解析过一次并失败了）
+    // 或这里的二次解析失败。
+    let mut blocked: Option<String> = None;
     let resolved = match ResolvedProxy::from_json(&proxy) {
-        Ok(proxy) => proxy,
+        Ok(proxy) => {
+            // 存储层报过错、但 JSON 本身还能解出来（例如端口字段合法而
+            // 代理池条目已被删）：仍然按「不可用」处理，因为那条出口的
+            // 语义已经失效了
+            if let Some(error) = error_for_block {
+                blocked = Some(error);
+            }
+            proxy
+        }
         Err(reason) => {
-            // 会话里的 proxy 由账号存储解析过（成功才会带过来），
-            // 这里失败说明数据在两次读盘之间变了：按直连兜底
-            notice = Some(format!("账号代理不可用（{reason}），本次回退直连"));
+            blocked = Some(reason.clone());
+            notice = Some(format!("账号代理不可用（{reason}），已停止请求"));
             None
         }
     };
@@ -545,6 +564,7 @@ pub(super) fn with_proxy_notice(
         account: Some(account),
         proxy: resolved,
         proxy_notice: notice,
+        proxy_blocked: blocked,
         decision,
     }
 }

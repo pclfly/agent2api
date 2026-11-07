@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { providerPromptRows } from './settings-prompt-rows'
+import { ProviderPromptModelsButton } from './settings-prompt-model-picker'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
 import {
@@ -978,6 +979,15 @@ function ProviderPromptRows({ prompt, locked, busy }: {
                 </Select>
                 <ProviderFileRow item={item} label={label} locked={locked} busy={busy} />
                 <ProviderPromptTextButton item={item} label={label} locked={locked} busy={busy} />
+                {/* 适用模型范围：只决定这份覆盖对哪些模型生效，不改模式本身。
+                    `null`（全部）/ `[]`（全不选）是两个不同选择，弹窗里分别有入口。 */}
+                <ProviderPromptModelsButton
+                  item={item}
+                  label={label}
+                  catalog={option?.models ?? []}
+                  locked={locked}
+                  busy={busy}
+                />
                 {/* 「跟随默认」只在**单独配过**的行上出现：没配过的行点了它也删不掉
                     任何东西（后端此时没有这一项），留一颗无效按钮只会让人以为点坏了 */}
                 {item.configured ? (

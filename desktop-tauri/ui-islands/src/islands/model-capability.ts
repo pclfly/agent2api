@@ -181,6 +181,7 @@ export function capabilityTip(
   value: unknown,
   overridden: boolean,
   source: CapabilitySource | '' = '',
+  reasoningLevels?: { levels: string[]; defaultLevel: string; fixedLevel: string; source: string } | null,
 ): string {
   const label = CAPABILITY_LABELS[key]
   const suffix = overridden ? t('（已被手动覆盖，弹窗里可恢复继承）') : ''
@@ -190,7 +191,25 @@ export function capabilityTip(
     return t('{label}：{value}（对下游声明的精确值）{origin}{suffix}', { label, value: exactTokens(value), origin, suffix })
   }
   const state = capabilityState(value)
-  if (state === 'on') return t('{label}：支持{origin}{suffix}', { label, origin, suffix })
+  if (state === 'on') {
+    let base = t('{label}：支持{origin}{suffix}', { label, origin, suffix })
+    // 思考图标悬停补充可配档位：只在支持且有档位列表时追加第二行，
+    // 固定档位走「固定思考档位」+ 固定值，普通档位列出 levels 并带上默认档。
+    // 来源为 models.dev 时保留社区参考备注（与能力弹窗同一口径）。
+    if (key === 'supportsReasoning' && reasoningLevels && reasoningLevels.levels.length) {
+      const levelsText = reasoningLevels.fixedLevel
+        ? t('固定思考档位：{level}', { level: reasoningLevels.fixedLevel })
+        : t('可配思考档位：{levels}{defaultText}', {
+            levels: reasoningLevels.levels.join(' / '),
+            defaultText: reasoningLevels.defaultLevel ? t('（默认 {level}）', { level: reasoningLevels.defaultLevel }) : '',
+          })
+      base += '\n' + levelsText
+      if (reasoningLevels.source === 'modelsdev') {
+        base += t('社区参考档位，不代表当前上游通道支持；实际以该通道目录为准。')
+      }
+    }
+    return base
+  }
   if (state === 'off') return t('{label}：不支持{origin}{suffix}', { label, origin, suffix })
   return t('{label}：上游未声明（下游会按不支持处理）{suffix}', { label, suffix })
 }

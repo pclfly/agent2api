@@ -1722,12 +1722,16 @@ pub fn shim_js() -> &'static str {
     // 契约见 api::proxies 的模块头 —— 只加一边时另一形态下的页面会报
     // 「桥接方法缺失」，标题栏那一族有同样的教训）
     getProxyPool: function () { return call('GET', '/api/proxies/pool'); },
+    // 只列可用条目（账号侧代理下拉 / 轮询候选）：后端不同步 Clash、滤掉禁用项。
+    getUsableProxyPool: function () { return call('GET', '/api/proxies/pool/usable'); },
     createProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool', payload || {}); },
     updateProxyPoolItem: function (payload) { return call('POST', '/api/proxies/pool/update', payload || {}); },
     setProxyPoolItemEnabled: function (payload) { return call('POST', '/api/proxies/pool/enable', payload || {}); },
     removeProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/remove', { id: String(id || '') }); },
     testProxyPoolItem: function (id) { return call('POST', '/api/proxies/pool/test', { id: String(id || '') }); },
     syncClashToProxyPool: function () { return call('POST', '/api/proxies/pool/sync-clash', {}); },
+    // 清除轮询候选冷却（管理动作）：只清出口冷却，不清账号限额、不重启内核。
+    clearProxyRotateCooldowns: function () { return call('POST', '/api/proxies/rotate/clear-cooldowns', {}); },
     // 代理设置（「网络代理」页的设置弹窗；与桌面壳 bridge.rs 的同名方法
     // 成对存在，契约见 api::proxies 的模块头 settings 两条）
     getProxySettings: function () { return call('GET', '/api/proxies/settings'); },

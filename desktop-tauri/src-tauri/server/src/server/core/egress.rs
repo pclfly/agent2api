@@ -660,3 +660,155 @@ pub fn describe_public(proxy: Option<&ResolvedProxy>) -> Value {
         }),
     }
 }
+
+// ── 两跳出口（前置代理 + 第二跳）─────────────────────────────────
+//
+// v3.4.0 把两跳链路整体删掉了，`ResolvedProxy` 只剩单跳语义。但账号记录里的
+// `frontProxy` 仍是存量契约（本地库里已有配置），删掉会让这些账号**静默退回
+// 直连** —— 出口地区变了，上游按地区拦截时表现为莫名其妙的 401/403。
+//
+// 这里补回四件事：
+//   1. `validate_account_route`：两跳的配置闸门（只支持 HTTP CONNECT）；
+//   2. `chain_local_proxy`：把 `ChainEndpoint` 变成 reqwest 能用的单跳描述；
+//   3. `client_for_route`：两跳时先建中转再取客户端；
+//   4. `test_account_route`：账号链路探针（只 GET origin，不带凭证）。
+
+/// 两跳的配置闸门：协议、主机、端口，以及「前置跳必须有第二跳」。
+///
+/// 两跳实现只会发明文 HTTP CONNECT，不能把 SOCKS 或 HTTPS 代理当 HTTP 用；
+/// 单跳仍沿用已有的 HTTP / SOCKS5 能力。
+pub fn validate_account_route(
+    proxy: Option<&ResolvedProxy>,
+    front: Option<&ResolvedProxy>,
+) -> Result<(), String> {
+    if front.is_some() && proxy.is_none() {
+        return Err("frontProxy 需要同时配置 proxy（第二跳代理）".to_string());
+    }
+    for (name, hop) in [("proxy", proxy), ("frontProxy", front)] {
+        let Some(hop) = hop else { continue };
+        if !matches!(hop.protocol.as_str(), "http" | "socks5") {
+            return Err(format!("{name}: 代理协议只支持 http 或 socks5"));
+        }
+        if front.is_some() && hop.protocol != "http" {
+            return Err(format!("{name}: 两跳代理链只支持 HTTP CONNECT，两跳协议均须为 http"));
+        }
+        if hop.port.is_none() || hop.port == Some(0) || hop.host.is_empty()
+            || hop.host.chars().any(|ch| ch.is_whitespace() || ch.is_control() || "/\\@?#".contains(ch))
+        {
+            return Err(format!("{name}: 代理主机或端口无效"));
+        }
+    }
+    Ok(())
+}
+
+/// 把两跳中转的本地入口描述成一个普通单跳代理（交给 reqwest）。
+///
+/// 中转不需要认证：两跳的凭据在建立隧道时已经用掉，本机回环端口不该再要求
+/// 一次 `Proxy-Authorization`。
+fn chain_local_proxy(endpoint: &super::proxy_chain::ChainEndpoint) -> Result<ResolvedProxy, String> {
+    let address: std::net::SocketAddr = endpoint
+        .local_addr
+        .parse()
+        .map_err(|_| "代理链本地端点无效".to_string())?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err("代理链本地端点必须是有效的 loopback 地址".to_string());
+    }
+    Ok(ResolvedProxy {
+        source: "custom".to_string(),
+        protocol: "http".to_string(),
+        host: address.ip().to_string(),
+        port: Some(address.port()),
+        username: String::new(),
+        password: String::new(),
+        label: endpoint.label.clone(),
+    })
+}
+
+/// 取（或创建）带前置跳的出口客户端；没有前置跳时等价于 [`client_for`]。
+///
+/// 两跳的兑现方式是**在本地起一个中转端口**，然后把它当普通代理交给 reqwest
+/// —— reqwest 的连接栈完全不用改，TLS 仍由它自己做（证书校验照常）。
+pub fn client_for_route(
+    proxy: Option<&ResolvedProxy>,
+    front: Option<&ResolvedProxy>,
+) -> Result<(Arc<reqwest::Client>, Option<ResolvedProxy>), String> {
+    let (Some(front), Some(back)) = (front, proxy) else {
+        return Ok((client_for(proxy), proxy.cloned()));
+    };
+    let endpoint = super::proxy_chain::chain_endpoint(front, back)
+        .ok_or_else(|| "建立代理链失败（不会回退单跳或直连）".to_string())?;
+    let local = chain_local_proxy(&endpoint)?;
+    Ok((client_for(Some(&local)), Some(local)))
+}
+
+/// 账号链路探针：只 GET 上游 origin + '/'，不发账号 / provider 凭证、
+/// 不查出口 IP、不跟跳转。
+///
+/// 成功只表示「收到了目标的 HTTP 响应」，不代表模型权限或生成可用。
+/// 所有失败都不做直连 / 单跳兜底 —— 那样会把「出口坏了」测成「出口正常」。
+pub async fn test_account_route(
+    proxy: Option<&ResolvedProxy>,
+    front: Option<&ResolvedProxy>,
+    target_url: &str,
+) -> Value {
+    let started = std::time::Instant::now();
+    let probe = async {
+        validate_account_route(proxy, front)?;
+        let target = url::Url::parse(target_url).map_err(|_| "测试目标 URL 无效".to_string())?;
+        if !matches!(target.scheme(), "http" | "https")
+            || target.host_str().is_none()
+            || target.path() != "/"
+            || target.query().is_some()
+            || target.fragment().is_some()
+            || !target.username().is_empty()
+            || target.password().is_some()
+            || target.port() == Some(0)
+        {
+            return Err("测试目标必须是无凭证的 HTTP/HTTPS origin + '/'".to_string());
+        }
+        // 建链可能阻塞（起监听器 / DNS），放到阻塞池
+        let (client, effective) = match (front, proxy) {
+            (Some(front), Some(back)) => {
+                let (front, back) = (front.clone(), back.clone());
+                tokio::task::spawn_blocking(move || client_for_route(Some(&back), Some(&front)))
+                    .await
+                    .map_err(|error| format!("创建代理链失败: {error}"))??
+            }
+            _ => {
+                let owned = proxy.cloned();
+                let client = tokio::task::spawn_blocking(move || client_for(owned.as_ref()))
+                    .await
+                    .map_err(|error| format!("创建测试客户端失败: {error}"))?;
+                (client, proxy.cloned())
+            }
+        };
+        let response = client
+            .get(target)
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|error| describe_error_detail(&error))?;
+        Ok::<_, String>((response.status().as_u16(), effective))
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(15), probe).await;
+    let mut data = json!({
+        "success": false,
+        "durationMs": started.elapsed().as_millis() as u64,
+        "targetUrl": target_url,
+        "chained": front.is_some() && proxy.is_some(),
+        "proxy": describe_public(proxy),
+        "frontProxy": describe_public(front),
+        "note": "成功仅表示收到目标 HTTP 响应，不代表账号鉴权、模型权限或付费生成成功",
+    });
+    match outcome {
+        Ok(Ok((status, effective))) => {
+            data["success"] = json!(true);
+            data["status"] = json!(status);
+            data["effective"] = describe_public(effective.as_ref());
+        }
+        Ok(Err(error)) => data["error"] = json!(error),
+        Err(_) => data["error"] = json!("连接超时（15 秒，包含完整代理链）"),
+    }
+    data
+}

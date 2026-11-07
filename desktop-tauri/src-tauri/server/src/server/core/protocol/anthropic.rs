@@ -689,12 +689,32 @@ pub fn usage_to_anthropic(usage: Option<&Value>) -> Value {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let input = number("prompt_tokens");
-    json!({
-        // Anthropic 的 input_tokens **不含**缓存命中部分，所以这里减掉
-        "input_tokens": (input - cached).max(0),
+    // ── 缓存**写入**也要透传（Bedrock 等转换器会显式上报）─────────────
+    // Anthropic 把缓存读 / 写都从普通输入里分开计数：客户端拿 `input_tokens`
+    // 与两个 cache_* 相加去对上游账单。少了写入这一项，Bedrock 路径上
+    // 「上下文创建」那部分会被算进普通输入 —— 客户端算出的成本偏高，而
+    // 逐位对不上的差异很难归因。
+    //
+    // 没带这个字段的旧上游**保持原响应形状**：不凭空添加
+    // `cache_creation_input_tokens: 0`，那会让「上游不支持缓存写入」与
+    // 「这次没写缓存」看起来一样。
+    let created = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0);
+    let mut out = json!({
+        // Anthropic 的 input_tokens **不含**缓存命中与写入部分，两者都减掉
+        "input_tokens": input
+            .saturating_sub(cached)
+            .saturating_sub(created.unwrap_or(0))
+            .max(0),
         "output_tokens": number("completion_tokens"),
         "cache_read_input_tokens": cached,
-    })
+    });
+    if let Some(created) = created {
+        out["cache_creation_input_tokens"] = json!(created);
+    }
+    out
 }
 
 /// 输入 token 估算：字符数 ÷ 3.5（中英混排的经验值，与 Anthropic 官方

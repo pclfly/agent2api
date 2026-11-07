@@ -1,6 +1,7 @@
 /* Agent2API · 报表数据契约、读数口径与热力图布局 */
 
 import { t } from '../i18n'
+import { creditReading } from './credit-measurement'
 import { DATE_RANGES, readCustomRange as readDates, saveCustomRange as saveDates, type CustomDates } from '../../../ui-shared/date-range'
 export { dayKey, defaultCustomRange, DAY_KEY_RE } from '../../../ui-shared/date-range'
 
@@ -22,6 +23,12 @@ export type StatsGroup = {
   successRate?: number | null; promptTokens?: number | null; completionTokens?: number | null
   cacheReadTokens?: number | null; cacheRate?: number | null; lastUsedAt?: number | null
   tokenDetailsComplete?: boolean
+  /** 积分合计（`null` / 缺省 = 这一组一条读数都没有，不是 0） */
+  credit?: number | null
+  /** 参与积分合计的条数（覆盖率分子） */
+  creditRequests?: number
+  /** 这份合计里是否混入了预估值（`≈` 的依据） */
+  creditEstimated?: boolean
   source?: string; filterValue?: string; state?: 'enabled' | 'disabled' | 'deleted'
 }
 export type StatsOverview = {
@@ -206,6 +213,11 @@ export function rankRows(list: StatsGroup[] | undefined): RankRowView[] | null {
       id: String(item?.id ?? '').trim(),
       label: String(item?.label ?? '').trim(),
       tokens: Number(item?.totalTokens ?? item?.tokens) || 0,
+      // 积分读数只在**有值**时带出来：`null` / 缺省表示「一条都没读到」，
+      // 与「读了、合计是 0」是两件事（后者要显示 0，前者显示「—」）
+      credit: typeof item?.credit === 'number' && Number.isFinite(item.credit) ? item.credit : null,
+      creditRequests: Number(item?.creditRequests) || 0,
+      creditEstimated: item?.creditEstimated === true,
     }))
     .filter(item => item.tokens > 0)
 
@@ -225,12 +237,37 @@ export function rankRows(list: StatsGroup[] | undefined): RankRowView[] | null {
       id: item.id,
       name,
       full,
-      tip: t('{name}：{tokens} tokens · 占 {pct}%', { name: full, tokens: text, pct: percent.toFixed(1) }),
+      tip: creditTip(full, text, percent, item.credit, item.creditRequests, item.creditEstimated),
       tokensText: text,
       percentText: `${percent.toFixed(1)}%`,
       barWidth: `${percent.toFixed(1)}%`,
     }
   })
+}
+
+/**
+ * 排行行的悬停说明：Token 占比 + **积分读数**（有读数时追加）。
+ *
+ * `creditReading` 决定 `≈`（含预估）与 `*`（覆盖不全）两个前缀/后缀；
+ * 没有读数时整段不出现 —— 不写「积分 0」是最重要的一条：那会把「没采集」
+ * 读成「免费」。
+ */
+function creditTip(
+  name: string,
+  tokensText: string,
+  percent: number,
+  credit: number | null,
+  creditRequests: number,
+  creditEstimated: boolean,
+): string {
+  const base = t('{name}：{tokens} tokens · 占 {pct}%', { name, tokens: tokensText, pct: percent.toFixed(1) })
+  if (credit === null) return base
+  const reading = creditReading({ credit, creditRequests, creditEstimated })
+  const note = reading.estimated ? t('（含预估值）') : ''
+  const coverage = reading.partial
+    ? t('（{measured}/{successful} 条有读数）', { measured: reading.measured, successful: reading.successful })
+    : ''
+  return `${base} · ${t('积分 {value}', { value: reading.text })}${note}${coverage}`
 }
 
 export function rankTotalText(list: StatsGroup[]): string {

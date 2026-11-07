@@ -15,7 +15,7 @@ import {
 import {
   displayNameOf, providerFeatures, providerOf, supportsProxyRotate, supportsUsage,
 } from './accounts-domain'
-import { allAccounts, findAccount, syncBalancesSnapshot } from './accounts-data'
+import { allAccounts, findAccount, refreshProxyPool, syncBalancesSnapshot } from './accounts-data'
 import { confirmBatchResult, refreshSavedAccounts } from './accounts-update'
 import { limiterDraftOf, LimiterSection } from './accounts-dialog-limiter'
 import { readUsageDraft, UsageSettingsSection, usageDraftOf, type UsageDraft } from './accounts-dialog-usage'
@@ -176,6 +176,21 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
         verb, ok: changed, unchanged, skip: skipped.length, fail: failed.length,
       })
       toast(summary, failed.length ? 'err' : 'ok')
+      // 批量改代理时后端会把选中的池条目一并启用（见
+      // `proxy_pool::enable_for_reference`）：池缓存还停在「已禁用」，
+      // 「网络代理」页不重读就会继续显示旧状态
+      if (data.autoEnabledProxy) {
+        // 后端给的是一整句「代理「X」原为禁用，已自动启用」，直接展示
+        toast(data.autoEnabledProxy)
+        void refreshProxyPool()
+      }
+      // 监听器对账：缺口已上报（等内核补）或内核没运行（要手动启动）。
+      // 不提示的话用户保存完仍会看到「未分配端口」，分不清是没生效还是内核停着。
+      if (data.listenerBlocked) {
+        toast(t('引用的订阅节点还没有监听端口，但代理内核当前未运行 —— 去「网络代理 → 订阅」点「启动内核」后端口才会分配'), 'err')
+      } else if (data.listenersMissing) {
+        toast(t('发现 {n} 个引用的订阅节点还没有监听端口，已请求内核补建', { n: data.listenersMissing }), 'ok')
+      }
       if (failed.length || skipped.length) {
         setResult(<div role='status' className='space-y-2'>
           <p>{summary}</p>

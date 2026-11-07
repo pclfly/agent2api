@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { Badge, Button, Progress , Card, CardHeader, CardContent } from '@ui'
 import {
   downloadAsset, errorMessage, handleExternalClick, isSelfUpdate, markdownHtml,
-  missingAssetReasonFor, safeExternal, shared, toast,
+  missingAssetReasonFor, safeExternal, shared, toast, updateDownloadEnabled,
   type DownloadTask, type UpdateInfo,
 } from './update-shared'
 import { showUpdateModal } from './update-modal'
@@ -393,6 +393,16 @@ function renderCheckResult(): void {
         latest: String(info.latestVersion || ''),
         current: String(info.currentVersion || ''),
         reason: missingAssetReasonFor(info),
+        at,
+      }))
+      return
+    }
+    // 下载入口被本地策略关掉时，面板上的按钮不会出现（见 downloadButton）——
+    // 状态行得把「去哪儿拿」说清楚，否则「发现新版本」四个字后面空无一物
+    if (!updateDownloadEnabled()) {
+      setState(t('发现新版本 {latest}（当前 {current}）。如需升级，请到 GitHub 发布页下载安装包。{at}', {
+        latest: String(info.latestVersion || ''),
+        current: String(info.currentVersion || ''),
         at,
       }))
       return
@@ -857,6 +867,14 @@ async function downloadOrCancel(): Promise<void> {
   if (busy) return
   const current = getSnapshot()
 
+  // 本地分发策略关掉了下载 / 安装入口：面板外的两条调用（「去更新」深链的
+  // openAndDownload、强制更新门的按钮）不经过按钮显隐，必须在这里也拦一次。
+  // 两处例外：「取消下载」与「立即重启」—— 前者只在真有一轮下载在跑时才成立
+  // （例如策略切换前就发起的遗留任务），后者给已经落盘的更新收尾，两者都不从
+  // 上游取包，收尾动作不该被策略挡住。
+  const restartOnly = current.info?.pendingRestart === true && current.phase !== 'downloading'
+  if (current.phase !== 'downloading' && !restartOnly && !updateDownloadEnabled()) return
+
   // 更新已经应用到容器里、只差重启（可能发生在页面上一次打开之后：
   // 安装点了、重启请求没成，或用户在倒计时里刷新了页面）——这一步只重启
   if (current.info?.pendingRestart === true && current.phase !== 'downloading') {
@@ -1022,21 +1040,30 @@ async function openAndDownload(checkedInfo?: UpdateInfo | null): Promise<void> {
 function downloadButton(snap: Snapshot): { label: string; disabled: boolean } | null {
   // 重启倒计时期间不给按钮：此刻点了也没有意义（页面马上就要刷新）
   if (snap.phase === 'restarting') return null
-  // 已应用、只差重启：按钮换语义（点击 = 重启，见 downloadOrCancel 的首个分支）
+  // 已应用、只差重启：按钮换语义（点击 = 重启，见 downloadOrCancel 的首个分支）。
+  // 这一支**不受**下面的下载策略影响：它不是「从上游取包」，而是给一个
+  // 已经落到磁盘上的更新收尾 —— 把它藏起来只会让人对着「待重启」无从下手
   if (snap.info?.pendingRestart === true && snap.phase === 'idle') {
     return { label: t('立即重启'), disabled: snap.actionBusy }
   }
+  // 下载在途：只剩「取消下载」。这一支放在策略判断之前 —— 那轮下载可能是策略
+  // 切换前就发起的遗留任务，收尾动作不该被后来的策略挡住
+  if (snap.phase === 'downloading') return { label: t('取消下载'), disabled: snap.actionBusy }
+  // 本地分发策略关掉了下载 / 安装入口（见 ui-shared/updates.ts 的 UPDATE_SURFACE）：
+  // 「下载并安装 / 重试下载 / 安装并重启」这一族都不出现。收在这里而不是各处调用点 ——
+  // 面板渲染、「去更新」深链的自动下载、强制更新门的判断都读这一个函数，一处收口
+  // 就不必逐个拔。已经下好但还没装的包（phase==='ready'）同样不给按钮：它指的
+  // 那一步正是被策略关掉的那一步
+  if (!updateDownloadEnabled()) return null
   // 有更新且真的有可下载资产时才给出按钮：桌面看 asset（安装器），
   // 容器看 serverAsset（服务端包）—— 该版本没挂对应资产时退回纯提示
   const actionable = snap.info?.hasUpdate === true && !!downloadAsset(snap.info)?.url
-  if (!actionable && snap.phase !== 'downloading' && snap.phase !== 'ready') return null
-  const label = snap.phase === 'downloading'
-    ? t('取消下载')
-    : snap.phase === 'failed'
-      ? t('重试下载')
-      : snap.phase === 'ready'
-        ? installButtonText(snap.info)
-        : isSelfUpdate(snap.info) ? t('下载并更新') : t('下载并安装')
+  if (!actionable && snap.phase !== 'ready') return null
+  const label = snap.phase === 'failed'
+    ? t('重试下载')
+    : snap.phase === 'ready'
+      ? installButtonText(snap.info)
+      : isSelfUpdate(snap.info) ? t('下载并更新') : t('下载并安装')
   return { label, disabled: snap.actionBusy }
 }
 
@@ -1130,11 +1157,16 @@ function UpdatePanel() {
     <Card render={<section />} className='panel' onClick={handleExternalClick}>
       <CardHeader className='panel-head'>
         <h2>{t('软件更新')}</h2>
+        {/* 标题旁的「?」：说清这一块能做什么。下载入口关掉时（本地分发策略，
+            见 ui-shared/updates.ts）整段换成「只查不下」的说法 —— 否则悬停提示
+            还在教人怎么下载，而按钮已经不在了 */}
         <span
           className='tip-q'
-          data-tip={selfUpdate
-            ? t('容器内更新：更新包从 GitHub 发布页下载，校验 sha256 后由面板替换容器内的程序与界面文件，再重启服务（容器由 restart 策略拉起，页面会自动刷新）。更新的是容器里的文件，compose 里的镜像标签不变 —— 之后执行 docker compose pull && up -d 会使用镜像里的版本。检查更新与下载的出网线路、GitHub 令牌都在「更新设置」里。')
-            : t('更新包从 GitHub Release 获取，下载后交给本平台安装器。GitHub 访问方式、加速前缀、出网代理和令牌在「更新设置」中配置。默认官方优先，连接失败后尝试加速源；镜像安装包必须匹配官方校验值，取不到时仅使用原始源。指定代理失效会明确报错，不会静默改走直连。')}
+          data-tip={!updateDownloadEnabled()
+            ? t('这一版只提供「查看」：可手动检查 GitHub 上的最新发布版本、查看更新日志，需要升级时请自行到发布页获取安装包。检查更新的出网线路与 GitHub 令牌在「更新设置」里。')
+            : selfUpdate
+              ? t('容器内更新：更新包从 GitHub 发布页下载，校验 sha256 后由面板替换容器内的程序与界面文件，再重启服务（容器由 restart 策略拉起，页面会自动刷新）。更新的是容器里的文件，compose 里的镜像标签不变 —— 之后执行 docker compose pull && up -d 会使用镜像里的版本。检查更新与下载的出网线路、GitHub 令牌都在「更新设置」里。')
+              : t('更新包从 GitHub Release 获取，下载后交给本平台安装器。GitHub 访问方式、加速前缀、出网代理和令牌在「更新设置」中配置。默认官方优先，连接失败后尝试加速源；镜像安装包必须匹配官方校验值，取不到时仅使用原始源。指定代理失效会明确报错，不会静默改走直连。')}
         ></span>
         {/* id 保留：app.js 的 renderTopbarStatus 按 id 镜像徽章文案与语义色（配色经
             data-tone 传；设置页顶栏那枚镜像目前还不读它，保持一致没坏处） */}
@@ -1343,6 +1375,10 @@ declare global {
        *  若仍走 wbApp.updateUpdateBadge，需要在那边改成转发到这里，否则「取消后再弹
        *  一轮」会失效 */
       showUpdateModal(info?: UpdateInfo | null): void
+      /** 下载 / 安装入口是否可用（本地分发策略，见 ui-shared/updates.ts 的
+       *  `UPDATE_SURFACE`）。app.js 用它决定侧栏角标的悬停说明要不要提「下载」——
+       *  口径只留本文件这一处，别在 app.js 里另抄一份常量 */
+      downloadEnabled(): boolean
     }
   }
 }
@@ -1350,4 +1386,5 @@ declare global {
 window.wbUpdatePanel = {
   load, check, syncFromCache, openAndDownload, applyStatus,
   showUpdateModal: (info) => showUpdateModal(info, openAndDownload),
+  downloadEnabled: () => updateDownloadEnabled(),
 }

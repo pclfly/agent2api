@@ -165,6 +165,10 @@ export const PROVIDER_ICONS: Record<string, string> = {
   grok: 'assets/providers/grok.svg',
   'minimax-code': 'assets/providers/minimax-code.svg',
   'minimax-code-global': 'assets/providers/minimax-code.svg',
+  // MiniMax 的 live 身份（插件 provider id `minimax`，国内站 agent.minimax.cn）
+  // 与上面两个停用身份是同一品牌、同一张图。不登记这一行的话，账号页分组带 /
+  // 模型页 / 添加账号弹窗都取不到键，回落成首字母「M」。
+  minimax: 'assets/providers/minimax-code.svg',
   qwenwork: 'assets/providers/qwenwork.svg',
   'qwenwork-intl': 'assets/providers/qwenwork.svg',
   'qwenwork-enterprise': 'assets/providers/qwenwork.svg',

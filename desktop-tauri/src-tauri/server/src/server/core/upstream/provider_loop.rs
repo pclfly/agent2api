@@ -101,8 +101,8 @@ use super::request::{read_upstream_error, TransportRequest};
 use super::usage::LogPhase;
 use super::{
     account_display, account_label, cancellation, connections::ConnectionGuard, describe_proxy,
-    format_reset_text, refusal, reset_hint, rotate, ForwardOutcome, InFlightGuard, RouteTarget,
-    UpstreamService,
+    format_reset_text, refusal, reset_hint, resolve_front_proxy, rotate, ForwardOutcome,
+    InFlightGuard, RouteTarget, UpstreamService,
     MAX_ROUTE_ATTEMPTS,
 };
 
@@ -1238,6 +1238,37 @@ async fn attempt_queue(
                         .unwrap_or_else(|| "?".to_string()),
                 ),
             );
+            // ── 配了代理但不可用：拒绝，不回退直连 ──────────────────
+            // 账号明明配了出口（订阅节点 / 代理池条目），而这一轮解析不出来时，
+            // 直连等于把账号的真实 IP 暴露给上游 —— 订阅节点端口失效时尤其危险
+            // （内核没起来 / 被手动停了 / 机器重启后没拉起，池里的 `port` 仍然
+            // 留着，但没人监听）。
+            //
+            // 与 `proxy_notice` 的分工：那条是「没配代理 / 显式直连」的提示，
+            // 允许直连；这条是「配了却不可用」，必须停。
+            if let Some(reason) = target.proxy_blocked.as_ref() {
+                return Err(GatewayError::with_status(
+                    502,
+                    format!(
+                        "账号「{}」配置的代理不可用，已停止请求（不回退直连）：{reason}",
+                        target
+                            .account
+                            .as_ref()
+                            .map(account_display)
+                            .or_else(|| target.account_id.clone())
+                            .unwrap_or_else(|| "该账号".to_string()),
+                    ),
+                ));
+            }
+            // 前置跳（`frontProxy`）只在本轮真的要用账号出口时解析：显式指定了
+            // 直连 / 节点的请求不继承它（`proxy_override` 是完整出口覆盖）。
+            // 解析失败是**硬错误**：静默降级会让请求从错误的地区出去。
+            let front_proxy = if ctx.proxy_override.is_some() {
+                None
+            } else {
+                resolve_front_proxy(target.account.as_ref())
+                    .map_err(|reason| GatewayError::with_status(502, reason))?
+            };
             let transport = TransportRequest {
                 url: plan.url,
                 headers: plan.headers,
@@ -1246,6 +1277,7 @@ async fn attempt_queue(
                 // 能力位由适配器给；账号已配代理或本次显式指定了直连/节点时它不参与
                 system_proxy_when_unset: ctx.proxy_override.is_none()
                     && adapter.system_proxy_when_unset(),
+                front_proxy,
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
@@ -2311,22 +2343,147 @@ async fn attempt_custom(
             describe_proxy(target.proxy.as_ref()),
         ),
     );
-    // ── 轮询档的 429 补救：换下一个出口原地重发 ────────────────────
+    // ── 轮询档的换出口补救：失败时换下一个出口原地重发 ──────────────
     // OpenCode Zen 免费档的 429 是**按 IP** 判的（这个出口的免费额度用完，
     // 见 `core::proxy_rotate` 的模块头）——换一个出口往往就过了，而按「账号
     // 被限额」处理会白白把这台账号冷却掉。所以这里在轮询档上最多原地换
-    // [`MAX_ROTATE_EXIT_RETRIES`] 个出口；都 429 才把错误交给调用方，走既有的
+    // [`MAX_ROTATE_EXIT_RETRIES`] 个出口；都失败才把错误交给调用方，走既有的
     // 「按模型冷却 + 顺延下一个账号」。
     //
-    // 只对 429（`is_quota_limit`）动手：连接错误 / 5xx / 4xx 与出口无关，
-    // 换出口只是白花一次往返（那类失败由调用方顺延下一个账号兜底）。
+    // ── 什么时候换：由账号的 `failureMode` 决定（#31）───────────────
+    // `smart`（默认）：只换**与出口有关**的失败 —— 传输层、429/403 且文案指向
+    //   IP/地区限制（判据 `proxy_rotate::is_egress_failure`）。上游业务错误
+    //   （模型不存在、参数不对）换出口照样失败，换它只是白花往返。
+    // `all_errors`：任何失败都换（自建前置 / 企业网关这类「上游回什么都可能
+    //   是这条出口的锅」的场景）。
+    //
+    // ── 换出去之后要给冷却表记账（#32）────────────────────────────
+    // 失败的那条出口按 `(账号, 出口, origin)` 记一次冷却，于是下一次选路
+    // **主动跳过它**而不是等游标转一圈又撞回来。冷却只落哈希（见
+    // `proxy_rotate::health` 的模块头）。
+    let rotate_config = target
+        .account
+        .as_ref()
+        .and_then(|account| account.pointer("/proxy/config"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let is_rotating = custom_forward::is_rotate_account(target.account.as_ref());
+    // 目标 origin：冷却的作用域（同一出口对 A 家被限流不代表对 B 家不通）。
+    // `forward` 不返回 URL，所以按自定义提供商的 `baseUrl` 取 —— 那就是这条
+    // 链路真正要打的上游。取不到（配置缺失 / 非法）时 `None`，冷却退化成
+    // 「按出口记账、不分上游」，比不记账好。
+    let origin = crate::server::core::custom_providers::get(&provider_id)
+        .and_then(|provider| {
+            provider
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .and_then(|base| crate::server::core::proxy_rotate::health::canonical_origin(&base));
+    let rotate_epoch = crate::server::core::proxy_rotate::health::epoch();
+    // 轮询档的出口并发预算（#34）：按 (origin, 出口) 计。非轮询档不参与 ——
+    // 单条出口的账号没有「换一条」的语义，限并发只会凭空多一个失败点。
+    let balance_settings = if is_rotating {
+        Some(crate::server::core::proxy_settings::rotate_balance())
+    } else {
+        None
+    };
     let mut proxy = target.proxy.clone();
-    let mut rotate_left = if custom_forward::is_rotate_account(target.account.as_ref()) {
+    let mut rotate_left = if is_rotating {
         MAX_ROTATE_EXIT_RETRIES
     } else {
         0
     };
     loop {
+        let starting_proxy = proxy.clone();
+        // ── 冷却刚到期：先探一下再用（#33）──────────────────────────
+        // 冷却到期只说明「退避时间到了」，不说明出口已恢复。直接发请求大概率
+        // 再失败一次、退避翻倍；一次 5 秒的 HEAD 探测能提前判定。探测失败就
+        // 重新打开冷却并换下一条出口（**不浪费一次真实请求的额度**）。
+        if let (Some(account_id), Some(origin), Some(proxy_ref)) = (
+            target.account_id.as_deref(),
+            origin.as_deref(),
+            starting_proxy.as_ref(),
+        ) {
+            if crate::server::core::proxy_rotate::health::needs_probe(
+                account_id, proxy_ref, origin,
+            )
+            .is_some()
+            {
+                let route = crate::server::core::proxy_rotate::health::proxy_identity(proxy_ref);
+                let probe = crate::server::core::proxy_rotate::probe::check(
+                    route,
+                    origin,
+                    proxy_ref,
+                    false,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                )
+                .await;
+                if let Err(error) = probe {
+                    crate::server::core::proxy_rotate::health::note_probe_failure(
+                        account_id,
+                        proxy_ref,
+                        origin,
+                        std::time::Duration::ZERO,
+                    );
+                    let reason = format!(
+                        "出口 {} 恢复探测未通过（{}）：改用下一条出口",
+                        describe_proxy(Some(proxy_ref)),
+                        error.message,
+                    );
+                    logging::verbose("[Upstream]", &format!("🔎 {reason}"));
+                    ctx.telemetry.note_attempt_retry(&reason, None, 0);
+                    // 换下一条；没有就走「都不可用」那条收尾
+                    if rotate_left > 0 {
+                        if let Some(account_id) = target.account_id.as_deref() {
+                            let store = service.store.clone();
+                            let account = account_id.to_string();
+                            let origin = origin.to_string();
+                            let next = crate::server::core::blocking::run(move || {
+                                store.next_rotate_proxy(&account, Some(origin.as_str()))
+                            })
+                            .await?;
+                            if let Ok(Some(next)) = next {
+                                rotate_left -= 1;
+                                proxy = Some(next);
+                                continue;
+                            }
+                        }
+                    }
+                    ctx.telemetry.finish_last_attempt(
+                        Some(503),
+                        Some("轮询出口恢复探测未通过"),
+                    );
+                    return Err(GatewayError::with_status(
+                        503,
+                        "轮询出口恢复探测未通过，且没有其它可用出口",
+                    ));
+                }
+            }
+        }
+        // 准入：拿到 permit 才能发（drop 即释放，见 `admission::Permit` 的说明）
+        let _admission = match (balance_settings, starting_proxy.as_ref()) {
+            (Some(settings), Some(proxy_ref)) => {
+                match crate::server::core::proxy_rotate::admit(
+                    origin.as_deref(),
+                    proxy_ref,
+                    settings,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+                )
+                .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        // 准入失败**不是**上游的问题：给一个明确的 503，且不记
+                        // 任何冷却 / 账号限额（那是本机排队排满了）
+                        ctx.telemetry
+                            .finish_last_attempt(Some(503), Some(&error.message()));
+                        return Err(GatewayError::with_status(503, error.message()));
+                    }
+                }
+            }
+            _ => None,
+        };
         match custom_forward::forward(
             &service.store,
             &provider_id,
@@ -2368,38 +2525,82 @@ async fn attempt_custom(
                 return Ok(outcome);
             }
             Err(error) => {
+                // ── 先给冷却表记账（#32）─────────────────────────────
+                // 只在与出口有关时记（判据同 `failureMode: smart`）—— 把业务
+                // 错误也记进去会让好出口被无故冻住几分钟。`all_errors` 档下
+                // 调用方已经把「任何失败都可能是出口的锅」这个判断交给我们了，
+                // 所以那一档照记。
+                if is_rotating {
+                    if let (Some(account_id), Some(origin)) =
+                        (target.account_id.as_deref(), origin.as_deref())
+                    {
+                        let status = u16::try_from(error.status_code).ok();
+                        let relevant = crate::server::core::proxy_rotate::should_rotate_on(
+                            &rotate_config,
+                            status,
+                            &error.message,
+                        );
+                        if relevant {
+                            if let Some(failed) = starting_proxy.as_ref() {
+                                let retry_after = crate::server::core::proxy_rotate::retry_after_delay(
+                                    None,
+                                    &error.message,
+                                );
+                                crate::server::core::proxy_rotate::health::note_failure_unreserved(
+                                    account_id,
+                                    failed,
+                                    origin,
+                                    retry_after,
+                                    rotate_epoch,
+                                );
+                            }
+                        }
+                    }
+                }
                 // 换出口重发（同一账号、同一条尝试明细：明细里追加一条内部重试，
                 // 与「动作 0 换提示词重试」同一记账形态，见 `note_attempt_retry`）。
-                if rotate_left > 0 && error.is_quota_limit() {
-                    if let Some(account_id) = target.account_id.as_deref() {
-                        let store = service.store.clone();
-                        let account_id = account_id.to_string();
-                        let next = crate::server::core::blocking::run(move || store.next_rotate_proxy(&account_id)).await?;
-                        match next {
-                            Ok(Some(next)) => {
-                                rotate_left -= 1;
-                                let reason = format!(
-                                    "轮询换出口重试（下一个 {label}）：上游 {status} 表示该出口已用完额度",
-                                    label = describe_proxy(Some(&next)),
-                                    status = error.status_code,
-                                );
-                                logging::verbose("[Upstream]", &format!("🔁 {reason}"));
-                                ctx.telemetry.note_attempt_retry(
-                                    &reason,
-                                    Some(i64::from(error.status_code)),
-                                    0,
-                                );
-                                proxy = Some(next);
-                                continue;
-                            }
-                            // 不是轮询档（理论上不会走到：上面已按它开门）——
-                            // 按原错误收尾，不制造第二条消息
-                            Ok(None) => {}
-                            // 是轮询档但一条候选都取不出来（池空了 / 全被禁用）：
-                            // 原错误更有信息量（上游为什么拒），换出口那件事
-                            // 如实记一句到明细里，便于排障时区分两种成因
-                            Err(reason) => {
-                                ctx.telemetry.note_attempt_retry(&reason, None, 0);
+                if rotate_left > 0 {
+                    let status = u16::try_from(error.status_code).ok();
+                    let should_rotate = crate::server::core::proxy_rotate::should_rotate_on(
+                        &rotate_config,
+                        status,
+                        &error.message,
+                    );
+                    if should_rotate {
+                        if let Some(account_id) = target.account_id.as_deref() {
+                            let store = service.store.clone();
+                            let account_id = account_id.to_string();
+                            let origin = origin.clone();
+                            let next = crate::server::core::blocking::run(move || {
+                                store.next_rotate_proxy(&account_id, origin.as_deref())
+                            })
+                            .await?;
+                            match next {
+                                Ok(Some(next)) => {
+                                    rotate_left -= 1;
+                                    let reason = format!(
+                                        "轮询换出口重试（下一个 {label}）：上游 {status} 与该出口有关",
+                                        label = describe_proxy(Some(&next)),
+                                        status = error.status_code,
+                                    );
+                                    logging::verbose("[Upstream]", &format!("🔁 {reason}"));
+                                    ctx.telemetry.note_attempt_retry(
+                                        &reason,
+                                        Some(i64::from(error.status_code)),
+                                        0,
+                                    );
+                                    proxy = Some(next);
+                                    continue;
+                                }
+                                // 不是轮询档（理论上不会走到：上面已按它开门）——
+                                // 按原错误收尾，不制造第二条消息
+                                Ok(None) => {}
+                                // 是轮询档但一条候选都取不出来（池空了 / 全被禁用）：
+                                // 原错误更有信息量（上游为什么拒），换出口那件事
+                                // 如实记一句到明细里，便于排障时区分两种成因
+                                Err(reason) => {
+                                    ctx.telemetry.note_attempt_retry(&reason, None, 0);
+                                }
                             }
                         }
                     }

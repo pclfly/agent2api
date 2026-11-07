@@ -19,7 +19,7 @@ import {
 } from '@ui'
 import {
   durationText, errorMessage, loadSettings, saveItem, saveSettings, toast, wb,
-  type ProxyPoolItem,
+  type ProxyPoolItem, type ProxySettings, type ProxySettingsPayload,
 } from './proxies-state'
 import { t } from '../i18n'
 // 赞助位外链：与文档页/更新日志同一条路（data-external 委托 + 系统浏览器打开）。
@@ -240,66 +240,221 @@ export function ProxyModal({
   )
 }
 
-/* ─── 连通性测试设置 ───────────────────────── */
+/* ─── 网络代理设置 ─────────────────────────── */
 
+/**
+ * 「网络代理 → 设置」弹窗：节点端口区间 + 出口测试网址 + 轮询出口的并发预算。
+ *
+ * ── 三组字段各自的生效时机不同（保存后要说清楚）─────────────────
+ *   · **端口区间**：留给订阅节点的本地监听端口段。内核给被引用的节点开监听器
+ *     时从这段里挑空闲端口，**要手动重启内核**才按新范围分配；已分配的端口
+ *     不会因为改范围而失效（否则所有账号引用会一起断）。
+ *   · **测试网址**：下一次「测试」立刻生效。
+ *   · **并发 / 排队**：下一个请求立刻生效。
+ *   所以保存后**不自动关窗** —— 那段「端口还没落地」的话要留在眼前。
+ */
 export function ProxySettingsModal({ onClose }: { onClose: () => void }) {
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
+  const [base, setBase] = React.useState('')
+  const [end, setEnd] = React.useState('')
   const [testUrl, setTestUrl] = React.useState('')
-  const [defaultUrl, setDefaultUrl] = React.useState('')
+  const [maxConcurrentPerIp, setMaxConcurrentPerIp] = React.useState('1')
+  const [maxQueueSize, setMaxQueueSize] = React.useState('64')
+  const [queueTimeoutSeconds, setQueueTimeoutSeconds] = React.useState('30')
+  const [defaults, setDefaults] = React.useState<NonNullable<ProxySettings['defaults']>>({})
   const [error, setError] = React.useState('')
+  /** 保存成功后说明并发预算与端口范围的不同生效时机。 */
+  const [saved, setSaved] = React.useState(false)
 
   React.useEffect(() => {
     let alive = true
-    void loadSettings().then(data => {
-      if (!alive) return
-      if (!data) throw new Error(t('代理设置响应异常'))
-      setTestUrl(data.testUrl || '')
-      setDefaultUrl(data.defaults?.testUrl || '')
-    }).catch(cause => { if (alive) setError(errorMessage(cause)) })
-      .finally(() => { if (alive) setLoading(false) })
+    void (async () => {
+      try {
+        const data = await loadSettings()
+        if (!alive || data === null) return
+        setBase(String(data.listenerPortBase ?? ''))
+        setEnd(String(data.listenerPortEnd ?? ''))
+        setTestUrl(String(data.testUrl ?? ''))
+        setMaxConcurrentPerIp(String(data.rotateMaxConcurrentPerIp ?? data.defaults?.rotateMaxConcurrentPerIp ?? 1))
+        setMaxQueueSize(String(data.rotateMaxQueueSize ?? data.defaults?.rotateMaxQueueSize ?? 64))
+        setQueueTimeoutSeconds(String(data.rotateQueueTimeoutSeconds ?? data.defaults?.rotateQueueTimeoutSeconds ?? 30))
+        setDefaults(data.defaults ?? {})
+        setLoading(false)
+      } catch (cause) {
+        if (!alive) return
+        setError(errorMessage(cause))
+        setLoading(false)
+      }
+    })()
     return () => { alive = false }
   }, [])
 
-  async function save(): Promise<void> {
-    if (saving || loading) return
+  /** 表单 → 提交 payload；形状非法时返回 null（错误写进状态行） */
+  function draftPayload(): ProxySettingsPayload | null {
+    const baseNumber = Number(base)
+    const endNumber = Number(end)
+    // 下界 1024 与后端同一口径（低于它是系统保留段，后端会拒）
+    if (!Number.isInteger(baseNumber) || baseNumber < 1024 || baseNumber > 65535
+      || !Number.isInteger(endNumber) || endNumber < 1024 || endNumber > 65535) {
+      setError(t('端口范围必须是 1024-65535 的整数'))
+      return null
+    }
+    if (baseNumber > endNumber) {
+      setError(t('起始端口不能大于结束端口'))
+      return null
+    }
     const url = testUrl.trim()
     if (url && !/^https?:\/\//i.test(url)) {
       setError(t('测试网址要以 http:// 或 https:// 开头'))
-      return
+      return null
     }
-    setSaving(true)
+    const concurrent = Number(maxConcurrentPerIp)
+    const queue = Number(maxQueueSize)
+    const timeout = Number(queueTimeoutSeconds)
+    // 空串不能隐式变成 0；只收十进制整数字面量，拒绝小数、NaN、指数及超限
+    if (!/^\d+$/.test(maxConcurrentPerIp.trim()) || !Number.isInteger(concurrent)
+      || concurrent < 1 || concurrent > 32) {
+      setError(t('每个出口 IP 的最大并发必须是 1-32 的整数'))
+      return null
+    }
+    if (!/^\d+$/.test(maxQueueSize.trim()) || !Number.isInteger(queue) || queue < 0 || queue > 1024) {
+      setError(t('最大排队数必须是 0-1024 的整数'))
+      return null
+    }
+    if (!/^\d+$/.test(queueTimeoutSeconds.trim()) || !Number.isInteger(timeout)
+      || timeout < 1 || timeout > 300) {
+      setError(t('排队超时必须是 1-300 秒的整数'))
+      return null
+    }
     setError('')
-    try {
-      await saveSettings({ testUrl: url })
-      toast(t('✅ 连通性测试设置已保存'))
-      onClose()
-    } catch (cause) {
-      setError(errorMessage(cause))
-    } finally { setSaving(false) }
+    return {
+      listenerPortBase: baseNumber,
+      listenerPortEnd: endNumber,
+      testUrl: url,
+      rotateMaxConcurrentPerIp: concurrent,
+      rotateMaxQueueSize: queue,
+      rotateQueueTimeoutSeconds: timeout,
+    }
   }
 
-  return <Dialog open onOpenChange={open => { if (!open && !saving) onClose() }}>
-    <DialogContent className='max-w-[500px]'>
-      <DialogHeader><DialogTitle>{t('连通性测试设置')}</DialogTitle></DialogHeader>
-      <DialogBody>
-        <div className='flex flex-col gap-1.5'>
-          <Label htmlFor='proxy-settings-url'>{t('测试目标网址')}</Label>
-          <Input id='proxy-settings-url' value={testUrl} placeholder={defaultUrl} autoComplete='off' spellCheck={false}
-            disabled={loading || saving} className='font-mono text-xs'
-            onChange={event => setTestUrl(event.currentTarget.value)} />
-        </div>
-        <p className='text-xs leading-[1.8] text-subtle'>
-          {t('通过代理访问该网址，检查是否能收到 HTTP 响应。留空沿用网关默认值。')}
-        </p>
-        {loading ? <p className='text-xs text-subtle'>{t('加载中…')}</p> : null}
-        {error ? <p className='text-xs text-destructive'>❌ {error}</p> : null}
-      </DialogBody>
-      <DialogFooter>
-        <Button variant='ghost' className='mr-auto' disabled={loading || saving} onClick={() => { setTestUrl(''); setError('') }}>{t('恢复默认')}</Button>
-        <Button variant='outline' disabled={saving} onClick={onClose}>{t('取消')}</Button>
-        <Button disabled={loading || saving} onClick={() => void save()}>{saving ? t('保存中…') : t('保存设置')}</Button>
-      </DialogFooter>
-    </DialogContent>
-  </Dialog>
+  async function save(): Promise<void> {
+    if (saving || loading) return
+    setSaved(false)
+    const payload = draftPayload()
+    if (!payload) return
+    setSaving(true)
+    try {
+      await saveSettings(payload)
+      setSaved(true)
+      toast(t('✅ 网络代理设置已保存'))
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  /** 恢复默认：把默认值回填进表单（还不是「保存」—— 用户确认后一起提交） */
+  function resetToDefaults(): void {
+    setBase(String(defaults.listenerPortBase ?? ''))
+    setEnd(String(defaults.listenerPortEnd ?? ''))
+    setTestUrl(String(defaults.testUrl ?? ''))
+    setMaxConcurrentPerIp(String(defaults.rotateMaxConcurrentPerIp ?? 1))
+    setMaxQueueSize(String(defaults.rotateMaxQueueSize ?? 64))
+    setQueueTimeoutSeconds(String(defaults.rotateQueueTimeoutSeconds ?? 30))
+    setSaved(false)
+    setError('')
+  }
+
+  return (
+    <Dialog open onOpenChange={open => { if (!open && !saving) onClose() }}>
+      <DialogContent className='max-w-[560px]'>
+        <DialogHeader>
+          <DialogTitle>{t('代理设置')}</DialogTitle>
+        </DialogHeader>
+        <DialogBody className='flex flex-col gap-3.5'>
+          {loading ? (
+            <p className='text-xs text-subtle'>{t('加载中…')}</p>
+          ) : (
+            <>
+              <div className='flex flex-row items-end gap-2.5'>
+                <div className='flex min-w-0 flex-1 flex-col gap-1.5'>
+                  <Label htmlFor='proxy-settings-base'>{t('节点端口范围（起始）')}</Label>
+                  <Input id='proxy-settings-base' type='number' min={1024} max={65535}
+                    placeholder={String(defaults.listenerPortBase ?? '')} autoComplete='off'
+                    value={base} onChange={event => { setBase(event.currentTarget.value); setSaved(false) }} />
+                </div>
+                <span aria-hidden='true' className='flex-none pb-[7px] text-subtle'>—</span>
+                <div className='flex min-w-0 flex-1 flex-col gap-1.5'>
+                  <Label htmlFor='proxy-settings-end'>{t('节点端口范围（结束）')}</Label>
+                  <Input id='proxy-settings-end' type='number' min={1024} max={65535}
+                    placeholder={String(defaults.listenerPortEnd ?? '')} autoComplete='off'
+                    value={end} onChange={event => { setEnd(event.currentTarget.value); setSaved(false) }} />
+                </div>
+              </div>
+              <p className='text-xs leading-[1.65] text-subtle'>
+                {t('订阅节点会在本机各占一个监听端口，从该范围里挑空闲的分配；节点多的大订阅把默认范围（{base}-{end}）用尽时会报「没有可用的节点端口」，这时把范围调大再重启内核。已分配出去的端口不会因改范围而失效。', {
+                  base: defaults.listenerPortBase ?? '',
+                  end: defaults.listenerPortEnd ?? '',
+                })}
+              </p>
+
+              <div className='flex flex-col gap-1.5'>
+                <Label htmlFor='proxy-settings-url'>{t('出口测试网址')}</Label>
+                <Input id='proxy-settings-url' placeholder={defaults.testUrl || ''}
+                  autoComplete='off' spellCheck={false} className='font-mono text-[12px]'
+                  value={testUrl} onChange={event => { setTestUrl(event.currentTarget.value); setSaved(false) }} />
+              </div>
+              <p className='text-xs leading-[1.65] text-subtle'>
+                {t('「测试」与「批量测试」访问的目标；留空用默认。判据是能否拿到 HTTP 响应，不用考虑该网址返回什么内容。')}
+              </p>
+
+              <div className='grid grid-cols-1 gap-2.5 sm:grid-cols-3'>
+                <div className='flex min-w-0 flex-col gap-1.5'>
+                  <Label htmlFor='proxy-settings-concurrent'>{t('每个出口 IP 的最大并发')}</Label>
+                  <Input id='proxy-settings-concurrent' type='number' min={1} max={32} step={1}
+                    placeholder={String(defaults.rotateMaxConcurrentPerIp ?? 1)} autoComplete='off'
+                    value={maxConcurrentPerIp}
+                    onChange={event => { setMaxConcurrentPerIp(event.currentTarget.value); setSaved(false) }} />
+                </div>
+                <div className='flex min-w-0 flex-col gap-1.5'>
+                  <Label htmlFor='proxy-settings-queue'>{t('最大排队数')}</Label>
+                  <Input id='proxy-settings-queue' type='number' min={0} max={1024} step={1}
+                    placeholder={String(defaults.rotateMaxQueueSize ?? 64)} autoComplete='off'
+                    value={maxQueueSize}
+                    onChange={event => { setMaxQueueSize(event.currentTarget.value); setSaved(false) }} />
+                </div>
+                <div className='flex min-w-0 flex-col gap-1.5'>
+                  <Label htmlFor='proxy-settings-queue-timeout'>{t('排队超时（秒）')}</Label>
+                  <Input id='proxy-settings-queue-timeout' type='number' min={1} max={300} step={1}
+                    placeholder={String(defaults.rotateQueueTimeoutSeconds ?? 30)} autoComplete='off'
+                    value={queueTimeoutSeconds}
+                    onChange={event => { setQueueTimeoutSeconds(event.currentTarget.value); setSaved(false) }} />
+                </div>
+              </div>
+              <p className='text-xs leading-[1.65] text-subtle'>
+                {t('仅在账号使用「轮询」档时生效：同一真实出口 IP 跨账号共享并发名额，响应流结束后释放；未知 IP 保守串行。全部繁忙时排队，不惩罚账号；最大排队数为 0 时满载立即拒绝。')}
+              </p>
+
+              <div className='min-h-[18px] text-xs'>
+                {error ? <span className='text-destructive'>❌ {error}</span> : null}
+                {!error && saved ? (
+                  <span className='text-success'>
+                    {t('已保存。并发与排队设置对下个请求生效；端口范围需手动重启内核重建监听器后用于新分配，已分配端口沿用。本次保存不会自动重启。')}
+                  </span>
+                ) : null}
+              </div>
+            </>
+          )}
+        </DialogBody>
+        <DialogFooter>
+          <Button variant='ghost' disabled={loading || saving} onClick={resetToDefaults}>{t('恢复默认')}</Button>
+          <div className='mr-auto' />
+          <Button variant='outline' disabled={saving} onClick={onClose}>{t('关闭')}</Button>
+          <Button disabled={loading || saving} onClick={() => void save()}>{saving ? t('保存中…') : t('保存')}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }

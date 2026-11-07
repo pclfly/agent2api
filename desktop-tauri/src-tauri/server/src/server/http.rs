@@ -441,10 +441,21 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/proxies/pool/remove", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/test", any(api::accounts::proxies_entry))
         .route("/api/proxies/pool/sync-clash", any(api::accounts::proxies_entry))
+        // 只列可用条目（账号侧代理下拉 / 轮询候选）：不同步 Clash、滤掉禁用项。
+        .route("/api/proxies/pool/usable", any(api::accounts::proxies_entry))
         .route("/api/proxies/settings", any(api::accounts::proxies_entry))
-        // ── 已下线的订阅入口只返回状态，不再读取请求体或执行内核操作 ──
-        .route("/api/subscriptions", any(retired_proxy_feature))
-        .route("/api/subscriptions/{*rest}", any(retired_proxy_feature))
+        // 出口冷却（轮询档）：读摘要 + 全清。两条都在 `proxies_entry` 里按
+        // `(方法, 剩余段)` 分派，与其他代理子路径同一形态。
+        .route("/api/proxies/rotate/cooldowns", any(api::accounts::proxies_entry))
+        .route(
+            "/api/proxies/rotate/clear-cooldowns",
+            any(api::accounts::proxies_entry),
+        )
+        // ── 订阅与内核（v3.4.0 曾整体下线，现恢复）──────────────
+        // 全部子路径交给同一个入口分派（与 proxies_entry 同一形态：通配段
+        // 会与 404 兜底互相干扰，所以只注册一条通配）。
+        .route("/api/subscriptions", any(api::subscriptions::entry))
+        .route("/api/subscriptions/{*rest}", any(api::subscriptions::entry))
         // ── 积分 / 签到 / 运营活动（对照 server.mjs 871-911 行）──
         // 六条都挂在 protected（Node 版每条都调了 checkApiKey），
         // 失败时的 body 是 OpenAI 风格（那几条在 server.mjs 的大 try 里）
@@ -916,6 +927,8 @@ pub fn gateway_router(state: ServerState) -> Router {
         .route("/v1/messages/count_tokens", post(api::chat::count_tokens))
         .route("/v1/images/generations", post(api::images::generations))
         .route("/v1/images/edits", post(api::images::edits))
+        // 先鉴权、再判就绪：顺序见 `require_egress_ready` 的说明
+        .layer(middleware::from_fn(require_egress_ready))
         .layer(middleware::from_fn(require_api_key))
         .with_state(state);
     health.merge(open.merge(guarded))
@@ -1091,6 +1104,30 @@ fn attach_cors(headers: &mut axum::http::HeaderMap) {
 /// 模型调用必须携带有效网关 Key，管理员会话不能代替模型鉴权。
 /// 管理接口另认可管理员会话；受限 Key 没有管理权限。
 /// `/v1/models` 是独立的只读探针：不带 Key 可读取，携带 Key 时必须有效。
+/// 转发面的出口闸门：账号绑定的订阅节点端口没就绪时**拒绝转发**。
+///
+/// ── 为什么需要这一道（而不是等请求自己失败）────────────────────
+/// 内核冷启动要几秒。这段时间里账号绑定的节点端口还没分配 / 还没 listen，
+/// 代理解析可能失败 —— 而转发链的兜底是**回退直连**（`with_proxy_notice`），
+/// 等于把账号真实 IP 暴露给上游。运行时那条「配了代理但不可用」的拦截
+/// 已经把这种情形变成 502，但**启动期**整批请求都撞上它，用户体验是
+/// 「刚开机就全红」；先把内核拉起来再放行更合理。
+///
+/// ── 为什么排在鉴权之后 ─────────────────────────────────────────
+/// 先鉴权（401）再谈就绪（503）：拿错 key 的人不该从状态码里读到
+/// 「这个网关正在起内核」这类运行期信息。
+async fn require_egress_ready(request: Request, next: Next) -> Response {
+    if crate::server::core::egress_ready::is_ready() {
+        return next.run(request).await;
+    }
+    crate::server::errors::GatewayError::with_status(
+        503,
+        crate::server::core::egress_ready::blocked_message(),
+    )
+    .with_code("egress_not_ready")
+    .payload_response()
+}
+
 async fn require_api_key(mut request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
     if path.starts_with("/v1/") {

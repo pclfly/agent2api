@@ -143,6 +143,15 @@ fn empty() -> Arc<RoutingSnapshot> {
 }
 
 // 复用各家公开投影的字段口径，只缓存选路和发送编排需要的部分。
+//
+// ── 为什么 `frontProxy` 必须整份带过来（不是只带 source）─────────
+// 转发层的两跳读的就是这份快照里的账号：
+// `resolve_front_proxy(target.account)` → `.pointer("/frontProxy/config")`。
+// 原先它只把 `proxy` 压成 `{config:{source}}`（选路只需要 source），而
+// `frontProxy` **根本不在白名单里** —— 于是两跳在快照这一层就断了：存储里有
+// 前置跳、账号列表也显示正常，转发却永远走单跳（日志里只有第二跳的 CONNECT）。
+// 实测在 MiniMax 账号上踩到，排查横跨「公开投影 / 记录 / 建链」三处才落到这里。
+// 这里带整份（含原始 `config`）而不是只带 source：建链要用端口与凭据。
 fn route_account(account: &Value) -> Value {
     let mut public = Map::new();
     for key in [
@@ -155,5 +164,10 @@ fn route_account(account: &Value) -> Value {
     }
     let source = account.pointer("/proxy/config/source").and_then(Value::as_str).unwrap_or("");
     public.insert("proxy".to_string(), json!({ "config": { "source": source } }));
+    // 前置跳：键恒在（null = 没配），与公开投影同一口径
+    public.insert(
+        "frontProxy".to_string(),
+        account.get("frontProxy").cloned().unwrap_or(Value::Null),
+    );
     Value::Object(public)
 }

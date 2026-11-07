@@ -32,6 +32,7 @@ use crate::server::core::providers::catalog::{
     advertised_manifest_contains, default_model_catalog, default_model_usable,
     has_available_providers, model_blocked_everywhere, suggest_advertised,
 };
+use crate::server::core::upstream::credit_estimate;
 use crate::server::core::upstream::usage::{self, RequestTelemetry, TelemetrySnapshot};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
@@ -626,6 +627,51 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     entry.completion_tokens = snapshot.completion_tokens;
     entry.total_tokens = snapshot.total_tokens;
     entry.cache_read_tokens = snapshot.cache_read_tokens;
+    // 本次消耗积分（上游 usage 块里的 `credit`；None = 这一家没上报）。
+    //
+    // ── 为什么这一行必须在这里 ──────────────────────────────────
+    // schema v23 建了 `requests.credit` 列，`RequestTelemetry` 也一路把它采集
+    // 到了 `snapshot.credit` —— 但收尾记账**从没把它写进 entry**，于是那一列
+    // 在库里恒为 NULL，报表与请求日志的「消耗」永远是空的。采集链是通的，
+    // 断的只是这最后一跳。
+    //
+    // 与 token 四件套同源、同一「最后一次上报覆盖」口径（见
+    // `TelemetrySnapshot::credit` 的说明）：多轮尝试时保留最后那一轮的上游读数。
+    //
+    // ── 上游不报时的预估 ────────────────────────────────────────
+    // 多数家的计费发生在独立账本平面（余额接口 / `bills` / `points/records`），
+    // 对话流里只有 Token、`usage.credit` 恒缺 —— 那些家的「消耗」列会永远空着。
+    // 这里按 Token × 该家倍率折一个预估值兜底，并标成 `estimate`：前端据
+    // `creditSource` 显示 `≈` 与「并非上游实际扣费」。
+    //
+    // **只在实报缺失时估**：上游给了 credit（包括明确的 0）就以它为准 ——
+    // 估算绝不覆盖实报，与 `report_usage` 的「没有不能覆盖有」同一条纪律。
+    let estimated = if snapshot.credit.is_none() {
+        let provider = entry.provider.as_deref().unwrap_or("");
+        credit_estimate::estimate(
+            provider,
+            &entry.upstream_model,
+            &usage::UsageTokens {
+                prompt: entry.prompt_tokens,
+                completion: entry.completion_tokens,
+                total: entry.total_tokens,
+                cache_read: entry.cache_read_tokens,
+                credit: None,
+            },
+            &credit_estimate_catalog(provider),
+        )
+    } else {
+        None
+    };
+    entry.credit = snapshot.credit.or(estimated);
+    entry.credit_source = if entry.credit.is_none() {
+        String::new()
+    } else if snapshot.credit.is_some() {
+        "reported".to_string()
+    } else {
+        // 走到这里必然是上面算出的预估值
+        "estimate".to_string()
+    };
     // Token 限制器的增量记账（先取快照再 record：entry 的字段已被 move）。
     // 请求收尾立刻把本次消耗加进当前窗口，选路的 Token 跳过判定不必等下一轮
     // 10 秒刷新。account_id 为空 = 没走到任何账号（转发前就失败的路径），
@@ -679,6 +725,23 @@ pub fn truncate_chars(text: &str, limit: usize) -> String {
     let mut out: String = text.chars().take(limit).collect();
     out.push('…');
     out
+}
+
+/// 取某家的模型清单，供积分估算查**逐模型倍率**。
+///
+/// ── 为什么在这里取而不是在估算模块里 ────────────────────────
+/// 清单的所有权在各家适配器（插件家的走 `models.list` RPC、内置家有各自的
+/// 目录缓存），估算模块只应该做纯计算 —— 让它在内部去查注册表会把「一次纯
+/// 函数调用」变成一次跨模块调用，且单元测试要连带起整套适配器。
+///
+/// 用 `adapter_by_id`（插件优先、同步查表）而不是 `adapter_for`：后者只认
+/// 内置 kind，插件家拿不到清单，逐模型倍率会全部回落基准档。
+/// 不认识 / 未安装的 provider（自定义提供商、空串）返回空表 —— 估算模块对
+/// 没有标定的家本来就不估算。
+fn credit_estimate_catalog(provider: &str) -> Vec<Value> {
+    crate::server::core::providers::adapter::adapter_by_id(provider)
+        .map(|adapter| adapter.list_models())
+        .unwrap_or_default()
 }
 
 /// 边透传边记账的响应流。
@@ -1209,6 +1272,12 @@ mod tests {
             limit: Some(5),
             model: None,
             provider: None,
+            // 客户端 / Key / 生产流量 / 完成态都不参与本用例的断言：
+            // 给「不过滤」的默认值，取回的就是这个库里唯一那条
+            client: None,
+            api_key: None,
+            production_only: false,
+            completed_only: false,
             status: None,
             start: None,
             end: None,
