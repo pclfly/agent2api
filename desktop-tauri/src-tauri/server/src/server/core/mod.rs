@@ -81,6 +81,7 @@ pub mod checkin_records;
 pub mod checkin_schedules;
 pub mod clash;
 pub mod client;
+pub(crate) mod compact_routing;
 // 云同步（设置页「数据 → 云同步」）：WebDAV / S3 兼容存储上的业务数据快照。
 // 范围、密钥封装与自动同步的触发口径见该模块头
 pub mod cloud_sync;
@@ -117,6 +118,7 @@ pub mod proxy_rotate;
 pub mod proxy_settings;
 pub mod proxies;
 pub mod routing;
+pub(crate) mod routing_groups;
 pub mod routing_order;
 pub mod routing_scope;
 pub mod sanitize;
@@ -127,6 +129,9 @@ pub mod scheduled_tasks;
 pub mod sidebar_layout;
 pub mod sub_kernel;
 pub mod subscriptions;
+// 工具服务（「工具服务」页）：网络搜索 / 视觉分析的上游配置、运行时编排与
+// 本机接入。三种对外协议（Skill / MCP / API）共享同一份上游配置，见该模块头
+pub mod tool_services;
 // 运行环境探测（系统 / 架构 / 容器 / 服务形态 / 路径脱敏）：设置页「版本信息」
 // 的数据底座，见该模块头。纯读，不依赖 ServerState。
 pub mod system_info;

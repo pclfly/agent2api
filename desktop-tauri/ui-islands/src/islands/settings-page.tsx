@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { providerPromptRows } from './settings-prompt-rows'
 import { ProviderPromptModelsButton } from './settings-prompt-model-picker'
 import { flushSync } from 'react-dom'
@@ -152,6 +153,8 @@ import { CloudSyncPanel } from './settings-cloud-sync'
 import { DbRestoreDialog } from './settings-db-restore'
 import { DatabaseBackupDialogs, DatabaseBackupPanel } from './settings-database-backup'
 import { SanitizePanel } from './settings-sanitize'
+import { ClientIdentificationPanel } from '../../../ui-shared/client-identification-panel'
+import { clientIdentificationApi } from './settings-client-identification'
 // 侧边栏菜单面板（设置 → 显示）：显隐 / 顺序 / 分组。布局模型在
 // ui/sidebar-layout.js（经典脚本，主侧边栏渲染与这里共用同一份），见该文件的模块头
 import { SidebarPane } from './sidebar-pane'
@@ -2446,6 +2449,7 @@ function SettingsPage() {
           <DisplayPane />
         </div>
         <div className={paneClass('gateway')} data-cat='gateway'>
+          <ClientIdentificationPanel api={clientIdentificationApi} t={t} active={snap.category === 'gateway'} />
           <GatewayPane snap={snap} panels={adminPanels} />
         </div>
         <div className={paneClass('retry')} data-cat='retry'>
@@ -2528,10 +2532,8 @@ function mount(): void {
 // load() 里还会再校准一次，覆盖「页面切回来时状态被重置」的情况。
 restoreCategory()
 
-// 脚本排在页面骨架之后（index.html 里 islands/ui.js 在各 section 之后），正常直接挂；
-// 万一将来被挪到前面，退化成等 DOM 解析完再挂。
-if (document.querySelector(PAGE_SELECTOR)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+// 首次切到本页时才挂载（见 island-lazy）：隐藏页不在首屏渲染，也不拉数据。
+mountOnPage('settings', PAGE_SELECTOR, mount)
 
 /* ─── 注册：对外契约 ─────────────────────────── */
 

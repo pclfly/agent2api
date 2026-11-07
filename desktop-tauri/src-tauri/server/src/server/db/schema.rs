@@ -338,7 +338,12 @@ pub fn is_reserved(key: &str) -> bool {
 /// 请求日志新增「积分」列读它。与 token 四列刻意不同：这一列**可空 REAL** ——
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
-pub const SCHEMA_VERSION: i64 = 24;
+///
+/// ── 版本 24 / 25：合并积分来源与客户端识别证据 ───────────────
+/// 本地 v24 已添加 `credit_source`，官方 v24 则添加 `client_evidence`，同一个
+/// 版本号有两种存量形态。保留本地 v24，并由 v25 幂等补齐两列：无论库来自
+/// 哪条历史，都不会漏列、重复 ALTER 或覆盖已有的积分来源 / 识别证据。
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -922,6 +927,20 @@ fn apply_v24(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// 版本 25：修复本地与官方 v24 的撞号，保留已有列及其内容。
+fn apply_v25(conn: &Connection) -> rusqlite::Result<()> {
+    apply_v24(conn)?;
+    let existing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name = 'client_evidence'",
+        [],
+        |row| row.get(0),
+    )?;
+    if existing == 0 {
+        conn.execute_batch(include_str!("schema_client_identification.sql"))?;
+    }
+    Ok(())
+}
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// **库版本高于本程序时返回 `Err` 拒绝打开**（v14 起有意反转的一条既有决定，
@@ -1099,6 +1118,8 @@ fn apply_version(
         23 => conn.execute_batch(V23_SCHEMA),
         // v24：积分来源列（**带列存在判断**：本地历史库可能已经手工加过）
         24 => apply_v24(conn),
+        // 两条历史都用了 v24；旧 v24 库直接走这里，必须同时补齐两列。
+        25 => apply_v25(conn),
         _ => Ok(()),
     }
 }
@@ -1159,4 +1180,92 @@ fn reset_model_refresh_cooldown(conn: &Connection) -> rusqlite::Result<()> {
         rusqlite::params![encoded],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v23_database() -> rusqlite::Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        let mut cleaned_raw_rows = 0;
+        for version in 1..=23 {
+            apply_version(&conn, version, &mut cleaned_raw_rows)?;
+        }
+        conn.pragma_update(None, "user_version", 23)?;
+        conn.execute(
+            "INSERT INTO requests (id, ts, model, credit) VALUES ('kept', 123, 'model', 0.375)",
+            [],
+        )?;
+        Ok(conn)
+    }
+
+    fn assert_v24_upgrade(has_credit_source: bool, has_client_evidence: bool) -> rusqlite::Result<()> {
+        let conn = v23_database()?;
+        let evidence = r#"{"method":"user_agent","clientName":"Existing client"}"#;
+        if has_credit_source {
+            apply_v24(&conn)?;
+            conn.execute("UPDATE requests SET credit_source = 'estimate'", [])?;
+        }
+        if has_client_evidence {
+            conn.execute_batch(include_str!("schema_client_identification.sql"))?;
+            conn.execute("UPDATE requests SET client_evidence = ?1", [evidence])?;
+        }
+        conn.pragma_update(None, "user_version", 24)?;
+
+        // 重复打开也必须成功；两种 v24 的列序可以不同，已有值不能被覆盖。
+        migrate(&conn)?;
+        migrate(&conn)?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 25);
+        for column in ["credit_source", "client_evidence"] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name = ?1",
+                [column], |row| row.get(0),
+            )?;
+            assert_eq!(count, 1, "{column} must exist exactly once");
+        }
+        let kept: (String, i64, String, f64, String, String) = conn.query_row(
+            "SELECT id, ts, model, credit, credit_source, client_evidence FROM requests",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )?;
+        assert_eq!(kept, (
+            "kept".to_string(), 123, "model".to_string(), 0.375,
+            if has_credit_source { "estimate" } else { "" }.to_string(),
+            if has_client_evidence { evidence } else { "{}" }.to_string(),
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_local_v24_preserves_credit_source() -> rusqlite::Result<()> {
+        assert_v24_upgrade(true, false)
+    }
+
+    #[test]
+    fn migrate_upstream_v24_preserves_client_evidence() -> rusqlite::Result<()> {
+        assert_v24_upgrade(false, true)
+    }
+
+    #[test]
+    fn migrate_v24_with_both_columns_preserves_values() -> rusqlite::Result<()> {
+        assert_v24_upgrade(true, true)
+    }
+
+    #[test]
+    fn migrate_v23_and_new_database_add_both_columns() -> rusqlite::Result<()> {
+        for conn in [v23_database()?, Connection::open_in_memory()?] {
+            migrate(&conn)?;
+            migrate(&conn)?;
+            conn.execute(
+                "INSERT INTO requests (id, ts, model) VALUES ('new', 456, 'model')", [],
+            )?;
+            let defaults: (Option<f64>, String, String) = conn.query_row(
+                "SELECT credit, credit_source, client_evidence FROM requests WHERE id = 'new'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(defaults, (None, String::new(), "{}".to_string()));
+        }
+        Ok(())
+    }
 }

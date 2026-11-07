@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
 import {
   Badge, Button, Checkbox, InputGroup, InputGroupAddon, InputGroupInput, NavList, NavItem,
@@ -9,6 +10,7 @@ import { TableFooter, useClientPaging } from './table-shell'
 import { CapabilityDialog } from './model-capability-dialog'
 import { ModelTestDialog, type ModelTestTarget } from './model-test-dialog'
 import { ModelBatchDialog } from './models-batch-dialog'
+import { CompactRoutesDialog } from './models-compact-dialog'
 import { ModelCell } from './models-cells'
 import { MappingDialog, CustomModelDialog } from './models-dialogs'
 import { DanglingMappings } from './models-dangling'
@@ -155,6 +157,7 @@ function ModelsPage() {
   const [testTarget, setTestTarget] = React.useState<ModelTestTarget | null>(null)
   /** 批量操作的弹窗开关（勾选若干行后由表头旁按钮打开） */
   const [batchOpen, setBatchOpen] = React.useState(false)
+  const [compactOpen, setCompactOpen] = React.useState(false)
   /**
    * 批量勾选的行集合（`rowKeyOf` 键 = provider:id，跨提供商天然不撞）。
    * 刻意**不进模块快照**：只有本页读它，没有从 React 之外打开的调用点 ——
@@ -486,6 +489,8 @@ function ModelsPage() {
                       return n > 0 ? <Badge variant='brand' shape='tag' className='mm-filter-badge'>{n}</Badge> : null
                     })()}
                   </Button>
+                  <Button id='btn-compact-routes' variant='outline' size='sm'
+                    onClick={() => setCompactOpen(true)}>{t('压缩路由')}</Button>
                 </div>
               </div>
               <ResponsiveSheet open={filterOpen} onOpenChange={setFilterOpen} title={t('筛选')}
@@ -629,6 +634,7 @@ function ModelsPage() {
         </div>
       </Card>
       {/* 弹窗走 Dialog（Esc / 点遮罩关闭、焦点陷阱、滚动锁定都内建），按需挂载、关闭即卸 */}
+      {compactOpen ? <CompactRoutesDialog onClose={() => setCompactOpen(false)} /> : null}
       {state.mapping ? <MappingDialog context={state.mapping} onClose={closeMapping} /> : null}
       {state.customModel
         ? <CustomModelDialog initial={state.customModel} onClose={closeCustomModel} />
@@ -670,7 +676,5 @@ function mount(): void {
   root.render(<ModelsPage />)
 }
 
-// 脚本排在页面骨架之后（index.html 里 islands/ui.js 在各 section 之后），正常直接挂；
-// 万一将来被挪到前面，退化成等 DOM 解析完再挂。
-if (document.querySelector(PAGE_SELECTOR)) mount()
-else document.addEventListener('DOMContentLoaded', mount, { once: true })
+// 首次切到本页时才挂载（见 island-lazy）：隐藏页不在首屏渲染，也不拉数据。
+mountOnPage('gateway', PAGE_SELECTOR, mount)

@@ -1,12 +1,14 @@
 import * as React from 'react'
+import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
 import { Badge, Button, Progress , Card, CardHeader, CardContent } from '@ui'
 import {
-  downloadAsset, errorMessage, handleExternalClick, isSelfUpdate, markdownHtml,
-  missingAssetReasonFor, safeExternal, shared, toast, updateDownloadEnabled,
+  downloadAsset, errorMessage, handleExternalClick, isSelfUpdate, isServiceUpdate, isManualUpdate, manualUpdateReason, markdownHtml,
+  missingAssetReasonFor, safeExternal, shared, toast, openExternal, serviceUpdateTask, updateDownloadEnabled,
   type DownloadTask, type UpdateInfo,
 } from './update-shared'
 import { showUpdateModal } from './update-modal'
+import { startServiceUpdate, watchServiceUpdate, serviceTaskActive, type ServiceProgress } from './update-systemd'
 import { UpdateSettingsDialog } from './update-settings'
 import { QqGroupDialog } from './update-qq-group'
 import { SupportDialog } from './update-support-dialog'
@@ -339,6 +341,14 @@ function setState(text: string, isError = false): void {
  * checkedAt / repository / phase 的**纯派生**，React 侧由快照自动重绘。这里只负责那两处
  * 「不是派生」的读数：徽章与状态行。
  */
+function acceptServiceProgress(progress: ServiceProgress): void {
+  stopPolling()
+  publish({ info: progress.info, currentVersion: String(progress.info.currentVersion || snapshot.currentVersion),
+    percent: progress.percent, readyPath: '', phase: progress.active ? 'restarting' : progress.failed ? 'failed' : 'idle' })
+  setBadge(progress.badge, progress.failed ? 'bad' : progress.active ? 'warn' : 'ok')
+  setState(progress.text, progress.failed)
+}
+
 function renderCheckResult(): void {
   const { info, checkedAt, checkError } = snapshot
   if (!info) {
@@ -347,6 +357,14 @@ function renderCheckResult(): void {
       setBadge(t('检查失败'), 'bad')
       setState(t('检查更新失败：{error}', { error: checkError }), true)
     }
+    return
+  }
+  const serviceTask = serviceUpdateTask(info)
+  if (serviceTask
+    && (serviceTaskActive(serviceTask)
+      || (serviceTask.phase === 'failed' && (!info.hasUpdate || serviceTask.version === info.latestVersion))
+      || (!info.hasUpdate && serviceTask.version === info.currentVersion))) {
+    watchServiceUpdate(info, acceptServiceProgress)
     return
   }
   const at = checkedAt ? t('（检查于 {time}）', { time: formatClock(checkedAt) }) : ''
@@ -374,6 +392,13 @@ function renderCheckResult(): void {
   }
   if (info.hasUpdate === true) {
     setBadge(t('有新版本'), 'warn')
+    if (isManualUpdate(info)) {
+      const reason = manualUpdateReason(info)
+      setState(t('发现新版本 {latest}（当前 {current}）。{reason}{at}', {
+        latest: String(info.latestVersion || ''), current: String(info.currentVersion || ''), reason, at,
+      }))
+      return
+    }
     // 容器内更新：该版本没挂服务端更新包时（老 Release / 只发了桌面安装包），
     // 按钮不会出现 —— 把原因与手动命令说清楚，别让人对着没有按钮的面板猜
     if (isSelfUpdate(info) && !info.serverAsset) {
@@ -439,6 +464,10 @@ function renderCheckResult(): void {
  * 自己再点一次「检查更新」：功能都有，只是没串起来。
  */
 function applyStatus(info?: UpdateInfo | null): void {
+  if (info && serviceTaskActive(serviceUpdateTask(info))) {
+    watchServiceUpdate(info, acceptServiceProgress)
+    return
+  }
   if (info?.channelChanged && info.checked === false) {
     failedOnCheckedAt = -1
     publish({ info: null, checkedAt: 0, checkError: '' })
@@ -568,12 +597,13 @@ function renderTask(task: DownloadTask | null | undefined): boolean {
     const totalMb = (Number(task.total) || 0) / 1024 / 1024
     publish({ phase: 'downloading', percent })
     setBadge(t('下载中'), 'warn')
-    setState(t('正在下载 {name}：{percent}%（{received} / {total} MB）', {
+    const text = task.selecting ? t('正在选择下载通道…') : t('正在下载 {name}：{percent}%（{received} / {total} MB）', {
       name: task.filename || t('安装包'),
       percent,
       received: mb.toFixed(1),
       total: totalMb.toFixed(1),
-    }))
+    })
+    setState(task.source ? `${text} · ${t('当前下载通道：{source}', { source: task.source === '官方源' ? t('官方源') : task.source })}` : text)
     return true
   }
 
@@ -596,6 +626,13 @@ function renderTask(task: DownloadTask | null | undefined): boolean {
     return true
   }
   if (task.done && task.path) {
+    // 只读分发不能因为 load() 恢复了旧下载任务就自动启动安装器。
+    // 保留版本与日志读数，不进入「可安装」状态，也不提示点击不存在的安装按钮。
+    if (!updateDownloadEnabled()) {
+      publish({ phase: 'idle', readyPath: '' })
+      renderCheckResult()
+      return true
+    }
     const path = task.path
     const name = task.filename || path
     setBadge(t('可安装'), 'ok')
@@ -665,6 +702,7 @@ function startPolling(): void {
  * 提示语（否则 macOS / Linux 用户会等一个不会发生的退出）。
  */
 async function install(path: string): Promise<void> {
+  if (!updateDownloadEnabled()) return
   const api = shared().workbuddyDesktop
   if (!api) return
   try {
@@ -696,6 +734,7 @@ async function install(path: string): Promise<void> {
  * 与其让用户对着报错，不如自动刷新回「新版本已经在跑」的那一刻。
  */
 async function installSelfUpdate(): Promise<void> {
+  if (!updateDownloadEnabled()) return
   const api = shared().workbuddyDesktop
   if (!api?.installUpdate) return
   try {
@@ -866,6 +905,7 @@ async function syncFromCache(): Promise<void> {
 async function downloadOrCancel(): Promise<void> {
   if (busy) return
   const current = getSnapshot()
+  if (serviceTaskActive(serviceUpdateTask(current.info))) return
 
   // 本地分发策略关掉了下载 / 安装入口：面板外的两条调用（「去更新」深链的
   // openAndDownload、强制更新门的按钮）不经过按钮显隐，必须在这里也拦一次。
@@ -874,6 +914,24 @@ async function downloadOrCancel(): Promise<void> {
   // 上游取包，收尾动作不该被策略挡住。
   const restartOnly = current.info?.pendingRestart === true && current.phase !== 'downloading'
   if (current.phase !== 'downloading' && !restartOnly && !updateDownloadEnabled()) return
+
+  // Windows / systemd 一键更新与「手动下载服务端包」也受本地策略约束。
+  // 只有重新启用下载入口时才走这些新流程；取消遗留下载与待重启收尾继续走下方。
+  if (updateDownloadEnabled() && current.phase !== 'downloading' && !restartOnly) {
+    if (isManualUpdate(current.info)) {
+      const url = downloadAsset(current.info)?.url || current.info?.pageUrl
+      if (url) await openExternal(url)
+      return
+    }
+    if (isServiceUpdate(current.info) && current.info) {
+      busy = true
+      publish({ actionBusy: true })
+      try { await startServiceUpdate(current.info, acceptServiceProgress) }
+      catch (error) { setState(t('无法开始更新：{error}', { error: errorMessage(error) }), true) }
+      finally { busy = false; publish({ actionBusy: false }) }
+      return
+    }
+  }
 
   // 更新已经应用到容器里、只差重启（可能发生在页面上一次打开之后：
   // 安装点了、重启请求没成，或用户在倒计时里刷新了页面）——这一步只重启
@@ -963,6 +1021,7 @@ async function load(): Promise<void> {
   // 面板上（本地读库，不打网络，理由见 syncFromCache）。放在下载任务之前：下面那几条路
   // 会把徽章与状态行换成下载读数，谁的读数更「当下」就归谁
   await syncFromCache()
+  if (isServiceUpdate(snapshot.info) || isManualUpdate(snapshot.info)) return
 
   // 先看有没有上次遗留的下载任务（页面切走再回来时进度不丢）
   try {
@@ -1015,6 +1074,8 @@ async function openAndDownload(checkedInfo?: UpdateInfo | null): Promise<void> {
     showUpdateModal(checkedInfo, openAndDownload)
   }
   await load()
+  // 对外契约仍可铺只读信息，但不能通过深链绕过策略开始下载 / 一键更新。
+  if (!updateDownloadEnabled()) return
   // 已有下载在跑或安装包已就绪：那两种状态下按钮分别是「取消下载」与「安装并重启」，
   // 自动再触发一次语义就错了
   const current = getSnapshot()
@@ -1055,6 +1116,14 @@ function downloadButton(snap: Snapshot): { label: string; disabled: boolean } | 
   // 就不必逐个拔。已经下好但还没装的包（phase==='ready'）同样不给按钮：它指的
   // 那一步正是被策略关掉的那一步
   if (!updateDownloadEnabled()) return null
+  // 新增的服务升级与手动下载入口也必须在策略判断之后，不能绕过只读模式。
+  if (serviceTaskActive(serviceUpdateTask(snap.info))) return { label: t('更新进行中'), disabled: true }
+  if (snap.info?.hasUpdate && isManualUpdate(snap.info)) {
+    return { label: downloadAsset(snap.info)?.url ? t('下载服务端包') : t('查看发布页'), disabled: snap.actionBusy }
+  }
+  if (snap.info?.hasUpdate && isServiceUpdate(snap.info) && downloadAsset(snap.info)?.url) {
+    return { label: t('一键更新'), disabled: snap.actionBusy }
+  }
   // 有更新且真的有可下载资产时才给出按钮：桌面看 asset（安装器），
   // 容器看 serverAsset（服务端包）—— 该版本没挂对应资产时退回纯提示
   const actionable = snap.info?.hasUpdate === true && !!downloadAsset(snap.info)?.url
@@ -1164,9 +1233,13 @@ function UpdatePanel() {
           className='tip-q'
           data-tip={!updateDownloadEnabled()
             ? t('这一版只提供「查看」：可手动检查 GitHub 上的最新发布版本、查看更新日志，需要升级时请自行到发布页获取安装包。检查更新的出网线路与 GitHub 令牌在「更新设置」里。')
-            : selfUpdate
-              ? t('容器内更新：更新包从 GitHub 发布页下载，校验 sha256 后由面板替换容器内的程序与界面文件，再重启服务（容器由 restart 策略拉起，页面会自动刷新）。更新的是容器里的文件，compose 里的镜像标签不变 —— 之后执行 docker compose pull && up -d 会使用镜像里的版本。检查更新与下载的出网线路、GitHub 令牌都在「更新设置」里。')
-              : t('更新包从 GitHub Release 获取，下载后交给本平台安装器。GitHub 访问方式、加速前缀、出网代理和令牌在「更新设置」中配置。默认官方优先，连接失败后尝试加速源；镜像安装包必须匹配官方校验值，取不到时仅使用原始源。指定代理失效会明确报错，不会静默改走直连。')}
+            : snap.info?.updateCapability?.deployment === 'windows-service'
+              ? t('Windows 服务一键更新会核验官方更新包，再由独立升级进程停止服务、备份替换并重新启动。账号与配置保留，确认新版运行后页面自动刷新。')
+              : snap.info?.updateCapability?.deployment === 'systemd'
+                ? t('systemd 一键更新由受限升级程序完成：下载、核验官方校验值、备份替换、重启并确认版本。网关保持普通账号运行，账号与配置不变。')
+                : isManualUpdate(snap.info) ? manualUpdateReason(snap.info) : selfUpdate
+                  ? t('容器内更新：更新包从 GitHub 发布页下载，校验 sha256 后由面板替换容器内的程序与界面文件，再重启服务（容器由 restart 策略拉起，页面会自动刷新）。更新的是容器里的文件，compose 里的镜像标签不变 —— 之后执行 docker compose pull && up -d 会使用镜像里的版本。检查更新与下载的出网线路、GitHub 令牌都在「更新设置」里。')
+                  : t('更新包从 GitHub Release 获取。自动模式按实际请求选择可用通道，失败后换源；镜像安装包必须匹配官方校验值，取不到时仅使用原始源。加速源、代理和令牌在「更新设置」中配置，指定代理失效不会静默直连。')}
         ></span>
         {/* id 保留：app.js 的 renderTopbarStatus 按 id 镜像徽章文案与语义色（配色经
             data-tone 传；设置页顶栏那枚镜像目前还不读它，保持一致没坏处） */}
@@ -1234,7 +1307,7 @@ function UpdatePanel() {
         </div>
 
         {/* 进度条：旧实现只在 0 < percent < 100 时露出，这里同样条件渲染 */}
-        {snap.phase === 'downloading' && snap.percent > 0 && snap.percent < 100
+        {(snap.phase === 'downloading' || serviceUpdateTask(snap.info)?.phase === 'downloading') && snap.percent > 0 && snap.percent < 100
           ? <Progress value={snap.percent} />
           : null}
 
@@ -1347,10 +1420,8 @@ function mountPanel(): void {
   paneRoot.render(<UpdatePanel />)
 }
 
-// 脚本排在页面骨架之后（index.html 里 islands/ui.js 在各 section 之后），正常直接挂；
-// 万一将来被挪到前面，退化成等 DOM 解析完再挂。
-if (document.querySelector(PANE_SELECTOR)) mountPanel()
-else document.addEventListener('DOMContentLoaded', mountPanel, { once: true })
+// 首次切到本页时才挂载（见 island-lazy）：隐藏页不在首屏渲染，也不拉数据。
+mountOnPage('settings', PANE_SELECTOR, mountPanel)
 
 /* ─── 注册：对外契约 ─────────────────────────── */
 

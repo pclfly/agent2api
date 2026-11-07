@@ -3,6 +3,7 @@ import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
 import { AppFrame, Badge, BadgeDot, Button, Empty, NavList, NavItem, PageHeader, SegmentedControl, Sheet, SheetClose, SheetContent, Sidebar, SidebarContent, SidebarFooter, SidebarGroupLabel, SidebarHeader, Toaster, toastManager, useMediaQuery } from '@ui'
 import { t } from './i18n'
+import { CheckinVerificationNotice } from './islands/checkin-verification-notice'
 
 type Menu = { key: string; label: string; icon: string }
 type Group = { label: string; items: Menu[] }
@@ -113,11 +114,12 @@ function Frame() {
         <div className='topbar-actions' id='topbar-status' title={title}><TopbarStatus /></div>
       </PageHeader>
       <div className='content'><div className='content-inner'>
-        {['assistant', 'overview', 'accounts', 'checkin', 'routing', 'gateway', 'agent', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'].map(key =>
+        {['assistant', 'overview', 'accounts', 'checkin', 'routing', 'gateway', 'agent', 'tools', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'plugins', 'settings'].map(key =>
           <section key={key} className={`page${page === key ? ' active' : ''}`} data-page={key} />)}
         <section className={`page${page.startsWith('plugin:') ? ' active' : ''}`} data-page='__plugin__' id='plugin-page-host' />
       </div></div>
     </main>
+    <CheckinVerificationNotice />
   </AppFrame>
 }
 

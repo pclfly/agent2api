@@ -74,6 +74,8 @@ pub(super) struct ProviderContext<'a> {
     /// —— 那是适配器的事）。各 provider 的实际发送体由 [`send_body`] 决定。
     pub body: &'a Value,
     pub routing: super::route_context::RequestRouting,
+    /// 网关确认并改写的压缩请求；入站伪造标记已在模型解析时剥离。
+    pub compact_routed: bool,
     /// 客户端是否要流式（决定成功后的形态：SSE 透传 or 聚合）
     pub stream: bool,
     pub images: Option<crate::server::core::providers::images::ImageOperation>,
@@ -246,16 +248,18 @@ pub(super) async fn send_body<'a>(
         .unwrap_or("")
         .trim()
         .to_string();
-    let prompt_model = if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
-        crate::server::core::custom_providers::wire_model_for(provider_id, &requested).0
-    } else {
-        crate::server::core::providers::catalog::wire_target_for_provider(
-            &requested,
-            provider_id,
-            account,
-        )
-        .model
-    };
+    let prompt_model = prompt_model_for_account(account, || {
+        if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
+            crate::server::core::custom_providers::wire_model_for(provider_id, &requested).0
+        } else {
+            crate::server::core::providers::catalog::wire_target_for_provider(
+                &requested,
+                provider_id,
+                account,
+            )
+            .model
+        }
+    });
     // 未选中该模型时 `for_model` 给 None —— 既不替换也不追加，也**不回落
     // 全局**（回落会悄悄改掉用户明确关掉的那一家）
     let prompt = ctx.prompt.for_model(provider_id, &prompt_model);
@@ -380,13 +384,14 @@ pub(super) async fn send_body<'a>(
     }
     // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
     // （同源，见模块头「思考等级绑定为什么也在这一步」）
-    let wire = crate::server::core::providers::catalog::wire_target_for_provider(
-        &requested,
-        provider_id,
-        account,
-    );
+    let direct = account.and_then(crate::server::core::routing_groups::candidate_model);
+    let wire = direct.map(|model| crate::server::core::providers::catalog::WireTarget { model: model.to_string(), reasoning: None })
+        .unwrap_or_else(|| crate::server::core::providers::catalog::wire_target_for_provider(&requested, provider_id, account));
     ctx.telemetry.note_upstream_model(&wire.model);
     rewrite_model(&mut body, &requested, &wire.model, provider_id);
+    if ctx.compact_routed {
+        crate::server::core::compact_routing::parameters::cap_output(&mut body, provider_id, &wire.model);
+    }
     let injected = apply_reasoning(
         &mut body,
         provider_id,
@@ -423,6 +428,94 @@ pub(super) fn outbound_reasoning_of(provider_id: &str, body: &Value) -> Option<S
         Some(kind) => crate::server::core::providers::adapter::adapter_for(kind).outbound_reasoning(body),
         None => crate::server::core::providers::adapter::adapter_by_id(provider_id)?
             .outbound_reasoning(body),
+    }
+}
+
+/// 路由组已选定成员模型时，提示词范围与实际发送目标保持一致；普通请求仍走
+/// 原有按提供商解析（包括自定义模型别名）。惰性回退避免组入口再次被同名映射改写。
+fn prompt_model_for_account(
+    account: Option<&Value>,
+    resolve_default: impl FnOnce() -> String,
+) -> String {
+    account
+        .and_then(crate::server::core::routing_groups::candidate_model)
+        .map(str::to_string)
+        .unwrap_or_else(resolve_default)
+}
+
+#[cfg(test)]
+mod prompt_model_tests {
+    use super::prompt_model_for_account;
+    use crate::server::config::ProviderPrompt;
+    use crate::server::core::prompt::{PromptChoice, PromptMode, PromptPlan, PromptSource};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn scoped_provider(model: &str) -> ProviderPrompt {
+        ProviderPrompt {
+            mode: PromptMode::Custom,
+            file: None,
+            inline: None,
+            text: "member prompt".to_string(),
+            source: PromptSource::Inline,
+            file_error: None,
+            models: Some(vec![model.to_string()]),
+        }
+    }
+
+    fn default_prompt() -> PromptChoice<'static> {
+        PromptChoice {
+            mode: PromptMode::Custom,
+            text: "global prompt must not leak into excluded models",
+            source: PromptSource::Inline,
+        }
+    }
+
+    #[test]
+    fn routing_group_prompt_scope_matches_selected_member_model() {
+        let account = json!({ "id": "account-1", "routingModel": "gpt-X" });
+        let body = json!({
+            "model": "work",
+            "messages": [{ "role": "user", "content": "hello" }],
+        });
+        let model = prompt_model_for_account(Some(&account), || {
+            panic!("a selected member must not resolve the group entry alias again")
+        });
+        assert_eq!(model, "gpt-X");
+        for provider in ["workbuddy", "custom:bedrock"] {
+            let providers = BTreeMap::from([(provider.to_string(), scoped_provider("gpt-X"))]);
+            let plan = PromptPlan::new(default_prompt(), &providers);
+            let choice = plan.for_model(provider, &model).expect("member scope must match");
+            let outbound = choice.apply(&body, false).expect("member prompt must be applied");
+            assert_eq!(outbound["messages"][0]["content"], "member prompt");
+            assert_eq!(outbound["model"], "work", "scope lookup must not rewrite the request");
+        }
+    }
+
+    #[test]
+    fn routing_group_entry_scope_does_not_override_member_exclusion() {
+        let account = json!({ "id": "account-1", "routingModel": "gpt-X" });
+        let model = prompt_model_for_account(Some(&account), || "work".to_string());
+        for provider in ["workbuddy", "custom:bedrock"] {
+            let providers = BTreeMap::from([(provider.to_string(), scoped_provider("work"))]);
+            let plan = PromptPlan::new(default_prompt(), &providers);
+            assert!(plan.for_model(provider, &model).is_none(),
+                "selecting only the group entry must not inject a provider or global prompt");
+        }
+    }
+
+    #[test]
+    fn ordinary_requests_keep_the_existing_provider_resolution_fallback() {
+        let account = json!({ "id": "account-1" });
+        for account in [None, Some(&account)] {
+            let mut calls = 0;
+            let model = prompt_model_for_account(account, || {
+                calls += 1;
+                "resolved-upstream-model".to_string()
+            });
+            assert_eq!(model, "resolved-upstream-model");
+            assert_eq!(calls, 1);
+        }
     }
 }
 

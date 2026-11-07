@@ -715,6 +715,9 @@ fn host_allowed(url: &url::Url, provider: &str, social_restore: bool) -> bool {
     if provider == "doubaowork" {
         return url.as_str() == "about:blank" || crate::doubaowork_login::allowed(url);
     }
+    if let Some(region) = crate::server::core::providers::monkeycode::Region::from_provider_id(provider) {
+        return url.as_str() == "about:blank" || crate::monkeycode_login::allowed(url, region);
+    }
     match url.scheme() {
         "about" | "data" => true,
         "https" | "http" => {
@@ -786,6 +789,9 @@ fn is_login_callback(url: &url::Url, provider: &str) -> bool {
 /// 与 Qoder 的设备授权同形；手工填凭证与导入桌面端登录态都不经过这里
 /// （那两条走 `POST /api/accounts`）。
 fn normalize_provider(provider: &str) -> Result<&'static str, String> {
+    if let Some(region) = crate::server::core::providers::monkeycode::Region::from_provider_id(provider.trim()) {
+        return Ok(region.provider_id());
+    }
     match provider.trim() {
         "" | "workbuddy" => Ok("workbuddy"),
         // WorkBuddy 国际版（2026-10 拆家后是独立 provider）：面板那块
@@ -1212,20 +1218,60 @@ fn emit_login_progress(app: &AppHandle, flow: &str, started: &Value, instruction
 struct DynamicNavigation {
     hosts: Vec<String>,
     callbacks: Vec<url::Url>,
+    /// 插件申报的**本机登录页**（`127.0.0.1:<port>` 这类）。
+    ///
+    /// ── 为什么需要单独一列 ──────────────────────────────────
+    /// 网关原先只允许「HTTPS 授权页」与「授权地址里登记的回环回调」两种
+    /// 地址。有些插件（AStudio）的登录页本身就是回环 HTTP 页面（要跑极验
+    /// 滑块），既不是 HTTPS 也不是回调；不单独放行的话点「登录」直接报
+    /// 「登录链接不是允许的 HTTPS 站点或合法本机回调地址」。
+    /// 只接受**带显式端口的回环主机**，且必须由插件在 `allowedHosts` 里
+    /// 明确申报，不放宽任何非回环地址。
+    loopback_pages: Vec<(String, u16)>,
+}
+
+/// `127.0.0.1:1234` / `localhost:1234` / `[::1]:1234` → (host, port)。
+fn loopback_page(value: &str) -> Option<(String, u16)> {
+    let text = value.trim().to_ascii_lowercase();
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        if let Some(rest) = text.strip_prefix(host) {
+            if let Some(port) = rest.strip_prefix(':') {
+                if let Ok(port) = port.parse::<u16>() {
+                    if port > 0 {
+                        return Some((host.to_string(), port));
+                    }
+                }
+            }
+            return None;
+        }
+    }
+    None
 }
 
 impl DynamicNavigation {
     fn new(auth: &url::Url, started: &Value) -> Result<Self, String> {
-        let hosts = match started.get("allowedHosts") {
+        let raw = match started.get("allowedHosts") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(items)) => items.iter().map(|value| {
-                let host = value.as_str().ok_or("登录域名白名单格式无效")?
-                    .trim().trim_start_matches("*.").trim_end_matches('.').to_ascii_lowercase();
-                if host.is_empty() { return Err("登录域名白名单含有空主机".to_string()); }
-                Ok(host)
+                value.as_str().ok_or("登录域名白名单格式无效".to_string())
+                    .map(|text| text.trim().to_string())
             }).collect::<Result<Vec<_>, String>>()?,
             Some(_) => return Err("登录域名白名单格式无效".into()),
         };
+        let mut hosts = Vec::new();
+        let mut loopback_pages = Vec::new();
+        for item in raw {
+            if let Some(page) = loopback_page(&item) {
+                loopback_pages.push(page);
+                continue;
+            }
+            let host = item
+                .trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if host.is_empty() { return Err("登录域名白名单含有空主机".to_string()); }
+            hosts.push(host);
+        }
         let mut callbacks = Vec::new();
         let mut capture = |key: &str, value: &str| {
             if matches!(key, "redirect_uri" | "redirect" | "redirect_url" | "callback_url"
@@ -1242,13 +1288,21 @@ impl DynamicNavigation {
         if let Some((_, query)) = auth.fragment().and_then(|fragment| fragment.split_once('?')) {
             for (key, value) in url::form_urlencoded::parse(query.as_bytes()) { capture(&key, &value); }
         }
-        Ok(Self { hosts, callbacks })
+        Ok(Self { hosts, callbacks, loopback_pages })
     }
 
     fn is_callback(&self, url: &url::Url) -> bool {
         if matches!(url.scheme(), "file" | "javascript" | "data" | "about" | "blob") { return false; }
         if matches!(url.scheme(), "https" | "http") && !self.allows(url) { return false; }
         self.matches_callback(url)
+    }
+
+    fn matches_loopback_page(&self, url: &url::Url) -> bool {
+        let Some(host) = url.host_str() else { return false; };
+        let Some(port) = url.port_or_known_default() else { return false; };
+        self.loopback_pages.iter().any(|(page_host, page_port)| {
+            host.eq_ignore_ascii_case(page_host) && port == *page_port
+        })
     }
 
     fn matches_callback(&self, url: &url::Url) -> bool {
@@ -1265,9 +1319,11 @@ impl DynamicNavigation {
             "https" => self.hosts.is_empty() || self.hosts.iter().any(|item| {
                 host.eq_ignore_ascii_case(item) || host.to_ascii_lowercase().ends_with(&format!(".{item}"))
             }),
-            // HTTP 只用于授权地址实际登记的回环 callback；仅白名单写 localhost 不够。
+            // HTTP 只用于授权地址实际登记的回环 callback，或插件明确申报的
+            // 本机登录页；仅白名单写 localhost 不够。
             "http" => matches!(host, "localhost" | "127.0.0.1" | "[::1]")
-                && self.matches_callback(url) && (self.hosts.is_empty() || self.hosts.iter().any(|item| {
+                && (self.matches_callback(url) || self.matches_loopback_page(url))
+                && (self.hosts.is_empty() || self.hosts.iter().any(|item| {
                     host.eq_ignore_ascii_case(item) || host.to_ascii_lowercase().ends_with(&format!(".{item}"))
                 })),
             _ => false,
@@ -1388,6 +1444,9 @@ pub async fn start(
     let provider = normalize_provider(&provider)?;
     if provider == "doubaowork" {
         return crate::doubaowork_login::start(app, &mode).await;
+    }
+    if let Some(region) = crate::server::core::providers::monkeycode::Region::from_provider_id(provider) {
+        return crate::monkeycode_login::start(app, region, &mode).await;
     }
 
     // 小浣熊：授权地址由**后端适配器**生成（静态地址 + 本地生成的 state），
@@ -2014,7 +2073,10 @@ async fn run_embedded_with_proxy(
     // 密集重试只会延长风控窗口。
     let mut kuku_retry_block_until: Option<tokio::time::Instant> = None;
     let mut doubaowork_submitted = false;
+    let monkeycode_region = crate::server::core::providers::monkeycode::Region::from_provider_id(provider);
+    let mut monkeycode_submitted = false;
     let mut deepseek_submitted = false;
+    let mut deepseek_capture = crate::deepseek_login::CredentialCapture::default();
 
     // 导航拦截与弹窗拦截**共用同一个标志**：两种入口收到的可能是同一个回调
     // （页面先改 location、再被 WebView2 派生出一条弹窗请求），分开各一个标志
@@ -2115,6 +2177,13 @@ async fn run_embedded_with_proxy(
         // 同属一个 WebView2 数据目录、共享 Cookie 存储，弹窗里登录成功后
         // 等待循环照样能从 Cookie 读到 BDUSS）。
         .on_new_window(move |url, _features| {
+            if let Some(region) = monkeycode_region {
+                return if crate::monkeycode_login::allowed(&url, region) {
+                    tauri::webview::NewWindowResponse::Allow
+                } else {
+                    tauri::webview::NewWindowResponse::Deny
+                };
+            }
             if provider == "deepseek-web" && crate::deepseek_login::allowed(&url) {
                 return tauri::webview::NewWindowResponse::Allow;
             }
@@ -2249,7 +2318,7 @@ async fn run_embedded_with_proxy(
         // 初版那套「读窗口 cookie 找 ot_session」已删除：那条 Cookie 在
         // SPA 内扫码登录时根本不会被写出（见模块头的实测对照）。
         if provider == "deepseek-web" && !deepseek_submitted {
-            match crate::deepseek_login::credentials(&window).await {
+            match crate::deepseek_login::credentials(&window, &mut deepseek_capture).await {
                 Ok(Some(credentials)) if login_is_current(app, login_state) => {
                     deepseek_submitted = true;
                     submit_callback(login_state, &credentials).await;
@@ -2258,6 +2327,16 @@ async fn run_embedded_with_proxy(
                 Err(error) => {
                     eprintln!("[login] {error}");
                 }
+            }
+        }
+        if let Some(region) = monkeycode_region.filter(|_| !monkeycode_submitted) {
+            match crate::monkeycode_login::credentials(&window, region).await {
+                Ok(Some(credentials)) if login_is_current(app, login_state) => {
+                    monkeycode_submitted = true;
+                    submit_callback(login_state, &credentials).await;
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("[login] {error}"),
             }
         }
         if provider == "doubaowork" && !doubaowork_submitted {

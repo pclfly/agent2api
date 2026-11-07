@@ -63,6 +63,7 @@
   "按天 Token 用量": "",
   "按天 Token 趋势": "Daily token trend",
   "按本地整点，无请求的整点不标注": "By local hour; hours with no requests are not labeled",
+  "按每条请求的软件标识和识别规则统计，不依赖 API Key，也不代表设备或用户数。待确认的软件统一计入“其它”；规则修改不重新归类历史请求。": "Statistics use per-request software identifiers and identification rules, independently of API keys. They do not count devices or users. Unconfirmed software is grouped under Other; rule changes do not reclassify historical requests.",
   "提供商用": "Provider usage",
   "提供商用占比": "Provider usage share",
   "提供商用量": "",

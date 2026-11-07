@@ -979,5 +979,21 @@
   "，只对 OpenCode Zen 这类上游有意义，别的家请关掉。": ", so it only matters for upstreams like OpenCode Zen — turn it off for other providers.",
   "，已达到上限": ", limit reached",
   "：到「网络代理」页的「订阅管理」里点「同步 Clash Verge」把出口导进池后即可选 —— 那样能集中测试、也能被多个账号共用。": ": on the Network proxy page, open \"Manage subscriptions\" and click \"Sync Clash Verge\" to import exits into the pool and then select them — that centralizes testing and lets several accounts share them.",
-  "；": "; "
+  "；": "; ",
+  "不足 {n}": "Less than {n}",
+  "{count} 份单位未知": "{count} packs with unknown units",
+  "{count} 份仅提供比例": "{count} packs with percentage-only readings",
+  "{unit}余量未知（{count} 份）": "Remaining {unit} unknown ({count} packs)",
+  "{amount}，另 {count} 份余量未知": "{amount}, plus {count} packs with unknown remaining amounts",
+  "7 天内到期 {amount}（{count} 份）": "Expiring within 7 days: {amount} ({count} packs)",
+  "今天到期 {amount}（{count} 份）": "Expiring today: {amount} ({count} packs)",
+  "7天 {count}份": "{count} packs in 7d",
+  "7天 {n}": "{n} in 7d",
+  "即将到期 {count} 份": "{count} packs expiring soon",
+  "即将过期 {n}": "{n} expiring soon",
+  "不到 1 分钟到期": "Expires in under 1 min",
+  "{minutes} 分钟后到期": "Expires in {minutes} min",
+  "{hours} 小时后到期": "Expires in {hours} h",
+  "明天到期": "Expires tomorrow",
+  "{days} 天后到期": "Expires in {days} days"
 }

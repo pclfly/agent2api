@@ -49,6 +49,11 @@ pub mod accounts_usage;
 pub mod assistant;
 pub mod assistant_history;
 pub mod assistant_images;
+// 工具服务（「工具服务」页）：列表 / 开关 / 超时 / 上游提供商 / 视觉配置 /
+// 本机接入的管理面，以及对外运行时端点（Skill / MCP / REST）。上游配置与
+// 编排在 `core::tool_services`，见那两个文件模块头
+pub mod tools;
+pub mod tool_runtime;
 mod image_input;
 // 整库备份 / 恢复（设置页「整库备份 / 恢复」，SQL 文本形态；核心在
 // `db::backup`，替换语义与账号 JSON 导入的 merge 是两条独立通道）
@@ -75,6 +80,8 @@ pub mod checkin_records;
 pub mod checkin_schedules;
 pub mod cline_headers;
 pub mod codearts_welfare;
+pub mod compact_routes;
+pub mod client_identification;
 pub mod config_api;
 // WorkBuddy 成长任务（查询 / 执行 / 开学季 / 猫猫旅行）：从参考项目
 // workbuddy2api 的 task_runner.py 移植，见该文件模块头
@@ -146,6 +153,7 @@ pub(crate) mod request_prepare;
 pub mod role_compat;
 pub mod routing_api;
 pub mod routing_flow;
+pub mod routing_groups;
 pub mod routing_trace;
 pub mod subscriptions;
 pub mod routing_workspace;
@@ -165,6 +173,7 @@ pub mod zcode_captcha;
 // 令牌池的**补货节奏**设置（目标 / 轮询间隔 / 单轮上限），见该文件模块头
 pub mod zcode_captcha_pool;
 pub mod zcode_claim;
+pub mod zcode_claim_verification;
 // ZCode 客户端版本号（设置页可改）：上游按它决定活动套餐下不下发，
 // 落后时的症状是**静默空列表**，见该文件模块头
 pub mod zcode_version;
